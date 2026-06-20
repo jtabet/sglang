@@ -27,6 +27,30 @@ import triton.language as tl
 KVARN_NUM_KV_SPLITS = int(os.environ.get("KVARN_NUM_KV_SPLITS", "16"))
 KVARN_MAX_KV_SPLITS = 64
 
+# Autotune configs for the fused decode kernel.  Applied lazily so the module
+# can be imported on CPU-only machines without a Triton driver.
+_KVARN_DECODE_CONFIGS = [
+    triton.Config({"BLOCK_N": 16}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_N": 32}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_N": 64}, num_warps=4, num_stages=2),
+]
+
+
+def _maybe_autotune(kernel):
+    """Decorate with triton.autotune if a GPU driver is available.
+
+    This allows the module to be imported on CPU-only machines (e.g. for
+    unit tests of the non-Triton code) without raising.
+    """
+    try:
+        return triton.autotune(
+            configs=_KVARN_DECODE_CONFIGS,
+            key=["D", "GROUP", "Q_PER_KV", "K_BITS", "V_BITS"],
+        )(kernel)
+    except RuntimeError:
+        # No GPU driver — return the bare JIT kernel.
+        return kernel
+
 
 def adaptive_num_kv_splits(max_blocks_per_req: int) -> int:
     """Context-adaptive split-K count."""
@@ -217,14 +241,7 @@ def _kvarn_build_packed_kv_kernel(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_N": 16}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_N": 32}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_N": 64}, num_warps=4, num_stages=2),
-    ],
-    key=["D", "GROUP", "Q_PER_KV", "K_BITS", "V_BITS"],
-)
+@_maybe_autotune
 @triton.jit
 def _kvarn_fused_decode_kernel(
     Q_ptr,              # [B, Hq, D]                               fp16 (rotated)

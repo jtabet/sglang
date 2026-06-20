@@ -2743,3 +2743,317 @@ def move_kv_cache_native(
     for k_cache, v_cache in zip(k_buffer, v_buffer):
         k_cache[tgt_loc_flat] = k_cache[src_loc_flat]
         v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# KVarN: Hadamard + Sinkhorn + RTN compressed KV cache pool.
+#
+# Dual-pool architecture:
+#   • tail_pool: fp16 [pool_slots, group, Hk, D] — stores in-progress blocks
+#     and the attention-sink block(s) that stay fp16 permanently.
+#   • compressed_cache: uint8 [num_blocks, Hk, tile_bytes] — stores flushed
+#     int4 tiles (packed K + V + scales).
+#   • block_to_slot: int32 [num_blocks_lookup] → maps a cache block_id to
+#     a tail_pool slot (>=0) or -1 (meaning the block is compressed / a sink).
+#
+# For Phase 2 (initial), we use the tail pool for everything (no compression),
+# giving us a functional fp16 path while the attention backend is developed.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class KVarNTokenToKVPool(KVCache):
+    """KV cache pool for KVarN quantized models.
+
+    The pool has two storage tiers:
+      1. An fp16 ``tail_pool`` for blocks that are not yet flushed to int4
+         (in-progress blocks, sink blocks).
+      2. A uint8 ``compressed_cache`` for flushed int4 tiles.
+
+    In the initial implementation, all blocks live in the tail pool (fp16).
+    The compressed cache and flush logic will be added in a subsequent phase.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        kvarn_config: Any = None,
+        v_head_dim: Optional[int] = None,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        enable_alt_stream: bool = True,
+        enable_kv_cache_copy: bool = False,
+    ):
+        # KVarN uses fp16 for the tail pool regardless of the incoming dtype
+        # (which is torch.uint8 as a marker). The compressed int4 cache (to be
+        # added in Phase 3) will use uint8 storage.
+        actual_dtype = torch.float16
+        super().__init__(
+            size,
+            page_size,
+            actual_dtype,
+            layer_num,
+            device,
+            enable_memory_saver,
+            start_layer,
+            end_layer,
+        )
+        self.head_num = head_num
+        self.head_dim = head_dim
+        self.v_head_dim = v_head_dim if v_head_dim is not None else head_dim
+        self.kvarn_config = kvarn_config
+        self.kv_cache_layout = "nhd"
+
+        # KVarN group (tile) size must match page_size for block-aligned flush.
+        self.group = page_size
+        if kvarn_config is not None:
+            self.group = kvarn_config.group
+            # If KVarN group != page_size, we need page_size to divide group.
+            # For now, require them to match.
+            if self.group != page_size:
+                logger.warning(
+                    f"KVarN group ({self.group}) != page_size ({page_size}). "
+                    f"Using group={page_size} for block alignment."
+                )
+                self.group = page_size
+
+        self._create_buffers()
+
+        self.device_module = torch.get_device_module(self.device)
+        _use_alt_stream = _is_cuda or current_platform.is_cuda_alike()
+        self.alt_stream = (
+            self.device_module.Stream()
+            if _use_alt_stream and enable_alt_stream
+            else None
+        )
+
+        self._kv_copy_config = None
+        self._finalize_allocation_log(size)
+
+        # for store_cache JIT kernel
+        self.row_dim = self.head_num * self.head_dim
+        self.same_kv_dim = self.head_dim == self.v_head_dim
+
+    def _create_buffers(self):
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            # Tail pool: [size + page_size, head_num, head_dim] per layer
+            # (same layout as MHATokenToKVPool for compatibility)
+            self.k_buffer = [
+                torch.zeros(
+                    (self.size + self.page_size, self.head_num, self.head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+            self.v_buffer = [
+                torch.zeros(
+                    (self.size + self.page_size, self.head_num, self.v_head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        self.data_strides = torch.tensor(
+            [
+                np.prod(x.shape[1:]) * x.dtype.itemsize
+                for x in self.k_buffer + self.v_buffer
+            ],
+            device=self.device,
+        )
+
+    def _clear_buffers(self):
+        del self.k_buffer
+        del self.v_buffer
+
+    def get_kv_size_bytes(self):
+        k_size = sum(get_tensor_size_bytes(k) for k in self.k_buffer)
+        v_size = sum(get_tensor_size_bytes(v) for v in self.v_buffer)
+        return k_size, v_size
+
+    def get_contiguous_buf_infos(self):
+        kv_data_ptrs = [
+            self._get_key_buffer(i).data_ptr()
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ] + [
+            self._get_value_buffer(i).data_ptr()
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ]
+        kv_data_lens = [
+            self._get_key_buffer(i).nbytes
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ] + [
+            self._get_value_buffer(i).nbytes
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ]
+        kv_item_lens = [
+            self._get_key_buffer(i)[0].nbytes * self.page_size
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ] + [
+            self._get_value_buffer(i)[0].nbytes * self.page_size
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ]
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        current_platform.synchronize()
+        kv_cache_cpu = []
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            kv_cache_cpu.append([])
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                k_cpu = self.k_buffer[layer_id][chunk_indices].to(
+                    "cpu", non_blocking=True
+                )
+                v_cpu = self.v_buffer[layer_id][chunk_indices].to(
+                    "cpu", non_blocking=True
+                )
+                kv_cache_cpu[-1].append([k_cpu, v_cpu])
+        current_platform.synchronize()
+        return kv_cache_cpu
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        current_platform.synchronize()
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                k_cpu, v_cpu = (
+                    kv_cache_cpu[layer_id][i // chunk_size][0],
+                    kv_cache_cpu[layer_id][i // chunk_size][1],
+                )
+                k_chunk = k_cpu.to(self.k_buffer[0].device, non_blocking=True)
+                v_chunk = v_cpu.to(self.v_buffer[0].device, non_blocking=True)
+                self.k_buffer[layer_id][chunk_indices] = k_chunk
+                self.v_buffer[layer_id][chunk_indices] = v_chunk
+        current_platform.synchronize()
+
+    def _get_key_buffer(self, layer_id: int):
+        if self.store_dtype != self.dtype:
+            return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
+        return self.k_buffer[layer_id - self.start_layer]
+
+    def get_key_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self._get_key_buffer(layer_id)
+
+    def _get_value_buffer(self, layer_id: int):
+        if self.store_dtype != self.dtype:
+            return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
+        return self.v_buffer[layer_id - self.start_layer]
+
+    def get_value_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self._get_value_buffer(layer_id)
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc_info,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        loc, _ = unwrap_write_loc(loc_info)
+        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (KVarN)")
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id
+
+        if cache_k.dtype != self.dtype:
+            if k_scale is not None:
+                cache_k.div_(k_scale)
+            if v_scale is not None:
+                cache_v.div_(v_scale)
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.view(self.store_dtype)
+            cache_v = cache_v.view(self.store_dtype)
+
+        # For Phase 2: store directly to tail pool (fp16, no compression).
+        # This is functionally identical to MHATokenToKVPool.
+        # The Hadamard rotation is applied by the attention backend before
+        # calling set_kv_buffer, so the pool stores rotated K/V.
+        _set_kv_buffer_impl(
+            cache_k,
+            cache_v,
+            self.k_buffer[layer_id - self.start_layer],
+            self.v_buffer[layer_id - self.start_layer],
+            loc,
+            row_dim=self.row_dim,
+            store_dtype=self.store_dtype,
+            device_module=self.device_module,
+            size_limit=self.size + self.page_size,
+            alt_stream=self.alt_stream,
+            same_kv_dim=self.same_kv_dim,
+        )
+
+    def set_kv_buffer_prefix_valid(
+        self,
+        layer: RadixAttention,
+        loc_2d: torch.Tensor,
+        commit_lens: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        # Same as MHATokenToKVPool for now
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id
+
+        if cache_k.dtype != self.dtype:
+            if k_scale is not None:
+                cache_k.div_(k_scale)
+            if v_scale is not None:
+                cache_v.div_(v_scale)
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.contiguous().view(self.store_dtype)
+            cache_v = cache_v.contiguous().view(self.store_dtype)
+        else:
+            cache_k = cache_k.contiguous()
+            cache_v = cache_v.contiguous()
+
+        set_kv_buffer_prefix_valid_tiled(
+            self.k_buffer[layer_id - self.start_layer],
+            self.v_buffer[layer_id - self.start_layer],
+            cache_k,
+            cache_v,
+            loc_2d,
+            commit_lens,
+        )

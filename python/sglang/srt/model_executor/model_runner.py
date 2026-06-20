@@ -2379,6 +2379,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
                 )
                 self.kv_cache_dtype = self.dtype
+        elif self.server_args.kv_cache_dtype.startswith("kvarn_"):
+            # KVarN uses uint8 storage for compressed tiles; the actual quant
+            # config is carried by KVarNConfig. The KV pool stores fp16 tail
+            # tokens; the compressed cache is uint8. Set kv_cache_dtype to uint8
+            # so the pool configurator knows the cache is not a standard dtype.
+            self.kv_cache_dtype = torch.uint8
+            logger.info(
+                f"KVarN KV cache enabled: {self.server_args.kv_cache_dtype}"
+            )
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
