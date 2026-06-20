@@ -211,6 +211,27 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 cell_size = (cell_size // 2) + (
                     (n * k * num_layers * 2 * kv_size) // scale_block_size
                 )
+            elif mr.server_args.kv_cache_dtype.startswith("kvarn_"):
+                # KVarN: cell_size = compressed tile bytes per token per head.
+                # Each tile covers `group` tokens, so per-token cost is
+                # tile_bytes_aligned * Hk / group * num_layers.
+                from sglang.srt.layers.quantization.kvarn.config import (
+                    KVarNConfig,
+                )
+
+                kvarn_cfg = KVarNConfig.from_cache_dtype(
+                    mr.server_args.kv_cache_dtype, head_dim=model_config.head_dim
+                )
+                n = model_config.get_num_kv_heads(tp_size)
+                cell_size = (
+                    kvarn_cfg.tile_bytes_aligned
+                    * n
+                    * num_layers
+                    // kvarn_cfg.group
+                )
+                # Add fp16 tail pool overhead (~8% of total pool budget, shared)
+                # This is a rough estimate; the actual tail pool is sized separately.
+                cell_size = int(cell_size * 1.08)
 
         return cell_size
 
