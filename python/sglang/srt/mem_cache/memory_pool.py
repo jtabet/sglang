@@ -2823,6 +2823,12 @@ class KVarNTokenToKVPool(KVCache):
                 )
                 self.group = page_size
 
+        # Compressed cache and block_to_slot are set by the attention
+        # backend's flush manager once it's initialized.
+        self.compressed_cache: Optional[List[torch.Tensor]] = None
+        self.block_to_slot: Optional[torch.Tensor] = None
+        self.flush_manager = None
+
         self._create_buffers()
 
         self.device_module = torch.get_device_module(self.device)

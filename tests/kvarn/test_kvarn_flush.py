@@ -51,6 +51,12 @@ class TestFlushManager:
         assert len(manager.free_slots) == 16
         assert manager.block_to_slot.dtype == torch.int32
         assert (manager.block_to_slot == -1).all()
+        # Compressed cache is allocated eagerly
+        assert manager.compressed_cache is not None
+        assert len(manager.compressed_cache) == 2  # num_layers
+        for cache in manager.compressed_cache:
+            assert cache.dtype == torch.uint8
+            assert cache.shape == (64, 4, manager.tile_bytes)
 
     def test_allocate_tail_slot(self, manager):
         slot = manager.allocate_tail_slot(0)
@@ -142,8 +148,6 @@ class TestFlushManager:
         assert manager.block_states[0].tail_slot == -1  # slot freed
         assert manager.block_to_slot[0].item() == -1
         assert 0 in manager.free_slots  # slot recycled
-        assert manager.compressed_cache is not None
-        assert len(manager.compressed_cache) == 2  # one per layer
 
     def test_flush_multiple_blocks(self, manager, cfg):
         """Test flushing multiple blocks at once."""

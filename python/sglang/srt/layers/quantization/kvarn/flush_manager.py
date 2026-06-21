@@ -100,6 +100,17 @@ class KVarNFlushManager:
             (num_blocks,), -1, dtype=torch.int32, device=device
         )
 
+        # Allocate compressed cache eagerly so it's available when the first
+        # flush happens. [num_blocks, Hk, tile_bytes] uint8 per layer.
+        self.compressed_cache = [
+            torch.zeros(
+                (num_blocks, num_kv_heads, self.tile_bytes),
+                dtype=torch.uint8,
+                device=device,
+            )
+            for _ in range(num_layers)
+        ]
+
         # Hadamard matrix for un-rotation during flush (if needed)
         self.H = build_hadamard(self.head_dim, torch.device(device))
 
@@ -108,17 +119,6 @@ class KVarNFlushManager:
             f"pool_slots={max_pool_slots}, group={self.group}, "
             f"tile_bytes={self.tile_bytes}"
         )
-
-    def _allocate_compressed_cache(self):
-        """Lazily allocate the compressed uint8 cache."""
-        self.compressed_cache = [
-            torch.zeros(
-                (self.num_blocks, self.num_kv_heads, self.tile_bytes),
-                dtype=torch.uint8,
-                device=self.device,
-            )
-            for _ in range(self.num_layers)
-        ]
 
     def allocate_tail_slot(self, block_id: int) -> int:
         """Allocate a tail pool slot for a block.
@@ -195,9 +195,6 @@ class KVarNFlushManager:
         """
         if not block_ids:
             return
-
-        if self.compressed_cache is None:
-            self._allocate_compressed_cache()
 
         cfg = self.cfg
         Hk = self.num_kv_heads
