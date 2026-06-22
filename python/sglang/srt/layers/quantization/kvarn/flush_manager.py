@@ -23,6 +23,12 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.layers.quantization.kvarn.config import KVarNConfig
+from sglang.srt.layers.quantization.kvarn.dequant import (
+    kvarn_dequant_tile_k,
+    kvarn_dequant_tile_k_batch,
+    kvarn_dequant_tile_v,
+    kvarn_dequant_tile_v_batch,
+)
 from sglang.srt.layers.quantization.kvarn.sinkhorn import variance_normalize_batched
 from sglang.srt.layers.quantization.kvarn.store import (
     kvarn_store_tile_k_batch_from_sinkhorn,
@@ -180,6 +186,13 @@ class KVarNFlushManager:
             self.block_to_slot[bid] = -1
             self._flushed.add(bid)
 
+        # Dequant back to the bf16 pool so the standard decode kernel
+        # reads the compressed-then-decompressed data. This validates the
+        # full roundtrip without needing a fused Triton decode kernel.
+        # Once the fused kernel is validated, this can be removed to
+        # actually free the bf16 pool slots.
+        self._dequant_blocks_to_pool(block_ids, tail_k_pools, tail_v_pools)
+
         logger.info(f"KVarN flush: {nB} blocks flushed to int4")
 
     def _write_packed_tile(
@@ -225,3 +238,71 @@ class KVarNFlushManager:
             off = cfg.v_zp_offset
             cache[block_id, head_id, off:off + s_row.numel() * 2].copy_(
                 s_row.view(torch.uint8).flatten())
+
+    def _dequant_blocks_to_pool(
+        self,
+        block_ids: List[int],
+        tail_k_pools: List[torch.Tensor],
+        tail_v_pools: List[torch.Tensor],
+    ):
+        """Read int4 compressed tiles and write dequanted data back to the bf16 pool.
+
+        This validates the full roundtrip: bf16 → int4 → dequant → bf16.
+        The standard decode kernel then reads the dequanted (slightly lossy)
+        data instead of the original bf16, proving the compression is
+        accurate enough for coherent generation.
+
+        Once the fused Triton decode kernel is validated, this can be
+        removed to actually free the bf16 pool slots for flushed blocks.
+        """
+        cfg = self.cfg
+        Hk = self.num_kv_heads
+        D = self.head_dim
+        G = self.group
+        nB = len(block_ids)
+
+        for layer_id in range(self.num_layers):
+            k_pool = tail_k_pools[layer_id]
+            v_pool = tail_v_pools[layer_id]
+            k_cache = self.compressed_cache[layer_id]
+
+            for i, bid in enumerate(block_ids):
+                for h in range(Hk):
+                    # Read packed K tile from compressed cache
+                    off = cfg.k_packed_offset
+                    k_packed = k_cache[bid, h, off:off + D * (G // 2)]
+                    k_packed = k_packed.reshape(D, G // 2)
+
+                    off = cfg.k_s_col_offset
+                    s_col_K = k_cache[bid, h, off:off + D * 2].view(torch.float16)
+                    off = cfg.k_zp_offset
+                    zp_K = k_cache[bid, h, off:off + D * 2].view(torch.float16)
+                    off = cfg.k_s_row_offset
+                    s_row_K = k_cache[bid, h, off:off + G * 2].view(torch.float16)
+
+                    # Dequant: [D, G] fp32
+                    K_deq = kvarn_dequant_tile_k(
+                        k_packed, s_col_K, zp_K, s_row_K, group=G, bits=cfg.key_bits,
+                    )
+
+                    # Write back to pool: [G, Hk, D] ← transpose [G, D] from [D, G]
+                    slot_start = bid * G
+                    k_pool[slot_start:slot_start + G, h, :] = K_deq.t().to(k_pool.dtype)
+
+                    # Read packed V tile
+                    off = cfg.v_packed_offset
+                    v_packed = k_cache[bid, h, off:off + G * (D // 2)]
+                    v_packed = v_packed.reshape(G, D // 2)
+
+                    off = cfg.v_s_col_offset
+                    s_col_V = k_cache[bid, h, off:off + D * 2].view(torch.float16)
+                    off = cfg.v_s_row_offset
+                    s_row_V = k_cache[bid, h, off:off + G * 2].view(torch.float16)
+                    off = cfg.v_zp_offset
+                    zp_V = k_cache[bid, h, off:off + G * 2].view(torch.float16)
+
+                    V_deq = kvarn_dequant_tile_v(
+                        v_packed, s_col_V, s_row_V, zp_V, head_dim=D, bits=cfg.value_bits,
+                    )
+
+                    v_pool[slot_start:slot_start + G, h, :] = V_deq.to(v_pool.dtype)
