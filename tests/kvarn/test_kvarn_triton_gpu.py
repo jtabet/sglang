@@ -55,9 +55,10 @@ class TestTritonSinkhornGPU:
         # Triton
         bal_tri, sc_tri, sr_tri = kvarn_sinkhorn_triton(tiles, iterations=16)
 
+        # Triton returns [N, C] and [N, R], PyTorch returns [N, 1, C] and [N, R, 1]
         torch.testing.assert_close(bal_tri, bal_ref, rtol=1e-2, atol=1e-2)
-        torch.testing.assert_close(sc_tri, sc_ref, rtol=1e-2, atol=1e-2)
-        torch.testing.assert_close(sr_tri, sr_ref, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(sc_tri, sc_ref.squeeze(1), rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(sr_tri, sr_ref.squeeze(-1), rtol=1e-2, atol=1e-2)
 
     def test_reduces_imbalance_gpu(self):
         """Triton Sinkhorn should reduce the imbalance metric."""

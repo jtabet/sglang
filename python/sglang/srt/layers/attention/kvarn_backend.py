@@ -17,6 +17,7 @@ fill up.
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -66,8 +67,18 @@ class KVarNAttnBackend(AttentionBackend):
         self.inner = TritonAttnBackend(model_runner, skip_prefill=skip_prefill)
 
         # Hadamard matrix (cached per head_dim × device).
-        self.H = build_hadamard(self.head_dim, self.device)
-        self.H_t = self.H.t().contiguous()
+        # Keep in fp32 for precision during rotation; the inputs are cast
+        # to fp32 for the matmul, then back to fp16 for pool storage.
+        # Set KVARN_NO_ROTATION=1 to disable rotation (for testing the
+        # pipeline without Hadamard — equivalent to plain fp16 KV cache).
+        self.no_rotation = os.environ.get("KVARN_NO_ROTATION", "0") == "1"
+        if self.no_rotation:
+            logger.info("KVarN: Hadamard rotation DISABLED (KVARN_NO_ROTATION=1)")
+            self.H = None
+            self.H_t = None
+        else:
+            self.H = build_hadamard(self.head_dim, self.device)
+            self.H_t = self.H.t().contiguous()
 
         # Flush manager — tracks block lifecycle and performs fp16→int4 flush.
         # Initialized lazily once we know the number of cache blocks.
@@ -81,17 +92,40 @@ class KVarNAttnBackend(AttentionBackend):
             f"tile_bytes={kvarn_config.tile_bytes_aligned}"
         )
 
-    def _ensure_flush_manager(self, num_blocks_hint: int = 4096):
+    def _ensure_flush_manager(self):
         """Lazily initialize the flush manager."""
         if self.flush_manager is not None:
             return
+        from sglang.srt.layers.dp_attention import get_attention_tp_size
+
+        # Size the compressed cache to match the actual KV pool.
+        # The pool size is in tokens; divide by group to get block count.
+        pool_size = getattr(self.token_to_kv_pool, 'size', 1024)
+        page_size = getattr(self.token_to_kv_pool, 'page_size', self.group)
+        num_blocks = max(pool_size // page_size, 64)
+
+        # Cap the compressed cache to avoid OOM on small GPUs.
+        # Each block needs tile_bytes * Hk * num_layers bytes.
+        cfg = self.kvarn_config
+        Hk = self.model_runner.model_config.get_num_kv_heads(
+            get_attention_tp_size()
+        )
+        num_layers = self.model_runner.num_effective_layers
+        bytes_per_block = cfg.tile_bytes_aligned * Hk * num_layers
+        max_blocks_by_mem = 512 * 1024 * 1024 // bytes_per_block  # 512MB cap
+        num_blocks = min(num_blocks, max_blocks_by_mem, 256)
+
+        logger.info(
+            f"KVarN flush manager: pool_size={pool_size}, page_size={page_size}, "
+            f"num_blocks={num_blocks}, bytes_per_block={bytes_per_block}, "
+            f"total_compressed_cache={num_blocks * bytes_per_block / 1024 / 1024:.1f} MB"
+        )
+
         self.flush_manager = KVarNFlushManager(
-            kvarn_config=self.kvarn_config,
-            num_blocks=num_blocks_hint,
-            num_kv_heads=self.model_runner.model_config.get_num_kv_heads(
-                self.model_runner.server_args.attention_tp_size_or_tp
-            ),
-            num_layers=self.model_runner.num_effective_layers,
+            kvarn_config=cfg,
+            num_blocks=num_blocks,
+            num_kv_heads=Hk,
+            num_layers=num_layers,
             device=self.device,
             max_pool_slots=min(
                 2 * self.model_runner.max_running_requests + 32,
@@ -106,12 +140,7 @@ class KVarNAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: "ForwardBatch"):
         """Init metadata for the forward step."""
-        self._ensure_flush_manager(
-            num_blocks_hint=max(
-                forward_batch.num_tokens,
-                4096,
-            )
-        )
+        self._ensure_flush_manager()
         self.inner.init_forward_metadata(forward_batch)
 
     def init_cuda_graph_state(self, *args, **kwargs):
@@ -130,39 +159,33 @@ class KVarNAttnBackend(AttentionBackend):
     # ── Hadamard rotation ──────────────────────────────────────────────────
 
     def _rotate(self, x: torch.Tensor) -> torch.Tensor:
-        """Rotate [N, H, D] → [N, H, D] by Hadamard H."""
-        return torch.matmul(x, self.H_t)
+        """Rotate [N, H, D] → [N, H, D] by Hadamard H (in fp32 for precision)."""
+        if self.no_rotation:
+            return x
+        return torch.matmul(x.float(), self.H_t).to(x.dtype)
 
     def _unrotate(self, x: torch.Tensor) -> torch.Tensor:
-        """Un-rotate [N, H, D] → [N, H, D] by H^T = H."""
-        return torch.matmul(x, self.H)
+        """Un-rotate [N, H, D] → [N, H, D] by H^T = H (in fp32 for precision)."""
+        if self.no_rotation:
+            return x
+        return torch.matmul(x.float(), self.H).to(x.dtype)
 
     # ── Flush ──────────────────────────────────────────────────────────────
 
     def _flush_full_blocks(self, forward_batch: "ForwardBatch"):
         """Detect and flush full blocks from fp16 tail pool to int4.
 
-        Called after set_kv_buffer writes, before the attention kernel reads.
-        In practice, flush happens at the START of the next step (on already-
-        committed tokens), not mid-step — this matches the vLLM approach.
+        Called after set_kv_buffer writes. The flush manager tracks fill
+        counts per block; here we just check which blocks are ready.
         """
         if self.flush_manager is None:
             return
 
-        # Get block table and seq lens from forward batch
-        block_table = forward_batch.req_to_token_pool.req_to_token
-        seq_lens = forward_batch.seq_lens
-
-        # Find blocks to flush: blocks that are full (fill_count >= group),
-        # not sinks, not already compressed.
-        # This is a simplified version — the vLLM impl has more sophisticated
-        # tracking with spec-decode safety.
         flush_ids = self.flush_manager.get_blocks_to_flush()
         if not flush_ids:
             return
 
         # Tail pools are the pool's k_buffer/v_buffer (per layer)
-        # The flush manager handles the batched Sinkhorn + RTN
         tail_k = self.token_to_kv_pool.k_buffer
         tail_v = self.token_to_kv_pool.v_buffer
         self.flush_manager.flush_blocks(flush_ids, tail_k, tail_v)
@@ -179,55 +202,54 @@ class KVarNAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        """Decode forward: rotate Q/K/V, write to pool, fused compressed attention."""
-        # Reshape to [N, H, D] for rotation
-        q_3d = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        k_3d = k.view(-1, layer.tp_kv_head_num, layer.qk_head_dim)
-        v_3d = v.view(-1, layer.tp_kv_head_num, layer.v_head_dim)
+        """Decode forward: rotate Q/K/V, delegate to inner Triton backend.
 
-        # Rotate
-        q_rot = self._rotate(q_3d)
-        k_rot = self._rotate(k_3d)
-        v_rot = self._rotate(v_3d) if v_3d.shape[-1] == self.head_dim else v_3d
+        The inner backend handles pool writes and attention computation.
+        We only add Hadamard rotation of Q/K/V before, and un-rotation of
+        the output after.
+        """
+        pool_dtype = self.token_to_kv_pool.dtype
+        model_dtype = q.dtype
 
-        # Flatten back for the pool write
-        q_flat = q_rot.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
-        k_flat = k_rot.reshape(-1, layer.tp_kv_head_num * layer.qk_head_dim)
-        v_flat = v_rot.reshape(-1, layer.tp_kv_head_num * layer.v_head_dim)
-
-        # Write rotated K/V to the tail pool
-        if save_kv_cache:
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k_flat, v_flat,
+        # Debug: log shapes on first call
+        if not hasattr(self, '_debug_logged'):
+            logger.info(
+                f"KVarN decode: q.shape={q.shape}, q.dtype={q.dtype}, "
+                f"k.shape={k.shape}, v.shape={v.shape}, "
+                f"pool_dtype={pool_dtype}, model_dtype={model_dtype}, "
+                f"tp_q_head_num={layer.tp_q_head_num}, "
+                f"tp_k_head_num={layer.tp_k_head_num}, "
+                f"qk_head_dim={layer.qk_head_dim}, v_head_dim={layer.v_head_dim}"
             )
+            self._debug_logged = True
 
-        # Flush full blocks to int4 (committed tokens from previous steps)
-        self._flush_full_blocks(forward_batch)
+        # Q comes in as [N, H*D] or [N, H, D]. K/V come in as [N, H, D].
+        # Rotate in the 3D view, then pass to inner backend in the ORIGINAL
+        # input format (the inner backend handles reshaping internally).
+        q_input_shape = q.shape
+        q_3d = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        k_3d = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        v_3d = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
 
-        # Check if any blocks have been flushed to int4.
-        # If not, all blocks are in fp16 — use standard Triton decode.
-        has_compressed = (
-            self.flush_manager is not None
-            and self.flush_manager.compressed_cache is not None
-            and any(s.is_compressed for s in self.flush_manager.block_states)
+        # Rotate (in fp32 for precision, then back to pool dtype)
+        q_rot = self._rotate(q_3d.to(pool_dtype))
+        k_rot = self._rotate(k_3d.to(pool_dtype))
+        v_rot = self._rotate(v_3d.to(pool_dtype)) if v_3d.shape[-1] == self.head_dim else v_3d.to(pool_dtype)
+
+        # Pass to inner backend in the same format as the input
+        q_out = q_rot.reshape(q_input_shape) if q_input_shape != q_rot.shape else q_rot
+        k_out = k_rot.reshape(k.shape) if k.shape != k_rot.shape else k_rot
+        v_out = v_rot.reshape(v.shape) if v.shape != v_rot.shape else v_rot
+
+        # Let the inner backend handle pool write + attention
+        o = self.inner.forward_decode(
+            q_out, k_out, v_out, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs,
         )
 
-        if not has_compressed:
-            # No compressed blocks — standard Triton decode on fp16 pool.
-            # The Hadamard rotation ensures attention math is correct:
-            # QK^T = (QH)(KH)^T = Q(HH^T)K^T = QK^T (since H is orthonormal).
-            o = self.inner.forward_decode(
-                q_flat, k_flat, v_flat, layer, forward_batch, save_kv_cache=False,
-            )
-        else:
-            # Use the fused KVarN decode kernel that reads from both pools.
-            o = self._fused_decode(q_rot, layer, forward_batch)
-            o = o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
-
-        # Un-rotate output
+        # Un-rotate output and convert back to model dtype
         o_3d = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
         o_unrot = self._unrotate(o_3d) if o_3d.shape[-1] == self.head_dim else o_3d
-        return o_unrot.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+        return o_unrot.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(model_dtype)
 
     def _fused_decode(
         self,
@@ -249,7 +271,7 @@ class KVarNAttnBackend(AttentionBackend):
 
         cfg = self.kvarn_config
         B = forward_batch.batch_size
-        Hk = layer.tp_kv_head_num
+        Hk = layer.tp_k_head_num
         Hq = layer.tp_q_head_num
         D = self.head_dim
         G = self.group
@@ -355,70 +377,37 @@ class KVarNAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        """Extend forward: rotate, write to pool, materialize+standard attention.
+        """Extend forward: rotate Q/K/V, delegate to inner Triton backend."""
+        pool_dtype = self.token_to_kv_pool.dtype
+        model_dtype = q.dtype
 
-        For extend, we materialize the full K/V from both pools into a flat
-        fp16 buffer (using the build_packed_kv kernel), then run standard
-        Triton attention. This is simpler than fusing dequant into the extend
-        kernel and is acceptable since prefill is less latency-sensitive.
-        """
-        # Reshape to [N, H, D] for rotation
+        # Q comes in as [N, H*D] or [N, H, D]. K/V come in as [N, H, D].
+        q_input_shape = q.shape
         q_3d = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        k_3d = k.view(-1, layer.tp_kv_head_num, layer.qk_head_dim)
-        v_3d = v.view(-1, layer.tp_kv_head_num, layer.v_head_dim)
+        k_3d = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        v_3d = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
 
         # Rotate
-        q_rot = self._rotate(q_3d)
-        k_rot = self._rotate(k_3d)
-        v_rot = self._rotate(v_3d) if v_3d.shape[-1] == self.head_dim else v_3d
+        q_rot = self._rotate(q_3d.to(pool_dtype))
+        k_rot = self._rotate(k_3d.to(pool_dtype))
+        v_rot = self._rotate(v_3d.to(pool_dtype)) if v_3d.shape[-1] == self.head_dim else v_3d.to(pool_dtype)
 
-        # Write rotated K/V to the tail pool
-        if save_kv_cache:
-            self.token_to_kv_pool.set_kv_buffer(
-                layer,
-                forward_batch.out_cache_loc,
-                k_rot.reshape(-1, layer.tp_kv_head_num * layer.qk_head_dim),
-                v_rot.reshape(-1, layer.tp_kv_head_num * layer.v_head_dim),
-            )
+        # Pass to inner backend in the same format as the input
+        q_out = q_rot.reshape(q_input_shape) if q_input_shape != q_rot.shape else q_rot
+        k_out = k_rot.reshape(k.shape) if k.shape != k_rot.shape else k_rot
+        v_out = v_rot.reshape(v.shape) if v.shape != v_rot.shape else v_rot
 
-        # Flush full blocks to int4 (committed tokens from previous steps)
-        self._flush_full_blocks(forward_batch)
-
-        # For extend, use the standard Triton path.
-        # The tail pool (fp16) contains the current tokens' K/V.
-        # For previously-flushed blocks, the standard path reads from
-        # get_key_buffer which returns the fp16 tail pool — but flushed
-        # blocks are in int4, not the tail pool!
-        #
-        # For now (no blocks flushed yet during extend), the standard path
-        # works because all history is in the tail pool. Once flushing is
-        # active, we need the build_packed_kv kernel to materialize from
-        # both pools.
-        q_flat = q_rot.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
-        k_flat = k_rot.reshape(-1, layer.tp_kv_head_num * layer.qk_head_dim)
-        v_flat = v_rot.reshape(-1, layer.tp_kv_head_num * layer.v_head_dim)
-
+        # Let the inner backend handle pool write + attention
         o = self.inner.forward_extend(
-            q_flat, k_flat, v_flat, layer, forward_batch, save_kv_cache=False,
+            q_out, k_out, v_out, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs,
         )
 
-        # Un-rotate output
+        # Un-rotate output and convert back to model dtype
         o_3d = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
         o_unrot = self._unrotate(o_3d) if o_3d.shape[-1] == self.head_dim else o_3d
-        return o_unrot.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+        return o_unrot.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(model_dtype)
 
     # ── Dispatch ──────────────────────────────────────────────────────────
 
-    def forward(self, *args, **kwargs):
-        """Main forward entry point."""
-        forward_batch = kwargs.get("forward_batch", args[4] if len(args) > 4 else None)
-        if forward_batch is None:
-            return super().forward(*args, **kwargs)
-
-        if forward_batch.forward_mode.is_idle():
-            q = args[0] if args else kwargs["q"]
-            return q.new_empty(q.shape[0], args[3].tp_q_head_num * args[3].v_head_dim)
-        elif forward_batch.forward_mode.is_decode():
-            return self.forward_decode(*args, **kwargs)
-        else:
-            return self.forward_extend(*args, **kwargs)
+    # The base class's forward() dispatches to forward_decode/forward_extend
+    # correctly. We don't need to override it.

@@ -2790,10 +2790,10 @@ class KVarNTokenToKVPool(KVCache):
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
     ):
-        # KVarN uses fp16 for the tail pool regardless of the incoming dtype
-        # (which is torch.uint8 as a marker). The compressed int4 cache (to be
-        # added in Phase 3) will use uint8 storage.
-        actual_dtype = torch.float16
+        # KVarN uses the model dtype for the tail pool (to avoid precision
+        # loss from bf16→fp16 conversion). The compressed int4 cache (to be
+        # fully wired in Phase 3) uses uint8 storage.
+        actual_dtype = dtype if dtype != torch.uint8 else torch.bfloat16
         super().__init__(
             size,
             page_size,

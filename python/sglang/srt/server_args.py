@@ -187,6 +187,8 @@ ATTENTION_BACKEND_CHOICES = [
     "nsa",  # Deprecated alias for "dsa"
     "dsv4",
     "compressed",  # Deprecated alias for "dsv4"
+    # KVarN
+    "kvarn",
     # NVIDIA specific
     "cutlass_mla",
     "fa3",
@@ -3298,6 +3300,18 @@ class ServerArgs:
                 logger.info(
                     "Setting page_size=64 as default for "
                     "SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d."
+                )
+            elif self.kv_cache_dtype.startswith("kvarn_"):
+                # KVarN requires page_size to match the tile group size.
+                # The group is embedded in the preset name (e.g. g128).
+                from sglang.srt.layers.quantization.kvarn.config import (
+                    KVARN_PRESETS,
+                )
+                preset = KVARN_PRESETS.get(self.kv_cache_dtype, {})
+                self.page_size = preset.get("group", 128)
+                logger.info(
+                    f"Setting page_size={self.page_size} for KVarN "
+                    f"(kv_cache_dtype={self.kv_cache_dtype})."
                 )
             elif not is_musa():
                 self.page_size = 1
