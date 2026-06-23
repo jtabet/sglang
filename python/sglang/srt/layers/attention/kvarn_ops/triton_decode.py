@@ -547,10 +547,12 @@ def _kvarn_fused_decode_stage2(
 def kvarn_decode_attention(
     query: torch.Tensor,            # [B, Hq, D]   fp16/bf16
     kv_cache: torch.Tensor,         # [num_blocks, num_kv_heads, TILE_BYTES] uint8
+    tail_K: torch.Tensor,           # [POOL_SIZE, group, Hk, D] fp16 (layer-specific)
+    tail_V: torch.Tensor,           # [POOL_SIZE, group, Hk, D] fp16 (layer-specific)
     hadamard: torch.Tensor,         # [D, D]       fp32
     scale: float,
     cfg,
-    impl,                           # KVarNAttnBackend (has pool + scratch buffers)
+    impl,                           # KVarNAttnBackend (has block_to_slot_t + strides)
     block_table: torch.Tensor,      # [B, max_blocks] int32
     seq_lens: torch.Tensor,         # [B] int32
     cu_seqlens: torch.Tensor,       # [B+1] int32 (prefix sum)
@@ -600,8 +602,7 @@ def kvarn_decode_attention(
         _kvarn_fused_decode_kernel[(B, Hk)](
             q_rot_fp16.view(B, Hq, D), seq_lens, block_table, seq_lens,
             impl._block_to_slot_t,
-            kv_cache, impl.tail_K[0] if isinstance(impl.tail_K, list) else impl.tail_K,
-            impl.tail_V[0] if isinstance(impl.tail_V, list) else impl.tail_V,
+            kv_cache, tail_K, tail_V,
             fused_out.view(B, Hq, D), scale,
             Hq * D, D, block_table.stride(0),
             kv_cache.stride(0), kv_cache.stride(1),
@@ -611,7 +612,7 @@ def kvarn_decode_attention(
         )
         output_rot = fused_out
     else:
-        # Materialize path: build packed fp16 K/V then FlashAttention
+        # Materialize path: build packed fp16 K/V then SDPA
         total_tokens = cu_seqlens[-1].item()
         K_packed = torch.empty(total_tokens, Hk, D, dtype=torch.float16, device=device)
         V_packed = torch.empty(total_tokens, Hk, D, dtype=torch.float16, device=device)
@@ -619,9 +620,7 @@ def kvarn_decode_attention(
         _kvarn_build_packed_kv_kernel[(B * max_blocks_per_req, Hk)](
             block_table, seq_lens, cu_seqlens,
             impl._block_to_slot_t,
-            kv_cache,
-            impl.tail_K[0] if isinstance(impl.tail_K, list) else impl.tail_K,
-            impl.tail_V[0] if isinstance(impl.tail_V, list) else impl.tail_V,
+            kv_cache, tail_K, tail_V,
             K_packed, V_packed,
             block_table.stride(0),
             kv_cache.stride(0), kv_cache.stride(1),
@@ -637,8 +636,7 @@ def kvarn_decode_attention(
             V_S_ROW_OFFSET=cfg.v_s_row_offset, V_ZP_OFFSET=cfg.v_zp_offset,
             num_warps=4, num_stages=2,
         )
-        # Use SDPA for the attention (no flash_attn_varlen_func in sglang)
-        # For decode: each query is 1 token, attending to all keys
+        # Use SDPA for the attention
         output_rot = torch.empty(B, Hq, D, dtype=torch.float16, device=device)
         for i in range(B):
             seq_len = int(seq_lens[i].item())

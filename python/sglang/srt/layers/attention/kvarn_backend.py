@@ -291,8 +291,14 @@ class KVarNAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         sinks=None,
     ) -> torch.Tensor:
-        """Decode forward: one token per request."""
+        """Decode forward: one token per request.
+
+        Uses the fused Triton decode kernel when KVARN_FUSED_DECODE=1 (default):
+        dequant int4 in registers + online-softmax flash-decode.
+        Falls back to Python gather + SDPA when KVARN_FUSED_DECODE=0.
+        """
         from sglang.srt.layers.attention.kvarn_ops.triton_decode import (
+            kvarn_decode_attention,
             kvarn_scatter_store,
         )
 
@@ -321,35 +327,49 @@ class KVarNAttnBackend(AttentionBackend):
             else:
                 self._store_to_tail_pool(layer_id, k_3d, v_3d, forward_batch.out_cache_loc)
 
-        # Rotate Q
-        q_rot = (q_3d.float() @ H).to(q.dtype)
-
-        # Gather K/V per request and run SDPA
-        out = torch.empty(N, self.num_heads, self.head_dim, dtype=q.dtype, device=q.device)
-
-        req_pool_indices = forward_batch.req_pool_indices
-        seq_lens = forward_batch.seq_lens
-        req_to_token = self.model_runner.req_to_token_pool.req_to_token
-
-        for i in range(N):
-            req_idx = int(req_pool_indices[i].item())
-            seq_len = int(seq_lens[i].item())
-
-            block_ids = self._get_block_ids_for_request(req_idx, seq_len, req_to_token)
-            K_full, V_full = self._gather_request_kv(layer_id, block_ids, seq_len)
-
-            q_i = q_rot[i:i+1].transpose(0, 1).unsqueeze(0).float()
-            K_t = K_full.transpose(0, 1).unsqueeze(0).float()
-            V_t = V_full.transpose(0, 1).unsqueeze(0).float()
-
-            o = F.scaled_dot_product_attention(
-                q_i, K_t, V_t, is_causal=False, scale=self.scale,
-                enable_gqa=self.num_kv_heads < self.num_heads,
+        use_fused_decode = os.environ.get("KVARN_FUSED_DECODE", "1") == "1"
+        if use_fused_decode:
+            # Fused Triton decode kernel
+            block_table, seq_lens_t, cu_seqlens = self._build_block_table(forward_batch)
+            out = kvarn_decode_attention(
+                query=q_3d,
+                kv_cache=self.kv_cache_int4[layer_id],
+                tail_K=self.tail_K[layer_id],
+                tail_V=self.tail_V[layer_id],
+                hadamard=H,
+                scale=self.scale,
+                cfg=self.cfg,
+                impl=self,
+                block_table=block_table,
+                seq_lens=seq_lens_t,
+                cu_seqlens=cu_seqlens,
             )
-            o = o[0, :, 0, :].to(q.dtype)
-            out[i] = (o.float() @ H.T).to(q.dtype)
+            return out.view(N, self.num_heads * self.head_dim)
+        else:
+            # Python gather + SDPA fallback
+            q_rot = (q_3d.float() @ H).to(q.dtype)
+            out = torch.empty(N, self.num_heads, self.head_dim, dtype=q.dtype, device=q.device)
+            req_pool_indices = forward_batch.req_pool_indices
+            seq_lens = forward_batch.seq_lens
+            req_to_token = self.model_runner.req_to_token_pool.req_to_token
 
-        return out.view(N, self.num_heads * self.head_dim)
+            for i in range(N):
+                req_idx = int(req_pool_indices[i].item())
+                seq_len = int(seq_lens[i].item())
+                block_ids = self._get_block_ids_for_request(req_idx, seq_len, req_to_token)
+                K_full, V_full = self._gather_request_kv(layer_id, block_ids, seq_len)
+
+                q_i = q_rot[i:i+1].transpose(0, 1).unsqueeze(0).float()
+                K_t = K_full.transpose(0, 1).unsqueeze(0).float()
+                V_t = V_full.transpose(0, 1).unsqueeze(0).float()
+                o = F.scaled_dot_product_attention(
+                    q_i, K_t, V_t, is_causal=False, scale=self.scale,
+                    enable_gqa=self.num_kv_heads < self.num_heads,
+                )
+                o = o[0, :, 0, :].to(q.dtype)
+                out[i] = (o.float() @ H.T).to(q.dtype)
+
+            return out.view(N, self.num_heads * self.head_dim)
 
     def forward_extend(
         self,
