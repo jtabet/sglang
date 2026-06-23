@@ -196,6 +196,98 @@ class KVarNFlushManager:
 
         logger.info(f"KVarN flush: {nB} blocks compressed to int4")
 
+    def flush_batched_fast(
+        self,
+        block_ids: list[int],
+        tail_K: list[torch.Tensor],
+        tail_V: list[torch.Tensor],
+        slots: list[int],
+        compressed_cache: list[torch.Tensor],
+    ):
+        """Batched flush with vectorized write — one index_select gather +
+        one index_copy scatter per (layer, chunk), replacing the per-(block,head)
+        Python write loop. Numerically identical to flush_blocks_batched.
+
+        Matches vLLM's _batched_flush: assembles packed cache records via
+        tensor concatenation in config-offset order and writes with a single
+        scatter.
+        """
+        if not block_ids:
+            return
+
+        cfg = self.cfg
+        Hk = self.num_kv_heads
+        D = self.head_dim
+        vD = self.v_head_dim
+        G = self.group
+        T = cfg.tile_bytes_aligned
+        kpb = cfg.k_packed_bytes
+        vpb = cfg.v_packed_bytes
+        nB = len(block_ids)
+
+        # Chunk to bound transient gather memory
+        CHUNK_BLOCKS = max(1, 2048 // max(Hk, 1))
+
+        slots_dev = torch.as_tensor(slots, dtype=torch.long, device=tail_K[0].device)
+        bids_dev = torch.as_tensor(block_ids, dtype=torch.long, device=tail_K[0].device)
+
+        for layer_id in range(self.num_layers):
+            kvc = compressed_cache[layer_id]
+            for c0 in range(0, nB, CHUNK_BLOCKS):
+                bchunk = block_ids[c0:c0 + CHUNK_BLOCKS]
+                slot_t = slots_dev[c0:c0 + CHUNK_BLOCKS]
+                bid_t = bids_dev[c0:c0 + CHUNK_BLOCKS]
+                nBc = len(bchunk)
+
+                # One gather per chunk
+                K_rot = tail_K[layer_id].index_select(0, slot_t).float()  # [nBc, G, Hk, D]
+                V_rot = tail_V[layer_id].index_select(0, slot_t).float()
+
+                # Tiles: K [N, D, G] (absorb=channel), V [N, G, D] (absorb=token)
+                K_tiles = K_rot.permute(0, 2, 3, 1).reshape(nBc * Hk, D, G)
+                V_tiles = V_rot.permute(0, 2, 1, 3).reshape(nBc * Hk, G, vD)
+
+                # Sinkhorn + RTN (fused when square, else separate)
+                if K_tiles.shape[1:] == V_tiles.shape[1:]:
+                    # Square: fuse into one Sinkhorn launch
+                    K_bal, K_sc, K_sr = variance_normalize_batched(
+                        torch.cat([K_tiles, V_tiles], dim=0), iterations=cfg.sinkhorn_iters
+                    )
+                    nk = nBc * Hk
+                    K_out = kvarn_store_tile_k_batch_from_sinkhorn(
+                        K_bal[:nk], K_sc[:nk], K_sr[:nk], bits=cfg.key_bits)
+                    V_out = kvarn_store_tile_v_batch_from_sinkhorn(
+                        K_bal[nk:], K_sc[nk:], K_sr[nk:], bits=cfg.value_bits)
+                else:
+                    # Non-square (e.g. head_dim=256, group=128): separate launches
+                    K_bal, K_sc, K_sr = variance_normalize_batched(
+                        K_tiles, iterations=cfg.sinkhorn_iters)
+                    V_bal, V_sc, V_sr = variance_normalize_batched(
+                        V_tiles, iterations=cfg.sinkhorn_iters)
+                    K_out = kvarn_store_tile_k_batch_from_sinkhorn(
+                        K_bal, K_sc.squeeze(1), K_sr.squeeze(2), bits=cfg.key_bits)
+                    V_out = kvarn_store_tile_v_batch_from_sinkhorn(
+                        V_bal, V_sc.squeeze(1), V_sr.squeeze(2), bits=cfg.value_bits)
+
+                # Assemble packed cache record [nBc*Hk, tile_bytes] via concatenation
+                M = nBc * Hk
+                parts = [
+                    K_out["q_packed_uint8"].reshape(M, kpb),
+                    K_out["s_col_K"].contiguous().view(torch.uint8),
+                    K_out["zp_K"].contiguous().view(torch.uint8),
+                    K_out["s_row_K"].contiguous().view(torch.uint8),
+                    V_out["q_packed_uint8"].reshape(M, vpb),
+                    V_out["s_col_V"].contiguous().view(torch.uint8),
+                    V_out["s_row_V"].contiguous().view(torch.uint8),
+                    V_out["zp_V"].contiguous().view(torch.uint8),
+                ]
+                rec = torch.cat(parts, dim=1)  # [M, tile_bytes]
+                if rec.shape[1] < T:
+                    rec = torch.nn.functional.pad(rec, (0, T - rec.shape[1]))
+
+                # One scatter per chunk
+                kvc[bid_t] = rec.view(nBc, Hk, T)
+
     def dequant_block(
         self,
         block_id: int,

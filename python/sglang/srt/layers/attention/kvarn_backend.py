@@ -114,6 +114,10 @@ class KVarNAttnBackend(AttentionBackend):
 
         # Sink blocks: block_ids that stay in fp16, never flushed
         self._sink_block_ids: set[int] = set()
+        # Retired sinks: finished requests' sink blocks, kept fp16-resident
+        # for future prefix-cache hits. Lazily evicted (flushed to int4) when
+        # pool slots run dry, oldest first.
+        self._retired_sinks: dict[int, None] = {}
 
         # Flush manager
         self.flush_manager = KVarNFlushManager(
@@ -196,6 +200,17 @@ class KVarNAttnBackend(AttentionBackend):
         self._tail_K_stride1 = self.tail_K[0].stride(1)
         self._tail_K_stride2 = self.tail_K[0].stride(2)
 
+        # Pre-allocated rotation scratch (avoids allocation during CUDA graph capture)
+        max_batched_tokens = mr.server_args.max_prefill_tokens or 16384
+        self._k_rot_scratch = torch.empty(
+            max_batched_tokens, self.num_kv_heads, self.head_dim,
+            dtype=torch.float16, device=device,
+        )
+        self._v_rot_scratch = torch.empty_like(self._k_rot_scratch)
+
+        # Cached fp16 Hadamard for fast matmul in store path
+        self._H_fp16 = self._get_hadamard(device).to(torch.float16).contiguous()
+
         logger.info(
             f"KVarN pools allocated: tail_pool_slots={self.pool_slots}, "
             f"compressed_blocks={self.num_blocks}, "
@@ -204,9 +219,21 @@ class KVarNAttnBackend(AttentionBackend):
         )
 
     def _alloc_slot(self, block_id: int) -> int:
-        """Allocate a tail pool slot for a block."""
+        """Allocate a tail pool slot for a block.
+
+        If no free slots are available, evicts the oldest retired sink
+        (flushes it to int4 so future prefix-cache hits still find a valid
+        tile) and reuses its slot.
+        """
         if not self._free_slots:
-            raise RuntimeError("KVarN tail pool exhausted — no free slots")
+            # Evict oldest retired sink
+            if self._retired_sinks:
+                old = next(iter(self._retired_sinks))
+                self._retired_sinks.pop(old)
+                self._flush_block(old)
+                self._sink_block_ids.discard(old)
+            if not self._free_slots:
+                raise RuntimeError("KVarN tail pool exhausted — no free slots")
         slot = self._free_slots.pop()
         self._block_to_slot[block_id] = slot
         self._slot_to_block[slot] = block_id
@@ -250,8 +277,9 @@ class KVarNAttnBackend(AttentionBackend):
         self._maybe_flush_blocks(forward_batch)
 
         # Pre-allocate tail pool slots for new blocks
-        if forward_batch.out_cache_loc is not None:
-            self._ensure_slots_for_tokens(forward_batch.out_cache_loc)
+        out_cache_loc = getattr(forward_batch, 'out_cache_loc', None)
+        if out_cache_loc is not None:
+            self._ensure_slots_for_tokens(out_cache_loc)
 
     def init_forward_metadata_out_graph(
         self, forward_batch: "ForwardBatch", in_capture: bool = False,
@@ -266,8 +294,9 @@ class KVarNAttnBackend(AttentionBackend):
 
         # Pre-allocate tail pool slots for new blocks in this batch
         # (must happen before the captured forward_decode scatter store)
-        if forward_batch.out_cache_loc is not None:
-            self._ensure_slots_for_tokens(forward_batch.out_cache_loc)
+        out_cache_loc = getattr(forward_batch, 'out_cache_loc', None)
+        if out_cache_loc is not None:
+            self._ensure_slots_for_tokens(out_cache_loc)
 
         # Build block_table/seq_lens/cu_seqlens into static buffers
         if hasattr(self, '_cg_block_table'):
@@ -327,6 +356,60 @@ class KVarNAttnBackend(AttentionBackend):
         self._cg_max_batch_size = max_batch_size
         self._cg_max_blocks = max_blocks_per_req
 
+        # Warm up Triton kernels to avoid JIT stalls during capture / serving
+        self._warmup_kernels(max_batch_size, max_blocks_per_req)
+
+    def _warmup_kernels(self, max_batch_size: int, max_blocks_per_req: int):
+        """Warm up all Triton kernels with dummy inputs to trigger JIT compilation."""
+        import triton
+        from sglang.srt.layers.attention.kvarn_ops.triton_decode import (
+            kvarn_scatter_store,
+            kvarn_decode_attention,
+        )
+
+        device = self.device
+        B = min(max_batch_size, 4)
+        D = self.head_dim
+        Hk = self.num_kv_heads
+        Hq = self.num_heads
+        G = self.group
+
+        # Warm up scatter store
+        dummy_k = torch.zeros(B, Hk, D, dtype=torch.float16, device=device)
+        dummy_v = torch.zeros(B, Hk, D, dtype=torch.float16, device=device)
+        dummy_loc = torch.zeros(B, dtype=torch.int32, device=device)
+        kvarn_scatter_store(
+            dummy_k, dummy_v, dummy_loc,
+            self._block_to_slot_t,
+            self.tail_K[0], self.tail_V[0],
+            G, D, self._block_lookup_size,
+        )
+
+        # Warm up fused decode
+        dummy_q = torch.zeros(B, Hq, D, dtype=torch.float16, device=device)
+        dummy_bt = torch.zeros(B, max_blocks_per_req, dtype=torch.int32, device=device)
+        dummy_sl = torch.ones(B, dtype=torch.int32, device=device)
+        dummy_cs = torch.zeros(B + 1, dtype=torch.int32, device=device)
+        dummy_cs[1:] = torch.cumsum(dummy_sl, dim=0)
+        try:
+            _ = kvarn_decode_attention(
+                query=dummy_q,
+                kv_cache=self.kv_cache_int4[0],
+                tail_K=self.tail_K[0],
+                tail_V=self.tail_V[0],
+                hadamard=self._H_fp16.float(),
+                scale=self.scale,
+                cfg=self.cfg,
+                impl=self,
+                block_table=dummy_bt,
+                seq_lens=dummy_sl,
+                cu_seqlens=dummy_cs,
+            )
+        except Exception as e:
+            logger.warning(f"KVarN kernel warmup failed (non-fatal): {e}")
+
+        logger.info("KVarN Triton kernels warmed up")
+
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         return 1
 
@@ -337,6 +420,7 @@ class KVarNAttnBackend(AttentionBackend):
         self._block_fill.clear()
         self._free_slots = list(range(self.pool_slots))
         self._sink_block_ids.clear()
+        self._retired_sinks.clear()
 
     # ── Forward methods ─────────────────────────────────────────────────────
 
@@ -373,8 +457,11 @@ class KVarNAttnBackend(AttentionBackend):
         if save_kv_cache:
             use_triton_store = os.environ.get("KVARN_TRITON_STORE", "1") == "1"
             if use_triton_store:
-                k_rot = (k_3d.float() @ H).to(torch.float16)
-                v_rot = (v_3d.float() @ H).to(torch.float16)
+                # Use pre-allocated scratch + cached fp16 Hadamard (capture-safe)
+                k_rot = self._k_rot_scratch[:N]
+                v_rot = self._v_rot_scratch[:N]
+                torch.matmul(k_3d.to(torch.float16), self._H_fp16, out=k_rot)
+                torch.matmul(v_3d.to(torch.float16), self._H_fp16, out=v_rot)
                 kvarn_scatter_store(
                     k_rot, v_rot,
                     forward_batch.out_cache_loc.to(torch.int32),
@@ -468,8 +555,11 @@ class KVarNAttnBackend(AttentionBackend):
         if save_kv_cache:
             use_triton_store = os.environ.get("KVARN_TRITON_STORE", "1") == "1"
             if use_triton_store:
-                k_rot = (k_3d.float() @ H).to(torch.float16)
-                v_rot = (v_3d.float() @ H).to(torch.float16)
+                # Use pre-allocated scratch + cached fp16 Hadamard (capture-safe)
+                k_rot = self._k_rot_scratch[:N]
+                v_rot = self._v_rot_scratch[:N]
+                torch.matmul(k_3d.to(torch.float16), self._H_fp16, out=k_rot)
+                torch.matmul(v_3d.to(torch.float16), self._H_fp16, out=v_rot)
                 kvarn_scatter_store(
                     k_rot, v_rot,
                     forward_batch.out_cache_loc.to(torch.int32),
@@ -844,16 +934,154 @@ class KVarNAttnBackend(AttentionBackend):
     def _maybe_flush_blocks(self, forward_batch: "ForwardBatch"):
         """Flush full blocks from tail pool to int4 compressed cache.
 
-        A block is "full" when it has `group` tokens stored and is not a sink.
-        This runs eagerly before each forward pass.
-        """
-        blocks_to_flush = []
-        for block_id, fill in list(self._block_fill.items()):
-            if fill >= self.group and block_id not in self._sink_block_ids:
-                blocks_to_flush.append(block_id)
+        Uses the committed-token boundary (seq_len - query_len) to determine
+        which blocks are safe to flush — never quantizes speculative tokens
+        that may be rejected. Walks backward from the committed boundary
+        while blocks still hold pool slots.
 
-        for block_id in blocks_to_flush:
-            self._flush_block(block_id)
+        Also reclaims slots from finished requests: complete blocks are
+        flushed (so prefix cache hits find valid int4 tiles), partial blocks
+        are discarded (scheduler never prefix-caches partial blocks).
+
+        Sink blocks are NEVER flushed — they stay fp16 for the request's
+        lifetime, preserving KVarN's fp16-sink accuracy on multi-turn traffic.
+        When a request finishes, its sink is RETIRED (kept fp16-resident for
+        future prefix-cache hits) and lazily evicted (flushed to int4) only
+        when pool slots run dry.
+        """
+        GROUP = self.group
+        B = forward_batch.batch_size
+        seq_lens = forward_batch.seq_lens
+        req_pool_indices = forward_batch.req_pool_indices
+        req_to_token = self.model_runner.req_to_token_pool.req_to_token
+
+        # Get per-request query lengths
+        extend_seq_lens = getattr(forward_batch, 'extend_seq_lens', None)
+        extend_prefix_lens = getattr(forward_batch, 'extend_prefix_lens', None)
+        forward_mode = getattr(forward_batch, 'forward_mode', None)
+        if forward_mode is not None and hasattr(forward_mode, 'is_decode') and forward_mode.is_decode():
+            query_lens_cpu = [1] * B
+        elif extend_seq_lens is not None:
+            ext_list = extend_seq_lens.cpu().tolist()
+            query_lens_cpu = ext_list
+        else:
+            # During CUDA graph replay, forward_mode may be a SimpleNamespace
+            # without is_decode(). Treat as decode (query_len=1).
+            if forward_mode is None:
+                query_lens_cpu = [1] * B
+            else:
+                query_lens_cpu = seq_lens.cpu().tolist()
+
+        seq_lens_cpu = seq_lens.cpu().tolist()
+
+        # Build block_table for this batch
+        block_table_rows = []
+        for i in range(B):
+            req_idx = int(req_pool_indices[i].item())
+            sl = seq_lens_cpu[i]
+            n_blocks = (sl + self.page_size - 1) // self.page_size
+            row = []
+            for b in range(n_blocks):
+                token_pos = b * self.page_size
+                if token_pos < req_to_token.shape[1]:
+                    slot = int(req_to_token[req_idx, token_pos].item())
+                    row.append(slot // self.page_size if slot >= 0 else -1)
+                else:
+                    row.append(-1)
+            block_table_rows.append(row)
+
+        # Identify blocks needed this step (sinks + blocks receiving writes)
+        blocks_needed: set[int] = set()
+        for b in range(B):
+            sl = seq_lens_cpu[b]
+            if sl <= 0 or b >= len(block_table_rows):
+                continue
+            row = block_table_rows[b]
+            q_len = query_lens_cpu[b] if b < len(query_lens_cpu) else 1
+            committed = max(sl - q_len, 0)
+            for k in range(committed // GROUP,
+                           min((sl - 1) // GROUP, len(row) - 1) + 1):
+                bid = row[k] if k < len(row) else -1
+                if bid >= 0:
+                    blocks_needed.add(bid)
+                    self._block_fill[bid] = min(sl, (k + 1) * GROUP) - k * GROUP
+
+        # Mark sinks (block_table[r][0] for requests that write block 0 this step)
+        row0_set: set[int] = set()
+        for b in range(B):
+            if b >= len(block_table_rows) or not block_table_rows[b]:
+                continue
+            s0 = block_table_rows[b][0]
+            if s0 < 0:
+                continue
+            row0_set.add(s0)
+            if s0 not in self._sink_block_ids and s0 in blocks_needed:
+                self._sink_block_ids.add(s0)
+                if self._block_to_slot_t is not None and s0 < self._block_lookup_size:
+                    pass  # sinks tracked in CPU set only
+
+        # Un-retire any retired block named this step
+        for bid in [b for b in self._retired_sinks if b in blocks_needed]:
+            self._retired_sinks.pop(bid, None)
+            if bid not in row0_set and bid in self._sink_block_ids:
+                self._sink_block_ids.discard(bid)
+
+        # Walk backward from committed boundary to find full-but-unflushed blocks
+        flush_block_ids: list[int] = []
+        flush_seen: set[int] = set()
+        for b in range(B):
+            if b >= len(block_table_rows):
+                continue
+            sl = seq_lens_cpu[b]
+            row = block_table_rows[b]
+            if sl <= 0:
+                continue
+            q_len = query_lens_cpu[b] if b < len(query_lens_cpu) else 1
+            committed_len = max(sl - q_len, 0)
+            k = min(committed_len // GROUP - 1, len(row) - 1)
+            while 1 <= k:
+                bid = row[k] if k < len(row) else -1
+                if (bid < 0 or bid in flush_seen or bid in self._sink_block_ids
+                        or bid not in self._block_to_slot):
+                    break
+                flush_seen.add(bid)
+                flush_block_ids.append(bid)
+                k -= 1
+
+        # Reclaim slot-holding blocks from finished requests
+        discard_ids: list[int] = []
+        for bid in [b for b in self._block_to_slot
+                    if b not in blocks_needed and b not in flush_seen]:
+            full = self._block_fill.get(bid, 0) >= GROUP
+            if full and bid in self._sink_block_ids:
+                # Retire the sink — keep fp16-resident for future prefix-cache hits
+                self._retired_sinks[bid] = None
+                continue
+            if full:
+                flush_seen.add(bid)
+                flush_block_ids.append(bid)
+            else:
+                discard_ids.append(bid)
+            if bid in self._sink_block_ids:
+                self._sink_block_ids.discard(bid)
+
+        # Execute flushes — batch all blocks across all layers in one Sinkhorn+RTN
+        if flush_block_ids:
+            slots = [self._block_to_slot[bid] for bid in flush_block_ids]
+            self.flush_manager.flush_batched_fast(
+                block_ids=flush_block_ids,
+                tail_K=self.tail_K,
+                tail_V=self.tail_V,
+                slots=slots,
+                compressed_cache=self.kv_cache_int4,
+            )
+            # Free the flushed blocks' slots
+            for bid in flush_block_ids:
+                self._free_slot(bid)
+
+        # Free discarded partial blocks
+        for bid in discard_ids:
+            self._free_slot(bid)
 
     def _flush_block(self, block_id: int):
         """Compress a block from tail pool to int4 cache and free the slot."""
