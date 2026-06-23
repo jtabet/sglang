@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """KVarN tile flush manager.
 
-Manages the lifecycle of KV cache blocks:
-  - Compresses bf16 → int4 when blocks fill up (flush)
-  - Dequantizes int4 → bf16 on demand (lazy dequant)
+Manages the lifecycle of KV cache blocks in the dual-pool architecture:
+  - **Tail pool** (fp16): stores rotated K/V for in-progress + sink blocks.
+    Each block occupies one tail-pool slot: ``[pool_slots, group, Hk, D]``.
+  - **Compressed cache** (int4/uint8): stores flushed blocks as packed tiles.
+    ``[num_blocks, Hk, tile_bytes]`` per layer.
 
-The sglang KV pool stores tokens as ``[size, head_num, head_dim]`` per layer.
-A KVarN "block" is a page of ``group`` consecutive tokens. Block ``B``
-occupies pool slots ``[B*group, (B+1)*group)``, each slot being
-``[head_num, head_dim]``.
+Flush = compress fp16 tail pool → int4 cache, then free the tail pool slot.
+Dequant = read int4 cache → fp16 (on demand, for attention).
 """
 
 from __future__ import annotations
@@ -33,85 +33,128 @@ logger = logging.getLogger(__name__)
 
 
 class KVarNFlushManager:
-    """Manages the bf16→int4 tile flush lifecycle."""
+    """Manages the fp16 tail pool ↔ int4 compressed cache lifecycle."""
 
     def __init__(
         self,
-        kvarn_config: KVarNConfig,
-        num_blocks: int,
-        num_kv_heads: int,
+        cfg: KVarNConfig,
         num_layers: int,
-        device: str,
-        max_pool_slots: int = 256,
+        num_kv_heads: int,
+        head_dim: int,
+        v_head_dim: int,
+        sink_blocks: int = 1,
     ):
-        self.cfg = kvarn_config
-        self.num_blocks = num_blocks
-        self.num_kv_heads = num_kv_heads
+        self.cfg = cfg
         self.num_layers = num_layers
-        self.device = device
-        self.group = kvarn_config.group
-        self.head_dim = kvarn_config.head_dim
-        self.tile_bytes = kvarn_config.tile_bytes_aligned
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.v_head_dim = v_head_dim if v_head_dim else head_dim
+        self.group = cfg.group
+        self.tile_bytes = cfg.tile_bytes_aligned
+        self.sink_blocks = sink_blocks
 
-        # Compressed cache: [num_blocks, Hk, tile_bytes] uint8 per layer
-        self.compressed_cache: List[torch.Tensor] = [
-            torch.zeros(
-                (num_blocks, num_kv_heads, self.tile_bytes),
-                dtype=torch.uint8,
-                device=device,
-            )
-            for _ in range(num_layers)
-        ]
-
-        # block_to_slot mapping: [num_blocks] int32
-        # -1 = block is compressed (read from int4 cache)
-        self.block_to_slot = torch.full(
-            (num_blocks,), -1, dtype=torch.int32, device=device
-        )
-
-        self._flushed: set[int] = set()
-
-        logger.info(
-            f"KVarNFlushManager: num_blocks={num_blocks}, "
-            f"group={self.group}, tile_bytes={self.tile_bytes}"
-        )
-
-    def flush_blocks(
+    def flush_block(
         self,
-        block_ids: List[int],
-        tail_k_pools: List[torch.Tensor],  # per-layer [pool_size, Hk, D]
-        tail_v_pools: List[torch.Tensor],  # per-layer [pool_size, Hk, Dv]
+        block_id: int,
+        tail_K: list[torch.Tensor],  # per-layer [pool_slots, group, Hk, D] fp16
+        tail_V: list[torch.Tensor],  # per-layer [pool_slots, group, Hk, vD] fp16
+        slot: int,
+        compressed_cache: list[torch.Tensor],  # per-layer [num_blocks, Hk, tile_bytes] uint8
     ):
-        """Compress bf16 pool data → int4 cache. Does NOT dequant back."""
+        """Compress one block from the tail pool to the int4 cache.
+
+        Reads K/V from tail_K[layer][slot] / tail_V[layer][slot] (shape
+        ``[group, Hk, D]``), applies Sinkhorn + RTN, and writes packed tiles
+        to compressed_cache[layer][block_id].
+        """
+        cfg = self.cfg
+        Hk = self.num_kv_heads
+        D = self.head_dim
+        vD = self.v_head_dim
+        G = self.group
+
+        for layer_id in range(self.num_layers):
+            K_blk = tail_K[layer_id][slot]  # [G, Hk, D] fp16 (rotated)
+            V_blk = tail_V[layer_id][slot]  # [G, Hk, vD] fp16 (rotated)
+
+            # K tile orientation: [D, group] per head (channels × tokens)
+            # K_blk is [group, Hk, D] → per-head [group, D] → transpose to [D, group]
+            K_per_head = K_blk.permute(1, 2, 0)  # [Hk, D, group]
+            # V tile orientation: [group, D] per head (tokens × channels)
+            V_per_head = V_blk.permute(1, 0, 2)  # [Hk, group, vD]
+
+            # Sinkhorn variance normalization (batched over heads)
+            K_bal, K_sc, K_sr = variance_normalize_batched(
+                K_per_head, iterations=cfg.sinkhorn_iters
+            )
+            V_bal, V_sc, V_sr = variance_normalize_batched(
+                V_per_head, iterations=cfg.sinkhorn_iters
+            )
+
+            # RTN quantization + scale absorption + packing
+            K_out = kvarn_store_tile_k_batch_from_sinkhorn(
+                K_bal,
+                K_sc.squeeze(1),  # [Hk, group]
+                K_sr.squeeze(2),  # [Hk, D]
+                bits=cfg.key_bits,
+            )
+            V_out = kvarn_store_tile_v_batch_from_sinkhorn(
+                V_bal,
+                V_sc.squeeze(1),  # [Hk, vD]
+                V_sr.squeeze(2),  # [Hk, group]
+                bits=cfg.value_bits,
+            )
+
+            # Write packed tiles to compressed cache
+            cache = compressed_cache[layer_id]
+            for h in range(Hk):
+                self._write_packed_tile_k(
+                    cache, block_id, h,
+                    K_out["q_packed_uint8"][h],
+                    K_out["s_col_K"][h],
+                    K_out["zp_K"][h],
+                    K_out["s_row_K"][h],
+                )
+                self._write_packed_tile_v(
+                    cache, block_id, h,
+                    V_out["q_packed_uint8"][h],
+                    V_out["s_col_V"][h],
+                    V_out["s_row_V"][h],
+                    V_out["zp_V"][h],
+                )
+
+    def flush_blocks_batched(
+        self,
+        block_ids: list[int],
+        tail_K: list[torch.Tensor],
+        tail_V: list[torch.Tensor],
+        slots: list[int],
+        compressed_cache: list[torch.Tensor],
+    ):
+        """Compress multiple blocks in a batched fashion for efficiency."""
         if not block_ids:
             return
 
         cfg = self.cfg
         Hk = self.num_kv_heads
         D = self.head_dim
+        vD = self.v_head_dim
         G = self.group
         nB = len(block_ids)
 
         for layer_id in range(self.num_layers):
-            k_pool = tail_k_pools[layer_id]
-            v_pool = tail_v_pools[layer_id]
-            k_cache = self.compressed_cache[layer_id]
+            # Gather all blocks' K/V data
+            K_blocks = torch.stack([tail_K[layer_id][slots[i]] for i in range(nB)])
+            # K_blocks: [nB, G, Hk, D] → permute to [nB*Hk, D, G] for K path
+            K_per_head = K_blocks.permute(0, 2, 3, 1)  # [nB, Hk, D, G]
+            K_tiles = K_per_head.reshape(nB * Hk, D, G)
 
-            all_K_tiles = []
-            all_V_tiles = []
-            for bid in block_ids:
-                slot_start = bid * G
-                k_chunk = k_pool[slot_start:slot_start + G]
-                v_chunk = v_pool[slot_start:slot_start + G]
-                all_K_tiles.append(k_chunk)
-                all_V_tiles.append(v_chunk)
+            V_blocks = torch.stack([tail_V[layer_id][slots[i]] for i in range(nB)])
+            # V_blocks: [nB, G, Hk, vD] → permute to [nB*Hk, G, vD] for V path
+            V_per_head = V_blocks.permute(0, 2, 1, 3)  # [nB, Hk, G, vD]
+            V_tiles = V_per_head.reshape(nB * Hk, G, vD)
 
-            K_batched = torch.stack(all_K_tiles).float()
-            V_batched = torch.stack(all_V_tiles).float()
-
-            K_tiles = K_batched.permute(0, 2, 3, 1).reshape(nB * Hk, D, G)
-            V_tiles = V_batched.permute(0, 2, 1, 3).reshape(nB * Hk, G, D)
-
+            # Sinkhorn + RTN
             K_bal, K_sc, K_sr = variance_normalize_batched(
                 K_tiles, iterations=cfg.sinkhorn_iters
             )
@@ -120,134 +163,142 @@ class KVarNFlushManager:
             )
 
             K_out = kvarn_store_tile_k_batch_from_sinkhorn(
-                K_bal, K_sc.reshape(nB * Hk, G), K_sr.reshape(nB * Hk, D),
+                K_bal,
+                K_sc.squeeze(1),  # [nB*Hk, G]
+                K_sr.squeeze(2),  # [nB*Hk, D]
                 bits=cfg.key_bits,
             )
             V_out = kvarn_store_tile_v_batch_from_sinkhorn(
-                V_bal, V_sc.reshape(nB * Hk, D), V_sr.reshape(nB * Hk, G),
+                V_bal,
+                V_sc.squeeze(1),  # [nB*Hk, vD]
+                V_sr.squeeze(2),  # [nB*Hk, G]
                 bits=cfg.value_bits,
             )
 
+            cache = compressed_cache[layer_id]
             for i, bid in enumerate(block_ids):
                 for h in range(Hk):
                     idx = i * Hk + h
-                    self._write_packed_tile(
-                        k_cache, bid, h,
+                    self._write_packed_tile_k(
+                        cache, bid, h,
                         K_out["q_packed_uint8"][idx],
                         K_out["s_col_K"][idx],
                         K_out["zp_K"][idx],
                         K_out["s_row_K"][idx],
-                        is_key=True,
                     )
-                    self._write_packed_tile(
-                        k_cache, bid, h,
+                    self._write_packed_tile_v(
+                        cache, bid, h,
                         V_out["q_packed_uint8"][idx],
                         V_out["s_col_V"][idx],
                         V_out["s_row_V"][idx],
                         V_out["zp_V"][idx],
-                        is_key=False,
                     )
-
-        for bid in block_ids:
-            self.block_to_slot[bid] = -1
-            self._flushed.add(bid)
 
         logger.info(f"KVarN flush: {nB} blocks compressed to int4")
 
-    def dequant_blocks_to_pool(
+    def dequant_block(
         self,
-        block_ids: List[int],
-        tail_k_pools: List[torch.Tensor],
-        tail_v_pools: List[torch.Tensor],
-    ):
-        """Dequant int4 compressed blocks back into the bf16 pool (on demand).
+        block_id: int,
+        compressed_cache: list[torch.Tensor],
+        layer_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Read a block from int4 cache and dequantize.
 
-        Called before decode/extend when compressed blocks are needed by the
-        current batch. Reads from the int4 cache and writes dequanted bf16
-        data back into the pool so the standard attention kernel can read it.
+        Returns (K [group, Hk, D] fp16, V [group, Hk, vD] fp16) in the
+        ROTATED frame (caller must apply H^-1 if un-rotated data is needed).
         """
-        if not block_ids:
-            return
-
         cfg = self.cfg
         Hk = self.num_kv_heads
         D = self.head_dim
+        vD = self.v_head_dim
         G = self.group
         pack_k = 8 // cfg.key_bits
         pack_v = 8 // cfg.value_bits
 
-        for layer_id in range(self.num_layers):
-            k_pool = tail_k_pools[layer_id]
-            v_pool = tail_v_pools[layer_id]
-            k_cache = self.compressed_cache[layer_id]
+        cache = compressed_cache[layer_id][block_id]  # [Hk, tile_bytes] uint8
 
-            for bid in block_ids:
-                for h in range(Hk):
-                    # Dequant K tile: packed as [D, G // pack_k]
-                    off = cfg.k_packed_offset
-                    k_packed = k_cache[bid, h, off:off + D * (G // pack_k)].reshape(D, G // pack_k)
-                    off = cfg.k_s_col_offset
-                    s_col_K = k_cache[bid, h, off:off + D * 2].view(torch.float16)
-                    off = cfg.k_zp_offset
-                    zp_K = k_cache[bid, h, off:off + D * 2].view(torch.float16)
-                    off = cfg.k_s_row_offset
-                    s_row_K = k_cache[bid, h, off:off + G * 2].view(torch.float16)
+        K_out = torch.zeros(G, Hk, D, dtype=torch.float16, device=cache.device)
+        V_out = torch.zeros(G, Hk, vD, dtype=torch.float16, device=cache.device)
 
-                    K_deq = kvarn_dequant_tile_k(
-                        k_packed, s_col_K, zp_K, s_row_K, group=G, bits=cfg.key_bits,
-                    )
-                    slot_start = bid * G
-                    k_pool[slot_start:slot_start + G, h, :] = K_deq.t().to(k_pool.dtype)
+        for h in range(Hk):
+            # Dequant K tile: packed as [D, G // pack_k]
+            off = cfg.k_packed_offset
+            k_packed = cache[h, off:off + D * (G // pack_k)].reshape(D, G // pack_k)
+            off = cfg.k_s_col_offset
+            s_col_K = cache[h, off:off + D * 2].view(torch.float16)
+            off = cfg.k_zp_offset
+            zp_K = cache[h, off:off + D * 2].view(torch.float16)
+            off = cfg.k_s_row_offset
+            s_row_K = cache[h, off:off + G * 2].view(torch.float16)
 
-                    # Dequant V tile: packed as [G, D // pack_v]
-                    off = cfg.v_packed_offset
-                    v_packed = k_cache[bid, h, off:off + G * (D // pack_v)].reshape(G, D // pack_v)
-                    off = cfg.v_s_col_offset
-                    s_col_V = k_cache[bid, h, off:off + D * 2].view(torch.float16)
-                    off = cfg.v_s_row_offset
-                    s_row_V = k_cache[bid, h, off:off + G * 2].view(torch.float16)
-                    off = cfg.v_zp_offset
-                    zp_V = k_cache[bid, h, off:off + G * 2].view(torch.float16)
+            K_deq = kvarn_dequant_tile_k(
+                k_packed, s_col_K, zp_K, s_row_K, group=G, bits=cfg.key_bits,
+            )
+            # K_deq is [D, G] in rotated frame → transpose to [G, D]
+            K_out[:, h, :] = K_deq.t().to(torch.float16)
 
-                    V_deq = kvarn_dequant_tile_v(
-                        v_packed, s_col_V, s_row_V, zp_V, head_dim=D, bits=cfg.value_bits,
-                    )
-                    v_pool[slot_start:slot_start + G, h, :] = V_deq.to(v_pool.dtype)
+            # Dequant V tile: packed as [G, D // pack_v]
+            off = cfg.v_packed_offset
+            v_packed = cache[h, off:off + G * (vD // pack_v)].reshape(G, vD // pack_v)
+            off = cfg.v_s_col_offset
+            s_col_V = cache[h, off:off + vD * 2].view(torch.float16)
+            off = cfg.v_s_row_offset
+            s_row_V = cache[h, off:off + G * 2].view(torch.float16)
+            off = cfg.v_zp_offset
+            zp_V = cache[h, off:off + G * 2].view(torch.float16)
 
-    def _write_packed_tile(
+            V_deq = kvarn_dequant_tile_v(
+                v_packed, s_col_V, s_row_V, zp_V, head_dim=vD, bits=cfg.value_bits,
+            )
+            # V_deq is [G, vD] in rotated frame
+            V_out[:, h, :] = V_deq.to(torch.float16)
+
+        return K_out, V_out
+
+    def _write_packed_tile_k(
         self,
         cache: torch.Tensor,
         block_id: int,
         head_id: int,
         q_packed: torch.Tensor,
         s_col: torch.Tensor,
-        s_row_or_zp: torch.Tensor,
+        zp: torch.Tensor,
         s_row: torch.Tensor,
-        is_key: bool = True,
     ):
-        """Write one packed tile to the compressed cache."""
+        """Write one packed K tile to the compressed cache."""
         cfg = self.cfg
-        if is_key:
-            off = cfg.k_packed_offset
-            cache[block_id, head_id, off:off + q_packed.numel()].copy_(q_packed.flatten())
-            off = cfg.k_s_col_offset
-            cache[block_id, head_id, off:off + s_col.numel() * 2].copy_(
-                s_col.view(torch.uint8).flatten())
-            off = cfg.k_zp_offset
-            cache[block_id, head_id, off:off + s_row_or_zp.numel() * 2].copy_(
-                s_row_or_zp.view(torch.uint8).flatten())
-            off = cfg.k_s_row_offset
-            cache[block_id, head_id, off:off + s_row.numel() * 2].copy_(
-                s_row.view(torch.uint8).flatten())
-        else:
-            off = cfg.v_packed_offset
-            cache[block_id, head_id, off:off + q_packed.numel()].copy_(q_packed.flatten())
-            off = cfg.v_s_col_offset
-            cache[block_id, head_id, off:off + s_col.numel() * 2].copy_(
-                s_col.view(torch.uint8).flatten())
-            off = cfg.v_s_row_offset
-            cache[block_id, head_id, off:off + s_row_or_zp.numel() * 2].copy_(
-                s_row_or_zp.view(torch.uint8).flatten())
-            off = cfg.v_zp_offset
-            cache[block_id, head_id, off:off + s_row.numel() * 2].copy_(
-                s_row.view(torch.uint8).flatten())
+        off = cfg.k_packed_offset
+        cache[block_id, head_id, off:off + q_packed.numel()].copy_(q_packed.flatten())
+        off = cfg.k_s_col_offset
+        cache[block_id, head_id, off:off + s_col.numel() * 2].copy_(
+            s_col.view(torch.uint8).flatten())
+        off = cfg.k_zp_offset
+        cache[block_id, head_id, off:off + zp.numel() * 2].copy_(
+            zp.view(torch.uint8).flatten())
+        off = cfg.k_s_row_offset
+        cache[block_id, head_id, off:off + s_row.numel() * 2].copy_(
+            s_row.view(torch.uint8).flatten())
+
+    def _write_packed_tile_v(
+        self,
+        cache: torch.Tensor,
+        block_id: int,
+        head_id: int,
+        q_packed: torch.Tensor,
+        s_col: torch.Tensor,
+        s_row: torch.Tensor,
+        zp: torch.Tensor,
+    ):
+        """Write one packed V tile to the compressed cache."""
+        cfg = self.cfg
+        off = cfg.v_packed_offset
+        cache[block_id, head_id, off:off + q_packed.numel()].copy_(q_packed.flatten())
+        off = cfg.v_s_col_offset
+        cache[block_id, head_id, off:off + s_col.numel() * 2].copy_(
+            s_col.view(torch.uint8).flatten())
+        off = cfg.v_s_row_offset
+        cache[block_id, head_id, off:off + s_row.numel() * 2].copy_(
+            s_row.view(torch.uint8).flatten())
+        off = cfg.v_zp_offset
+        cache[block_id, head_id, off:off + zp.numel() * 2].copy_(
+            zp.view(torch.uint8).flatten())

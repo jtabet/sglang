@@ -212,13 +212,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     (n * k * num_layers * 2 * kv_size) // scale_block_size
                 )
             elif mr.server_args.kv_cache_dtype.startswith("kvarn_"):
-                # KVarN: the bf16 pool stores ALL tokens (compressed blocks
-                # are dequanted back into the pool before decode). The int4
-                # compressed cache is allocated separately by the flush manager.
-                # To make room for the compressed cache in the GPU memory budget,
-                # we reduce the effective pool size by the compressed cache's
-                # share. The compressed cache is ~3.5x smaller than bf16, so
-                # the total (pool + cache) holds more tokens than bf16 alone.
+                # KVarN dual-pool: the NoOp pool has a large logical size for
+                # the scheduler, but actual GPU memory = tail pool (small fp16)
+                # + int4 compressed cache. The cell_size should reflect the
+                # compressed cost per token to size the compressed cache capacity.
                 from sglang.srt.layers.quantization.kvarn.config import (
                     KVarNConfig,
                 )
@@ -227,27 +224,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     mr.server_args.kv_cache_dtype, head_dim=model_config.head_dim
                 )
                 n = model_config.get_num_kv_heads(tp_size)
-                # Compressed bytes per token (K+V) per layer
+                G = kvarn_cfg.group
+                # Compressed bytes per token (K+V) per layer:
+                # tile_bytes covers group tokens, divided by group gives per-token
                 compressed_per_token = (
-                    kvarn_cfg.tile_bytes_aligned * n // kvarn_cfg.group
+                    kvarn_cfg.tile_bytes_aligned * n * 2 // G  # K+V tiles
                 )
-                # bf16 bytes per token (K+V) per layer
-                bf16_per_token = n * (model_config.head_dim + model_config.v_head_dim) * kv_size
-                # The compressed cache adds ~25% overhead to the bf16 pool cost.
-                # Reduce the effective cell_size so the pool is smaller, making
-                # room for the compressed cache in the total GPU budget.
-                # Total per-token cost = bf16 + compressed = bf16 * (1 + compressed/bf16)
-                # But the compressed cache only holds flushed blocks (~75% of tokens),
-                # so effective overhead = 0.75 * compressed/bf16 ≈ 0.75 * 0.28 ≈ 0.21
-                # The compressed cache holds flushed blocks (majority of tokens).
-                # The bf16 pool holds all tokens (flushed blocks are dequanted
-                # back into the pool before decode). The compressed cache is
-                # additional memory, so we reduce the pool to make room.
-                # With 3.5x compression, the compressed cache for N tokens costs
-                # N * bf16_per_token / 3.5. If ~60% of tokens are flushed,
-                # overhead = 0.6 * (1/3.5) = ~17%. Use 20% to be safe.
-                overhead = 0.20  # 20% overhead for compressed cache
-                cell_size = int(bf16_per_token * num_layers * (1 + overhead))
+                # Tail pool overhead: small constant, ~2*max_num_seqs blocks.
+                # Per-token cost is dominated by the compressed cache.
+                # Add ~20% overhead for the tail pool.
+                overhead = 0.20
+                cell_size = int(compressed_per_token * num_layers * (1 + overhead))
 
         return cell_size
 

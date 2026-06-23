@@ -778,15 +778,10 @@ class ModelRunnerKVCacheMixin:
                         head_dim=self.model_config.head_dim,
                     )
                     self.kvarn_config = kvarn_config
-                    # Use standard MHA pool for now (fp16/bf16 tail pool).
-                    # The KVarN compression (int4 flush) will be wired in
-                    # a subsequent step once the rotation pipeline is validated.
-                    pool_cls = (
-                        NoOpMHATokenToKVPool
-                        if self.server_args.prefill_only_disable_kv_cache
-                        else MHATokenToKVPool
-                    )
-                    self.token_to_kv_pool = pool_cls(
+                    # Use NoOp pool: scheduler sees full capacity (max_total_num_tokens)
+                    # but actual K/V storage is in the KVarN backend's tail pool
+                    # (fp16, small) + int4 compressed cache.
+                    self.token_to_kv_pool = NoOpMHATokenToKVPool(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
                         dtype=self.dtype,

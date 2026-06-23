@@ -16,80 +16,90 @@ def cfg():
 @pytest.fixture
 def manager(cfg):
     return KVarNFlushManager(
-        kvarn_config=cfg,
-        num_blocks=64,
-        num_kv_heads=4,
+        cfg=cfg,
         num_layers=2,
-        device="cpu",
+        num_kv_heads=4,
+        head_dim=128,
+        v_head_dim=128,
+        sink_blocks=1,
     )
 
 
+def _make_tail_pools(num_layers, pool_slots, group, hk, d, device="cpu"):
+    tail_K = [torch.randn(pool_slots, group, hk, d, dtype=torch.float16, device=device) for _ in range(num_layers)]
+    tail_V = [torch.randn(pool_slots, group, hk, d, dtype=torch.float16, device=device) for _ in range(num_layers)]
+    return tail_K, tail_V
+
+
+def _make_compressed_cache(num_layers, num_blocks, hk, tile_bytes, device="cpu"):
+    return [torch.zeros(num_blocks, hk, tile_bytes, dtype=torch.uint8, device=device) for _ in range(num_layers)]
+
+
 class TestFlushManager:
-    def test_init(self, manager):
-        assert manager.num_blocks == 64
-        assert (manager.block_to_slot == -1).all()
-        assert manager.compressed_cache is not None
-        assert len(manager.compressed_cache) == 2
-        for cache in manager.compressed_cache:
-            assert cache.dtype == torch.uint8
-            assert cache.shape == (64, 4, manager.tile_bytes)
-
-    def test_flush_marks_compressed(self, manager, cfg):
-        G, Hk, D = cfg.group, 4, cfg.head_dim
-        pool_size = 64 * G
-        tail_k = [torch.randn(pool_size, Hk, D, dtype=torch.bfloat16) for _ in range(2)]
-        tail_v = [torch.randn(pool_size, Hk, D, dtype=torch.bfloat16) for _ in range(2)]
-
-        manager.flush_blocks([0, 1], tail_k, tail_v)
-
-        assert manager.block_to_slot[0].item() == -1
-        assert manager.block_to_slot[1].item() == -1
-        assert 0 in manager._flushed
-        assert 1 in manager._flushed
+    def test_init(self, manager, cfg):
+        assert manager.num_layers == 2
+        assert manager.num_kv_heads == 4
+        assert manager.head_dim == 128
+        assert manager.group == cfg.group
+        assert manager.tile_bytes > 0
 
     def test_flush_writes_nonzero(self, manager, cfg):
-        G, Hk, D = cfg.group, 4, cfg.head_dim
-        pool_size = 64 * G
-        tail_k = [torch.randn(pool_size, Hk, D, dtype=torch.bfloat16) for _ in range(2)]
-        tail_v = [torch.randn(pool_size, Hk, D, dtype=torch.bfloat16) for _ in range(2)]
+        G, Hk, D = cfg.group, 4, 128
+        pool_slots = 4
+        tail_K, tail_V = _make_tail_pools(2, pool_slots, G, Hk, D)
+        cache = _make_compressed_cache(2, 8, Hk, manager.tile_bytes)
 
-        assert manager.compressed_cache[0][0, 0].sum().item() == 0
-        manager.flush_blocks([0], tail_k, tail_v)
-        assert manager.compressed_cache[0][0, 0].sum().item() > 0
+        assert cache[0][0, 0].sum().item() == 0
+        manager.flush_block(0, tail_K, tail_V, slot=0, compressed_cache=cache)
+        assert cache[0][0, 0].sum().item() > 0
+
+    def test_flush_batched_writes_nonzero(self, manager, cfg):
+        G, Hk, D = cfg.group, 4, 128
+        pool_slots = 4
+        tail_K, tail_V = _make_tail_pools(2, pool_slots, G, Hk, D)
+        cache = _make_compressed_cache(2, 8, Hk, manager.tile_bytes)
+
+        assert cache[0][0, 0].sum().item() == 0
+        manager.flush_blocks_batched([0, 1], tail_K, tail_V, [0, 1], cache)
+        assert cache[0][0, 0].sum().item() > 0
+        assert cache[0][1, 0].sum().item() > 0
 
     def test_dequant_roundtrip(self, manager, cfg):
         """Flush then dequant should approximately recover the original data."""
-        G, Hk, D = cfg.group, 4, cfg.head_dim
-        pool_size = 64 * G
+        G, Hk, D = cfg.group, 4, 128
+        pool_slots = 2
+        tail_K, tail_V = _make_tail_pools(2, pool_slots, G, Hk, D)
+        cache = _make_compressed_cache(2, 8, Hk, manager.tile_bytes)
 
-        # Create deterministic data
-        torch.manual_seed(42)
-        orig_k = [torch.randn(pool_size, Hk, D, dtype=torch.bfloat16) for _ in range(2)]
-        orig_v = [torch.randn(pool_size, Hk, D, dtype=torch.bfloat16) for _ in range(2)]
-
-        # Copy for comparison
-        orig_k_copy = [k.clone() for k in orig_k]
-        orig_v_copy = [v.clone() for v in orig_v]
+        # Save originals for comparison
+        orig_k = tail_K[0][0].clone()  # [G, Hk, D]
+        orig_v = tail_V[0][0].clone()
 
         # Flush block 0 to int4
-        manager.flush_blocks([0], orig_k, orig_v)
+        manager.flush_block(0, tail_K, tail_V, slot=0, compressed_cache=cache)
 
-        # Dequant back to pool
-        manager.dequant_blocks_to_pool([0], orig_k, orig_v)
+        # Dequant back
+        K_deq, V_deq = manager.dequant_block(0, cache, layer_id=0)
+        # K_deq, V_deq are [G, Hk, D] in rotated frame
 
-        # Compare: should be approximately equal (within 4-bit quantization error)
-        slot_start = 0
-        slot_end = G
-        k_err = (orig_k[0][slot_start:slot_end].float() - orig_k_copy[0][slot_start:slot_end].float()).abs().mean()
-        k_mag = orig_k_copy[0][slot_start:slot_end].float().abs().mean()
+        # Check shapes
+        assert K_deq.shape == (G, Hk, D)
+        assert V_deq.shape == (G, Hk, D)
+
+        # Check approximate recovery (within 4-bit quantization error)
+        k_err = (K_deq.float() - orig_k.float()).abs().mean()
+        k_mag = orig_k.float().abs().mean()
         rel_err = k_err / k_mag
         assert rel_err < 0.5, f"K dequant roundtrip error too high: {rel_err:.3f}"
 
-    def test_no_flush_empty(self, manager):
-        tail_k = [torch.zeros(10, 4, 128, dtype=torch.bfloat16) for _ in range(2)]
-        tail_v = [torch.zeros(10, 4, 128, dtype=torch.bfloat16) for _ in range(2)]
-        manager.flush_blocks([], tail_k, tail_v)
-        assert (manager.block_to_slot == -1).all()
+    def test_no_flush_empty(self, manager, cfg):
+        G, Hk, D = cfg.group, 4, 128
+        pool_slots = 2
+        tail_K, tail_V = _make_tail_pools(2, pool_slots, G, Hk, D)
+        cache = _make_compressed_cache(2, 8, Hk, manager.tile_bytes)
+        # Just verify it doesn't crash with empty batch
+        manager.flush_blocks_batched([], tail_K, tail_V, [], cache)
+        assert cache[0][0, 0].sum().item() == 0
 
 
 if __name__ == "__main__":
