@@ -242,31 +242,90 @@ class KVarNAttnBackend(AttentionBackend):
     # ── AttentionBackend interface ─────────────────────────────────────────
 
     def init_forward_metadata(self, forward_batch: "ForwardBatch"):
-        """Eager entry point. Initialize pools and flush blocks."""
+        """Eager entry point. Initialize pools, flush blocks, allocate slots."""
         if self.pool_slots == 0:
             self._init_pools()
 
         # Flush any full blocks from the tail pool to int4 cache.
-        # This runs outside the captured region (eager).
         self._maybe_flush_blocks(forward_batch)
+
+        # Pre-allocate tail pool slots for new blocks
+        if forward_batch.out_cache_loc is not None:
+            self._ensure_slots_for_tokens(forward_batch.out_cache_loc)
 
     def init_forward_metadata_out_graph(
         self, forward_batch: "ForwardBatch", in_capture: bool = False,
     ):
-        """Per-iter metadata prep. No-op for eager-only backend."""
+        """Per-iter metadata prep (outside graph). Allocates slots, flushes
+        blocks, and fills static block_table/seq_lens/cu_seqlens buffers."""
         if self.pool_slots == 0:
             self._init_pools()
-        if not in_capture:
-            self._maybe_flush_blocks(forward_batch)
+
+        # Flush full blocks from tail pool to int4 cache
+        self._maybe_flush_blocks(forward_batch)
+
+        # Pre-allocate tail pool slots for new blocks in this batch
+        # (must happen before the captured forward_decode scatter store)
+        if forward_batch.out_cache_loc is not None:
+            self._ensure_slots_for_tokens(forward_batch.out_cache_loc)
+
+        # Build block_table/seq_lens/cu_seqlens into static buffers
+        if hasattr(self, '_cg_block_table'):
+            self._fill_cg_buffers(forward_batch)
 
     def init_forward_metadata_in_graph(self, forward_batch: "ForwardBatch"):
-        """Graph-recordable static-shape GPU op. No-op for eager-only backend."""
+        """Graph-recordable GPU ops. No-op — the fused decode kernel reads
+        from static buffers filled in init_forward_metadata_out_graph."""
         pass
 
+    def _fill_cg_buffers(self, forward_batch: "ForwardBatch"):
+        """Fill pre-allocated CUDA graph buffers with current batch data."""
+        B = forward_batch.batch_size
+        if B > self._cg_max_batch_size:
+            raise RuntimeError(
+                f"Batch size {B} exceeds CUDA graph max {self._cg_max_batch_size}"
+            )
+
+        seq_lens = forward_batch.seq_lens
+        req_pool_indices = forward_batch.req_pool_indices
+        req_to_token = self.model_runner.req_to_token_pool.req_to_token
+
+        # Zero-fill unused entries
+        self._cg_block_table[:B].zero_()
+        self._cg_seq_lens[:B].zero_()
+        self._cg_cu_seqlens.zero_()
+
+        if B > 0:
+            # Fill seq_lens
+            self._cg_seq_lens[:B] = seq_lens.to(torch.int32)[:B]
+
+            # Vectorized block_table construction
+            max_blocks = min(self._cg_max_blocks, self._cg_block_table.shape[1])
+            col_offsets = torch.arange(max_blocks, device=self.device) * self.page_size
+            req_indices = req_pool_indices.long()
+            token_positions = col_offsets.unsqueeze(0).expand(B, max_blocks)
+            max_token_pos = req_to_token.shape[1] - 1
+            token_positions = token_positions.clamp(max=max_token_pos)
+            slots = req_to_token[req_indices.unsqueeze(1), token_positions]
+            self._cg_block_table[:B, :max_blocks] = (slots // self.page_size).to(torch.int32)
+
+            # Fill cu_seqlens
+            self._cg_cu_seqlens[1:B+1] = torch.cumsum(self._cg_seq_lens[:B], dim=0)
+
     def init_cuda_graph_state(self, max_batch_size: int, max_num_token: int):
-        """Pre-allocate CUDA graph state. No-op for now (eager-only)."""
+        """Pre-allocate CUDA graph state (static buffers for block_table, etc.)."""
         if self.pool_slots == 0:
             self._init_pools()
+
+        # Pre-allocate static buffers for CUDA graph
+        max_blocks_per_req = max(self.model_runner.model_config.context_len // self.page_size, 1)
+        self._cg_block_table = torch.zeros(
+            max_batch_size, max_blocks_per_req, dtype=torch.int32, device=self.device,
+        )
+        self._cg_seq_lens = torch.zeros(max_batch_size, dtype=torch.int32, device=self.device)
+        self._cg_cu_seqlens = torch.zeros(max_batch_size + 1, dtype=torch.int32, device=self.device)
+        self._cg_max_batch_size = max_batch_size
+        self._cg_max_blocks = max_blocks_per_req
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         return 1
@@ -310,9 +369,8 @@ class KVarNAttnBackend(AttentionBackend):
         k_3d = k.view(N, self.num_kv_heads, self.head_dim)
         v_3d = v.view(N, self.num_kv_heads, self.v_head_dim)
 
-        # Store K/V to tail pool
+        # Store K/V to tail pool (slots already allocated in init_forward_metadata_out_graph)
         if save_kv_cache:
-            self._ensure_slots_for_tokens(forward_batch.out_cache_loc)
             use_triton_store = os.environ.get("KVARN_TRITON_STORE", "1") == "1"
             if use_triton_store:
                 k_rot = (k_3d.float() @ H).to(torch.float16)
@@ -330,7 +388,14 @@ class KVarNAttnBackend(AttentionBackend):
         use_fused_decode = os.environ.get("KVARN_FUSED_DECODE", "1") == "1"
         if use_fused_decode:
             # Fused Triton decode kernel
-            block_table, seq_lens_t, cu_seqlens = self._build_block_table(forward_batch)
+            # Use static CUDA graph buffers if available, otherwise build fresh
+            if hasattr(self, '_cg_block_table') and N <= self._cg_max_batch_size:
+                block_table = self._cg_block_table[:N]
+                seq_lens_t = self._cg_seq_lens[:N]
+                cu_seqlens = self._cg_cu_seqlens[:N+1]
+            else:
+                block_table, seq_lens_t, cu_seqlens = self._build_block_table(forward_batch)
+
             out = kvarn_decode_attention(
                 query=q_3d,
                 kv_cache=self.kv_cache_int4[layer_id],
@@ -399,9 +464,8 @@ class KVarNAttnBackend(AttentionBackend):
         k_3d = k.view(N, self.num_kv_heads, self.head_dim)
         v_3d = v.view(N, self.num_kv_heads, self.v_head_dim)
 
-        # Store K/V to tail pool
+        # Store K/V to tail pool (slots already allocated in init_forward_metadata_out_graph)
         if save_kv_cache:
-            self._ensure_slots_for_tokens(forward_batch.out_cache_loc)
             use_triton_store = os.environ.get("KVARN_TRITON_STORE", "1") == "1"
             if use_triton_store:
                 k_rot = (k_3d.float() @ H).to(torch.float16)

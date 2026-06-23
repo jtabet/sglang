@@ -3321,17 +3321,11 @@ class ServerArgs:
                     f"Setting page_size={self.page_size} for KVarN "
                     f"(kv_cache_dtype={self.kv_cache_dtype})."
                 )
-                # KVarN uses an eager-only path (Python gather + SDPA) for
-                # now — disable CUDA graph capture until the fused Triton
-                # decode kernel is ported.
-                if self.cuda_graph_config.decode.backend != Backend.DISABLED:
-                    logger.info(
-                        "Disabling decode CUDA graph for KVarN (eager-only path)."
-                    )
-                    self.cuda_graph_config.decode.backend = Backend.DISABLED
+                # KVarN supports CUDA graph for decode (fused Triton kernel).
+                # Prefill CUDA graph is not supported (Python gather + SDPA path).
                 if self.cuda_graph_config.prefill.backend != Backend.DISABLED:
                     logger.info(
-                        "Disabling prefill CUDA graph for KVarN (eager-only path)."
+                        "Disabling prefill CUDA graph for KVarN (eager extend path)."
                     )
                     self.cuda_graph_config.prefill.backend = Backend.DISABLED
             elif not is_musa():
