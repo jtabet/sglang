@@ -383,11 +383,12 @@ class KVarNAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         """Extend forward: multiple tokens per request (prefill/chunked-prefill).
 
-        Uses Python gather + SDPA for correctness. The build_packed_kv
-        Triton kernel will be used once debugged.
+        Uses the build-packed-KV Triton kernel to materialize K/V, then
+        SDPA for attention. The store path uses Triton scatter store.
         """
         from sglang.srt.layers.attention.kvarn_ops.triton_decode import (
             kvarn_scatter_store,
+            _kvarn_build_packed_kv_kernel,
         )
 
         layer_id = layer.layer_id
@@ -416,20 +417,78 @@ class KVarNAttnBackend(AttentionBackend):
                 self._store_to_tail_pool(layer_id, k_3d, v_3d, forward_batch.out_cache_loc)
 
         # Rotate Q
-        q_rot = (q_3d.float() @ H).to(q.dtype)
+        q_rot = (q_3d.float() @ H).to(torch.float16)
 
-        # Gather K/V per request and run SDPA
+        # Build block_table, seq_lens, cu_seqlens
+        block_table, seq_lens_t, cu_seqlens = self._build_block_table(forward_batch)
+
+        # Materialize K/V via build_packed_kv Triton kernel
+        B = forward_batch.batch_size
+        max_blocks = block_table.shape[1]
+        total_tokens = int(cu_seqlens[-1].item())
+
+        K_packed = torch.empty(
+            total_tokens, self.num_kv_heads, self.head_dim,
+            dtype=torch.float16, device=self.device,
+        )
+        V_packed = torch.empty(
+            total_tokens, self.num_kv_heads, self.v_head_dim,
+            dtype=torch.float16, device=self.device,
+        )
+
+        use_triton_extend = os.environ.get("KVARN_TRITON_EXTEND", "1") == "1"
+
+        if use_triton_extend and total_tokens > 0:
+            _kvarn_build_packed_kv_kernel[(B * max_blocks, self.num_kv_heads)](
+                block_table, seq_lens_t, cu_seqlens,
+                self._block_to_slot_t,
+                self.kv_cache_int4[layer_id],
+                self.tail_K[layer_id], self.tail_V[layer_id],
+                K_packed, V_packed,
+                block_table.stride(0),
+                self.kv_cache_int4[layer_id].stride(0),
+                self.kv_cache_int4[layer_id].stride(1),
+                self._tail_K_stride0, self._tail_K_stride1, self._tail_K_stride2,
+                K_packed.stride(0), K_packed.stride(1),
+                MAX_BLOCKS_PER_REQ=max_blocks,
+                D=self.head_dim, GROUP=self.group,
+                K_BITS=self.cfg.key_bits, V_BITS=self.cfg.value_bits,
+                NUM_BLOCKS_LOOKUP=self._block_lookup_size,
+                K_PACKED_OFFSET=self.cfg.k_packed_offset,
+                K_S_COL_OFFSET=self.cfg.k_s_col_offset,
+                K_ZP_OFFSET=self.cfg.k_zp_offset,
+                K_S_ROW_OFFSET=self.cfg.k_s_row_offset,
+                V_PACKED_OFFSET=self.cfg.v_packed_offset,
+                V_S_COL_OFFSET=self.cfg.v_s_col_offset,
+                V_S_ROW_OFFSET=self.cfg.v_s_row_offset,
+                V_ZP_OFFSET=self.cfg.v_zp_offset,
+                num_warps=4, num_stages=2,
+            )
+        else:
+            # Python gather fallback
+            req_pool_indices = forward_batch.req_pool_indices
+            req_to_token = self.model_runner.req_to_token_pool.req_to_token
+            token_offset = 0
+            for i in range(B):
+                req_idx = int(req_pool_indices[i].item())
+                seq_len = int(seq_lens_t[i].item())
+                if seq_len <= 0:
+                    continue
+                block_ids = self._get_block_ids_for_request(req_idx, seq_len, req_to_token)
+                K_full, V_full = self._gather_request_kv(layer_id, block_ids, seq_len)
+                K_packed[token_offset:token_offset + seq_len] = K_full
+                V_packed[token_offset:token_offset + seq_len] = V_full
+                token_offset += seq_len
+
+        # Run SDPA per request
         out = torch.empty(N, self.num_heads, self.head_dim, dtype=q.dtype, device=q.device)
 
-        req_pool_indices = forward_batch.req_pool_indices
-        req_to_token = self.model_runner.req_to_token_pool.req_to_token
         extend_seq_lens = forward_batch.extend_seq_lens
         extend_prefix_lens = forward_batch.extend_prefix_lens
 
         if extend_seq_lens is not None:
             token_offset = 0
             for i in range(extend_seq_lens.shape[0]):
-                req_idx = int(req_pool_indices[i].item())
                 ext_len = int(extend_seq_lens[i].item())
                 prefix_len = int(extend_prefix_lens[i].item()) if extend_prefix_lens is not None else 0
                 seq_len = prefix_len + ext_len
@@ -441,12 +500,12 @@ class KVarNAttnBackend(AttentionBackend):
                 if ext_len <= 0:
                     continue
 
-                block_ids = self._get_block_ids_for_request(req_idx, seq_len, req_to_token)
-                K_full, V_full = self._gather_request_kv(layer_id, block_ids, seq_len)
+                kv_start = int(cu_seqlens[i].item())
+                kv_end = kv_start + seq_len
 
                 q_i = q_rot[q_start:q_end].transpose(0, 1).unsqueeze(0).float()
-                K_t = K_full.transpose(0, 1).unsqueeze(0).float()
-                V_t = V_full.transpose(0, 1).unsqueeze(0).float()
+                K_t = K_packed[kv_start:kv_end].transpose(0, 1).unsqueeze(0).float()
+                V_t = V_packed[kv_start:kv_end].transpose(0, 1).unsqueeze(0).float()
 
                 if prefix_len == 0:
                     o = F.scaled_dot_product_attention(
@@ -469,7 +528,6 @@ class KVarNAttnBackend(AttentionBackend):
             seq_lens = forward_batch.seq_lens
             token_offset = 0
             for i in range(seq_lens.shape[0]):
-                req_idx = int(req_pool_indices[i].item())
                 seq_len = int(seq_lens[i].item())
                 q_start = token_offset
                 q_end = token_offset + seq_len
@@ -477,12 +535,12 @@ class KVarNAttnBackend(AttentionBackend):
                 if seq_len <= 0:
                     continue
 
-                block_ids = self._get_block_ids_for_request(req_idx, seq_len, req_to_token)
-                K_full, V_full = self._gather_request_kv(layer_id, block_ids, seq_len)
+                kv_start = int(cu_seqlens[i].item())
+                kv_end = kv_start + seq_len
 
                 q_i = q_rot[q_start:q_end].transpose(0, 1).unsqueeze(0).float()
-                K_t = K_full.transpose(0, 1).unsqueeze(0).float()
-                V_t = V_full.transpose(0, 1).unsqueeze(0).float()
+                K_t = K_packed[kv_start:kv_end].transpose(0, 1).unsqueeze(0).float()
+                V_t = V_packed[kv_start:kv_end].transpose(0, 1).unsqueeze(0).float()
 
                 o = F.scaled_dot_product_attention(
                     q_i, K_t, V_t, is_causal=True, scale=self.scale,
