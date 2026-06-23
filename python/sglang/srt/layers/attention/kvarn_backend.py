@@ -5,14 +5,10 @@ Implements compressed KV-cache attention:
   1. Hadamard rotation of Q, K, V before attention.
   2. K/V stored rotated in the pool (bf16 tail pool for in-progress blocks,
      int4 compressed cache for flushed blocks).
-  3. Decode: fused kernel that dequants int4 tiles in-register and runs
-     flash-decode, reading from both pools via ``block_to_slot``.
-  4. Extend: standard attention on the bf16 pool (history materialization
-     from int4 is a future optimization for prefill).
-  5. Un-rotate the output after attention.
-
-The flush (bf16 → int4) is triggered after each decode step when blocks
-fill up. A block is a page of ``group`` tokens (e.g. 128).
+  3. Before decode: dequant compressed blocks back into the bf16 pool
+     on-demand (lazy dequant). The standard Triton decode then reads the
+     dequanted data.
+  4. Un-rotate the output after attention.
 """
 
 from __future__ import annotations
@@ -40,14 +36,16 @@ logger = logging.getLogger(__name__)
 class KVarNAttnBackend(AttentionBackend):
     """KVarN attention backend with Hadamard rotation + int4 compressed KV cache.
 
-    The backend wraps TritonAttnBackend for metadata management and the
-    extend (prefill) path. For decode, it uses a fused kernel that reads
-    from both the int4 compressed cache and the bf16 tail pool.
-
-    Block = page of ``group`` tokens. When a page is fully written (all
-    ``group`` tokens stored in the pool), it is flushed to int4 via the
-    flush manager. The ``block_to_slot`` tensor maps block_id → tail pool
-    slot (-1 if the block is compressed or not yet allocated).
+    Pipeline per decode step:
+      1. Rotate Q, K, V by Hadamard H.
+      2. Write rotated K, V to the bf16 pool via the inner Triton backend.
+      3. Flush full blocks to int4 (Sinkhorn + RTN). After flush, the bf16
+         pool slots for flushed blocks are stale — the int4 cache is the
+         source of truth.
+      4. Before the next decode, dequant compressed blocks back into the
+         bf16 pool (lazy dequant). The standard Triton decode reads the
+         dequanted data.
+      5. Un-rotate the output by H.
     """
 
     needs_cpu_seq_lens: bool = False
@@ -65,7 +63,7 @@ class KVarNAttnBackend(AttentionBackend):
         self.head_dim = kvarn_config.head_dim
         self.group = kvarn_config.group
 
-        # Inner Triton backend for metadata management and extend path.
+        # Inner Triton backend for metadata management and attention.
         self.inner = TritonAttnBackend(model_runner, skip_prefill=skip_prefill)
 
         # Hadamard matrix (fp32 for precision during rotation).
@@ -82,8 +80,11 @@ class KVarNAttnBackend(AttentionBackend):
         self.flush_manager: Optional[KVarNFlushManager] = None
         self.token_to_kv_pool = model_runner.token_to_kv_pool
 
-        # Track which blocks we've already flushed (to avoid re-flushing).
+        # Track which blocks have been flushed (compressed to int4).
         self._flushed_block_ids: set[int] = set()
+        # Track which compressed blocks have already been dequanted back
+        # into the bf16 pool (so we don't re-dequant every step).
+        self._dequanted_in_pool: set[int] = set()
 
         logger.info(
             f"KVarNAttnBackend initialized: head_dim={self.head_dim}, "
@@ -108,7 +109,7 @@ class KVarNAttnBackend(AttentionBackend):
         )
         num_layers = self.model_runner.num_effective_layers
         bytes_per_block = cfg.tile_bytes_aligned * Hk * num_layers
-        max_blocks_by_mem = 512 * 1024 * 1024 // bytes_per_block  # 512MB cap
+        max_blocks_by_mem = 512 * 1024 * 1024 // bytes_per_block
         num_blocks = min(num_blocks, max_blocks_by_mem, 256)
 
         logger.info(
@@ -128,13 +129,11 @@ class KVarNAttnBackend(AttentionBackend):
                 512,
             ),
         )
-        # Attach to pool so the fused decode kernel can access them.
         self.token_to_kv_pool.compressed_cache = self.flush_manager.compressed_cache
         self.token_to_kv_pool.block_to_slot = self.flush_manager.block_to_slot
         self.token_to_kv_pool.flush_manager = self.flush_manager
 
     def init_forward_metadata(self, forward_batch: "ForwardBatch"):
-        """Init metadata for the forward step."""
         self._ensure_flush_manager()
         self.inner.init_forward_metadata(forward_batch)
 
@@ -154,13 +153,11 @@ class KVarNAttnBackend(AttentionBackend):
     # ── Hadamard rotation ──────────────────────────────────────────────────
 
     def _rotate(self, x: torch.Tensor) -> torch.Tensor:
-        """Rotate [N, H, D] → [N, H, D] by Hadamard H (in fp32 for precision)."""
         if self.no_rotation:
             return x
         return torch.matmul(x.float(), self.H_t).to(x.dtype)
 
     def _unrotate(self, x: torch.Tensor) -> torch.Tensor:
-        """Un-rotate [N, H, D] → [N, H, D] by H^T = H (in fp32 for precision)."""
         if self.no_rotation:
             return x
         return torch.matmul(x.float(), self.H).to(x.dtype)
@@ -168,32 +165,23 @@ class KVarNAttnBackend(AttentionBackend):
     # ── Flush: bf16 tail pool → int4 compressed cache ──────────────────────
 
     def _flush_full_blocks(self, forward_batch: "ForwardBatch"):
-        """Detect and flush full blocks from bf16 tail pool to int4.
-
-        A block (page) is flushable when all ``group`` token slots in it
-        have been written. We detect this by scanning the req_to_token
-        table for pages where all slots are non-negative.
-        """
+        """Detect and flush full blocks from bf16 tail pool to int4."""
         if self.flush_manager is None:
             return
 
         G = self.group
-        # req_to_token_pool is on the model_runner, not the forward_batch.
         req_to_token = self.model_runner.req_to_token_pool.req_to_token
         seq_lens = forward_batch.seq_lens
         req_pool_indices = forward_batch.req_pool_indices
 
-        # Collect block_ids to flush
         flush_block_ids = []
         for i in range(forward_batch.batch_size):
             seq_len = seq_lens[i].item()
             if seq_len < G:
                 continue
             req_idx = req_pool_indices[i].item()
-            # Number of complete pages for this request
             num_complete_pages = seq_len // G
             for page_idx in range(num_complete_pages):
-                # Get the first slot of this page
                 token_start = page_idx * G
                 first_slot = req_to_token[req_idx, token_start].item()
                 if first_slot < 0:
@@ -201,7 +189,6 @@ class KVarNAttnBackend(AttentionBackend):
                 block_id = first_slot // G
                 if block_id in self._flushed_block_ids:
                     continue
-                # Verify the page is fully written (all slots non-negative)
                 page_slots = req_to_token[req_idx, token_start:token_start + G]
                 if (page_slots >= 0).all():
                     flush_block_ids.append(block_id)
@@ -210,10 +197,58 @@ class KVarNAttnBackend(AttentionBackend):
         if not flush_block_ids:
             return
 
-        # Flush: batched Sinkhorn + RTN → int4
         tail_k = self.token_to_kv_pool.k_buffer
         tail_v = self.token_to_kv_pool.v_buffer
         self.flush_manager.flush_blocks(flush_block_ids, tail_k, tail_v)
+
+    # ── Lazy dequant: int4 → bf16 pool before decode ───────────────────────
+
+    def _dequant_compressed_for_decode(self, forward_batch: "ForwardBatch", layer: "RadixAttention"):
+        """Dequant compressed blocks back into the bf16 pool for the current batch.
+
+        Before each decode, scan the blocks needed by the current batch.
+        For blocks that have been compressed to int4 but not yet dequanted
+        back into the pool, dequant them. Blocks already in the pool are
+        skipped.
+
+        Note: when the inner backend writes a new token to a compressed block's
+        pool slot (decode writes 1 token per request), the pool slot for that
+        token is fresh bf16 data — the dequanted data for the other 127 tokens
+        in the block is still valid. Only the last token slot is overwritten,
+        and that's the current token's K/V (written by set_kv_buffer), which
+        is correct.
+        """
+        if self.flush_manager is None or not self._flushed_block_ids:
+            return
+
+        G = self.group
+        req_to_token = self.model_runner.req_to_token_pool.req_to_token
+        seq_lens = forward_batch.seq_lens
+        req_pool_indices = forward_batch.req_pool_indices
+
+        blocks_to_dequant = []
+        for i in range(forward_batch.batch_size):
+            seq_len = seq_lens[i].item()
+            if seq_len == 0:
+                continue
+            req_idx = req_pool_indices[i].item()
+            num_pages = (seq_len + G - 1) // G
+            for page_idx in range(num_pages):
+                token_start = page_idx * G
+                first_slot = req_to_token[req_idx, token_start].item()
+                if first_slot < 0:
+                    continue
+                block_id = first_slot // G
+                if block_id in self._flushed_block_ids and block_id not in self._dequanted_in_pool:
+                    blocks_to_dequant.append(block_id)
+
+        if not blocks_to_dequant:
+            return
+
+        tail_k = self.token_to_kv_pool.k_buffer
+        tail_v = self.token_to_kv_pool.v_buffer
+        self.flush_manager.dequant_blocks_to_pool(blocks_to_dequant, tail_k, tail_v)
+        self._dequanted_in_pool.update(blocks_to_dequant)
 
     # ── Forward: decode ────────────────────────────────────────────────────
 
@@ -227,35 +262,37 @@ class KVarNAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        """Decode forward: rotate Q/K/V, write to pool, flush, then attention."""
+        """Decode forward: dequant, rotate Q/K/V, write to pool, flush, attention."""
         pool_dtype = self.token_to_kv_pool.dtype
         model_dtype = q.dtype
 
-        # Q comes in as [N, H*D] or [N, H, D]. K/V come in as [N, H, D].
+        # Before decode: dequant compressed blocks back into the bf16 pool
+        # so the standard Triton decode can read them.
+        self._dequant_compressed_for_decode(forward_batch, layer)
+
+        # Rotate Q/K/V
         q_input_shape = q.shape
         q_3d = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         k_3d = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
         v_3d = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
 
-        # Rotate (in fp32 for precision, then back to pool dtype)
         q_rot = self._rotate(q_3d.to(pool_dtype))
         k_rot = self._rotate(k_3d.to(pool_dtype))
         v_rot = self._rotate(v_3d.to(pool_dtype)) if v_3d.shape[-1] == self.head_dim else v_3d.to(pool_dtype)
 
-        # Pass to inner backend in the same format as the input
         q_out = q_rot.reshape(q_input_shape) if q_input_shape != q_rot.shape else q_rot
         k_out = k_rot.reshape(k.shape) if k.shape != k_rot.shape else k_rot
         v_out = v_rot.reshape(v.shape) if v.shape != v_rot.shape else v_rot
 
-        # Let the inner backend handle pool write + attention
+        # Inner backend handles pool write + attention
         o = self.inner.forward_decode(
             q_out, k_out, v_out, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs,
         )
 
-        # Flush full blocks to int4 (after the pool write, before next step)
+        # After decode: flush full blocks to int4
         self._flush_full_blocks(forward_batch)
 
-        # Un-rotate output and convert back to model dtype
+        # Un-rotate output
         o_3d = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
         o_unrot = self._unrotate(o_3d) if o_3d.shape[-1] == self.head_dim else o_3d
         return o_unrot.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(model_dtype)
@@ -276,6 +313,9 @@ class KVarNAttnBackend(AttentionBackend):
         pool_dtype = self.token_to_kv_pool.dtype
         model_dtype = q.dtype
 
+        # Before extend: dequant compressed blocks back into the bf16 pool
+        self._dequant_compressed_for_decode(forward_batch, layer)
+
         q_input_shape = q.shape
         q_3d = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         k_3d = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
@@ -293,7 +333,7 @@ class KVarNAttnBackend(AttentionBackend):
             q_out, k_out, v_out, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs,
         )
 
-        # Flush full blocks to int4 after prefill
+        # After extend: flush full blocks to int4
         self._flush_full_blocks(forward_batch)
 
         o_3d = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
