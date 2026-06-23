@@ -78,6 +78,7 @@ def test_basic_completion(sglang_server):
     data = r.json()
     assert "text" in data
     assert len(data["text"]) > 0
+    assert "Paris" in data["text"]
 
 
 def test_long_context(sglang_server):
@@ -90,6 +91,44 @@ def test_long_context(sglang_server):
     assert r.status_code == 200
     data = r.json()
     assert len(data["text"]) > 0
+
+
+def test_concurrent_requests(sglang_server):
+    """Test that multiple concurrent requests work correctly."""
+    import requests
+    import threading
+
+    results = [None] * 4
+    def make_request(i):
+        r = requests.post(
+            f"{sglang_server}/generate",
+            json={"text": "The capital of France is", "sampling_params": {"max_new_tokens": 16, "temperature": 0}},
+        )
+        results[i] = r.json()
+
+    threads = [threading.Thread(target=make_request, args=(i,)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    for r in results:
+        assert r is not None
+        assert "Paris" in r["text"]
+
+
+def test_repeated_requests_consistency(sglang_server):
+    """Test that the same prompt produces consistent output (deterministic)."""
+    import requests
+    r1 = requests.post(
+        f"{sglang_server}/generate",
+        json={"text": "The capital of France is", "sampling_params": {"max_new_tokens": 16, "temperature": 0}},
+    )
+    r2 = requests.post(
+        f"{sglang_server}/generate",
+        json={"text": "The capital of France is", "sampling_params": {"max_new_tokens": 16, "temperature": 0}},
+    )
+    assert r1.json()["text"] == r2.json()["text"]
 
 
 if __name__ == "__main__":
