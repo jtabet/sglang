@@ -77,6 +77,8 @@ class KVarNAttnBackend(AttentionBackend):
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self._flushed_block_ids: set[int] = set()
         self._dequanted_in_pool: set[int] = set()
+        # Skip dequant/flush during CUDA graph capture and replay.
+        self._in_cuda_graph: bool = False
 
         logger.info(
             f"KVarNAttnBackend initialized: head_dim={self.head_dim}, "
@@ -119,17 +121,44 @@ class KVarNAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: "ForwardBatch"):
         self._ensure_flush_manager()
+        self._in_cuda_graph = False
         self.inner.init_forward_metadata(forward_batch)
+
+    def init_forward_metadata_out_graph(self, forward_batch: "ForwardBatch", in_capture: bool = False):
+        """Per-iter metadata prep — delegates to inner Triton backend.
+
+        The CUDA graph runner calls this for both decode and extend modes.
+        The inner Triton backend only supports DECODE mode for CUDA graph
+        replay. For EXTEND mode, we use the eager metadata path instead.
+        """
+        self._ensure_flush_manager()
+        if in_capture:
+            self._in_cuda_graph = True
+
+        is_decode = forward_batch.forward_mode.is_decode()
+
+        if not is_decode:
+            # Non-decode forward (e.g. warmup prefill) during CUDA graph
+            # context — use eager path, not the CUDA graph path.
+            self._in_cuda_graph = False
+            self.inner.init_forward_metadata(forward_batch)
+            return
+
+        # Decode forward — use the inner backend's CUDA graph path
+        if not in_capture:
+            # During replay: do lazy dequant before the graph replays,
+            # then flush full blocks after the previous decode step.
+            self._dequant_compressed_for_decode(forward_batch)
+            self._flush_full_blocks(forward_batch)
+
+        self.inner.init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
+
+    def init_forward_metadata_in_graph(self, forward_batch: "ForwardBatch"):
+        """Graph-recordable static-shape GPU op — delegates to inner backend."""
+        self.inner.init_forward_metadata_in_graph(forward_batch)
 
     def init_cuda_graph_state(self, *args, **kwargs):
         return self.inner.init_cuda_graph_state(*args, **kwargs)
-
-    def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs):
-        self._ensure_flush_manager()
-        return self.inner.init_forward_metadata_capture_cuda_graph(*args, **kwargs)
-
-    def init_forward_metadata_replay_cuda_graph(self, *args, **kwargs):
-        return self.inner.init_forward_metadata_replay_cuda_graph(*args, **kwargs)
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         return self.inner.get_cuda_graph_seq_len_fill_value()
@@ -238,7 +267,9 @@ class KVarNAttnBackend(AttentionBackend):
         model_dtype = q.dtype
 
         # Before decode: dequant compressed blocks back into bf16 pool
-        self._dequant_compressed_for_decode(forward_batch)
+        # (skip during CUDA graph capture/replay)
+        if not self._in_cuda_graph:
+            self._dequant_compressed_for_decode(forward_batch)
 
         # Rotate Q/K/V
         q_input_shape = q.shape
@@ -258,8 +289,9 @@ class KVarNAttnBackend(AttentionBackend):
             q_out, k_out, v_out, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs,
         )
 
-        # After decode: flush full blocks to int4
-        self._flush_full_blocks(forward_batch)
+        # After decode: flush full blocks to int4 (skip during CUDA graph)
+        if not self._in_cuda_graph:
+            self._flush_full_blocks(forward_batch)
 
         o_3d = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
         o_unrot = self._unrotate(o_3d) if o_3d.shape[-1] == self.head_dim else o_3d
@@ -278,7 +310,8 @@ class KVarNAttnBackend(AttentionBackend):
         pool_dtype = self.token_to_kv_pool.dtype
         model_dtype = q.dtype
 
-        self._dequant_compressed_for_decode(forward_batch)
+        if not self._in_cuda_graph:
+            self._dequant_compressed_for_decode(forward_batch)
 
         q_input_shape = q.shape
         q_3d = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
@@ -297,7 +330,8 @@ class KVarNAttnBackend(AttentionBackend):
             q_out, k_out, v_out, layer, forward_batch, save_kv_cache=save_kv_cache, **kwargs,
         )
 
-        self._flush_full_blocks(forward_batch)
+        if not self._in_cuda_graph:
+            self._flush_full_blocks(forward_batch)
 
         o_3d = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
         o_unrot = self._unrotate(o_3d) if o_3d.shape[-1] == self.head_dim else o_3d

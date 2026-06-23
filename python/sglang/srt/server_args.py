@@ -1526,7 +1526,15 @@ class ServerArgs:
                 "DSA prefill context parallelism",
                 lambda: self.enable_dsa_prefill_context_parallel,
             ),
+            # KVarN: the Triton backend (inner) doesn't support EXTEND mode
+            # for piecewise CUDA graph replay. Disable prefill CUDA graph.
+            ("KVarN attention backend", lambda: self.kv_cache_dtype.startswith("kvarn_")),
         ]
+        if self.kv_cache_dtype.startswith("kvarn_"):
+            logger.info(
+                f"KVarN: disabling piecewise CUDA graph "
+                f"(kv_cache_dtype={self.kv_cache_dtype})"
+            )
         for _name, predicate in rules:
             if predicate():
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
