@@ -57,6 +57,26 @@ class KVarNAttnBackend(AttentionBackend):
 
     needs_cpu_seq_lens: bool = False
 
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int]:
+        """Block sizes (page sizes) the KVarN kernels support."""
+        return [128, 64]
+
+    @staticmethod
+    def get_preferred_block_size() -> int:
+        """Preferred block size for KVarN — matches the tile group size."""
+        return 128
+
+    @staticmethod
+    def supports_head_size(head_size: int) -> bool:
+        """KVarN supports power-of-2 head dimensions (Hadamard requirement)."""
+        return head_size > 0 and (head_size & (head_size - 1)) == 0
+
+    @staticmethod
+    def supports_kv_cache_dtype(kv_cache_dtype: str) -> bool:
+        """Check if a kv_cache_dtype string is supported by KVarN."""
+        return kv_cache_dtype.startswith("kvarn_")
+
     def __init__(self, model_runner: "ModelRunner", kvarn_config: Optional[KVarNConfig] = None):
         super().__init__()
 
