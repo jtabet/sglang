@@ -495,6 +495,7 @@ class KVarNAttnBackend(AttentionBackend):
                 block_table=block_table,
                 seq_lens=seq_lens_t,
                 cu_seqlens=cu_seqlens,
+                sliding_window=getattr(layer, 'sliding_window_size', -1) if getattr(layer, 'sliding_window_size', -1) > 0 else 0,
             )
             return out.view(N, self.num_heads * self.head_dim)
         else:
@@ -533,14 +534,18 @@ class KVarNAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         sinks=None,
     ) -> torch.Tensor:
-        """Extend forward: multiple tokens per request (prefill/chunked-prefill).
+        """Extend forward: prefill, chunked-prefill, or target_verify.
 
-        Uses the build-packed-KV Triton kernel to materialize K/V, then
-        SDPA for attention. The store path uses Triton scatter store.
+        For target_verify (speculative decode), uses the fused verify kernel
+        (kvarn_verify_attention) which reads int4 + fp16 pool directly per
+        token with VQ_INDIRECT=True — no fp16 materialization.
+
+        For prefill/extend, uses build_packed_kv Triton kernel + SDPA.
         """
         from sglang.srt.layers.attention.kvarn_ops.triton_decode import (
             kvarn_scatter_store,
             _kvarn_build_packed_kv_kernel,
+            kvarn_verify_attention,
         )
 
         layer_id = layer.layer_id
@@ -555,7 +560,6 @@ class KVarNAttnBackend(AttentionBackend):
         if save_kv_cache:
             use_triton_store = os.environ.get("KVARN_TRITON_STORE", "1") == "1"
             if use_triton_store:
-                # Use pre-allocated scratch + cached fp16 Hadamard (capture-safe)
                 k_rot = self._k_rot_scratch[:N]
                 v_rot = self._v_rot_scratch[:N]
                 torch.matmul(k_3d.to(torch.float16), self._H_fp16, out=k_rot)
@@ -570,6 +574,15 @@ class KVarNAttnBackend(AttentionBackend):
             else:
                 self._store_to_tail_pool(layer_id, k_3d, v_3d, forward_batch.out_cache_loc)
 
+        # Check if this is a target_verify (speculative decode) batch
+        forward_mode = getattr(forward_batch, 'forward_mode', None)
+        is_verify = (forward_mode is not None and hasattr(forward_mode, 'is_target_verify')
+                     and forward_mode.is_target_verify())
+
+        if is_verify:
+            return self._fused_verify_path(q_3d, layer, forward_batch, H)
+
+        # Normal extend/prefill path: build_packed_kv + SDPA
         # Rotate Q
         q_rot = (q_3d.float() @ H).to(torch.float16)
 
@@ -704,6 +717,88 @@ class KVarNAttnBackend(AttentionBackend):
                 out[q_start:q_end] = (o.float() @ H.T).to(q.dtype)
 
         return out.view(N, self.num_heads * self.head_dim)
+
+    def _fused_verify_path(
+        self,
+        q_3d: torch.Tensor,       # [NQ, Hq, D]
+        layer: "RadixAttention",
+        forward_batch: "ForwardBatch",
+        H: torch.Tensor,          # [D, D] fp32 Hadamard
+    ) -> torch.Tensor:
+        """Speculative-decode verify via the fused dual-source kernel.
+
+        Each query token becomes a virtual kernel row with its own
+        bottom-right causal length (cached_len + idx + 1) and an indirection
+        to its request's block-table row — so the verify step reads int4
+        tiles + the fp16 pool directly without materializing the whole
+        context to fp16 scratch.
+
+        Eager-only (verify steps are not graph-captured): fresh small
+        tensors per call are fine.
+        """
+        from sglang.srt.layers.attention.kvarn_ops.triton_decode import (
+            kvarn_verify_attention,
+        )
+
+        layer_id = layer.layer_id
+        NQ = q_3d.shape[0]
+        device = q_3d.device
+
+        # Build block_table, seq_lens for the verify kernel
+        block_table, seq_lens_t, cu_seqlens = self._build_block_table(forward_batch)
+        B = block_table.shape[0]
+        max_ctx_blocks = block_table.shape[1]
+
+        # Build per-token vq_req and vq_seqlen
+        extend_seq_lens = forward_batch.extend_seq_lens
+        extend_prefix_lens = forward_batch.extend_prefix_lens
+
+        # query_start_loc: cumulative sum of extend_seq_lens
+        if extend_seq_lens is not None:
+            qlens = extend_seq_lens.to(torch.long)
+            qsl = torch.zeros(B + 1, dtype=torch.long, device=device)
+            qsl[1:] = torch.cumsum(qlens, dim=0)
+        else:
+            # Fallback: treat all tokens as one per request
+            qlens = torch.ones(B, dtype=torch.long, device=device)
+            qsl = torch.arange(B + 1, dtype=torch.long, device=device)
+
+        # vq_req: which request each token belongs to
+        vq_req_long = torch.repeat_interleave(
+            torch.arange(B, device=device), qlens,
+        )
+        vq_req = vq_req_long.to(torch.int32)
+
+        # pos_in_req: position of each token within its request
+        pos_in_req = torch.arange(NQ, device=device) - qsl[:-1][vq_req_long]
+
+        # committed = seq_len - qlen (the cached prefix length)
+        committed = seq_lens_t[:B].to(torch.long) - qlens
+
+        # vq_seqlen: causal length = committed + pos + 1
+        vq_seqlen = (committed[vq_req_long] + pos_in_req + 1).to(torch.int32)
+
+        sliding_window = getattr(layer, 'sliding_window_size', -1)
+        if sliding_window is None or sliding_window <= 0:
+            sliding_window = 0
+
+        out = kvarn_verify_attention(
+            query=q_3d,
+            kv_cache=self.kv_cache_int4[layer_id],
+            tail_K=self.tail_K[layer_id],
+            tail_V=self.tail_V[layer_id],
+            hadamard=H,
+            scale=self.scale,
+            cfg=self.cfg,
+            impl=self,
+            block_table=block_table,
+            vq_req=vq_req,
+            vq_seqlen=vq_seqlen,
+            max_ctx_blocks=max_ctx_blocks,
+            sliding_window=sliding_window,
+        )
+
+        return out.view(NQ, self.num_heads * self.head_dim)
 
     # ── Store path ──────────────────────────────────────────────────────────
 

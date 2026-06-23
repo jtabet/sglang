@@ -556,6 +556,7 @@ def kvarn_decode_attention(
     block_table: torch.Tensor,      # [B, max_blocks] int32
     seq_lens: torch.Tensor,         # [B] int32
     cu_seqlens: torch.Tensor,       # [B+1] int32 (prefix sum)
+    sliding_window: int = 0,        # 0 = no sliding window
 ) -> torch.Tensor:
     """Fused decode driver — dequant int4 in registers + online-softmax.
 
@@ -587,7 +588,7 @@ def kvarn_decode_attention(
     common = dict(
         MAX_BLOCKS_PER_REQ=max_blocks_per_req, D=D, GROUP=group,
         Q_PER_KV=_qpk, Q_PER_KV_PAD=_qpk_pad,
-        SLIDING_WINDOW=0,
+        SLIDING_WINDOW=sliding_window,
         K_BITS=cfg.key_bits, V_BITS=cfg.value_bits,
         NUM_BLOCKS_LOOKUP=impl._block_lookup_size,
         K_PACKED_OFFSET=cfg.k_packed_offset, K_S_COL_OFFSET=cfg.k_s_col_offset,
@@ -676,3 +677,75 @@ def kvarn_scatter_store(
         GROUP=group, D=D, NUM_BLOCKS_LOOKUP=num_blocks_lookup,
         num_warps=4,
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Speculative decode verify driver: kvarn_verify_attention
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def kvarn_verify_attention(
+    query: torch.Tensor,                # [NQ, Hq, D]  fp16/bf16 (token-major)
+    kv_cache: torch.Tensor,             # [num_blocks, Hk, TILE_BYTES] uint8
+    tail_K: torch.Tensor,              # [POOL_SIZE, group, Hk, D] fp16
+    tail_V: torch.Tensor,              # [POOL_SIZE, group, Hk, D] fp16
+    hadamard: torch.Tensor,            # [D, D] fp32
+    scale: float,
+    cfg,
+    impl,                               # KVarNAttnBackend
+    block_table: torch.Tensor,          # [B, max_blocks] int32
+    vq_req: torch.Tensor,               # [NQ] int32 — block-table row per token
+    vq_seqlen: torch.Tensor,            # [NQ] int32 — causal len: cached+i+1
+    max_ctx_blocks: int,               # ceil(max context / group) upper bound
+    sliding_window: int = 0,
+) -> torch.Tensor:
+    """Fused multi-query verify (speculative decode), reading int4 tiles +
+    the fp16 tail pool directly — no fp16 materialization of the context.
+
+    Each query token becomes a virtual kernel row with its own causal length
+    and block-table row indirection (VQ_INDIRECT=True).
+
+    Output: [NQ, Hq, D] in query's dtype, un-rotated frame.
+    """
+    NQ, Hq, D = query.shape
+    Hk = kv_cache.shape[1]
+    device = query.device
+    out_dtype = query.dtype
+    group = cfg.group
+    Nrows = NQ * Hq
+
+    H16 = hadamard.to(torch.float16)
+    q_rot = torch.mm(query.reshape(Nrows, D).to(torch.float16), H16)
+
+    _qpk = Hq // Hk
+    _qpk_pad = 1 << (_qpk - 1).bit_length() if _qpk > 1 else 1
+
+    common = dict(
+        MAX_BLOCKS_PER_REQ=max_ctx_blocks, D=D, GROUP=group,
+        Q_PER_KV=_qpk, Q_PER_KV_PAD=_qpk_pad,
+        SLIDING_WINDOW=sliding_window,
+        K_BITS=cfg.key_bits, V_BITS=cfg.value_bits,
+        NUM_BLOCKS_LOOKUP=impl._block_lookup_size,
+        K_PACKED_OFFSET=cfg.k_packed_offset, K_S_COL_OFFSET=cfg.k_s_col_offset,
+        K_ZP_OFFSET=cfg.k_zp_offset, K_S_ROW_OFFSET=cfg.k_s_row_offset,
+        V_PACKED_OFFSET=cfg.v_packed_offset, V_S_COL_OFFSET=cfg.v_s_col_offset,
+        V_S_ROW_OFFSET=cfg.v_s_row_offset, V_ZP_OFFSET=cfg.v_zp_offset,
+        VQ_INDIRECT=True,
+    )
+
+    out_rot = torch.empty(NQ, Hq, D, dtype=torch.float16, device=device)
+
+    _kvarn_fused_decode_kernel[(NQ, Hk)](
+        q_rot, vq_req, block_table, vq_seqlen,
+        impl._block_to_slot_t,
+        kv_cache, tail_K, tail_V,
+        out_rot, scale,
+        Hq * D, D, block_table.stride(0),
+        kv_cache.stride(0), kv_cache.stride(1),
+        impl._tail_K_stride0, impl._tail_K_stride1, impl._tail_K_stride2,
+        Hq * D, D,
+        **common,
+    )
+
+    out_unrot = torch.mm(out_rot.reshape(Nrows, D), H16)
+    return out_unrot.view(NQ, Hq, D).to(out_dtype)
