@@ -161,6 +161,10 @@ class KVarNAttnBackend(AttentionBackend):
             req_idx = req_pool_indices[i].item()
             num_complete_pages = seq_len // G
             for page_idx in range(num_complete_pages):
+                # Skip page 0 (sink block) — keep fp16 for attention
+                # sink accuracy and multi-turn prefix cache reuse.
+                if page_idx == 0:
+                    continue
                 token_start = page_idx * G
                 first_slot = req_to_token[req_idx, token_start].item()
                 if first_slot < 0:
