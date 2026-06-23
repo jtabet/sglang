@@ -82,6 +82,13 @@ class KVarNAttnBackend(AttentionBackend):
         self.cfg: KVarNConfig = kvarn_cfg
         self.group = self.cfg.group
 
+        # Validate head_dim — KVarN supports power-of-2 head dims
+        model_config = model_runner.model_config
+        if model_config.head_dim & (model_config.head_dim - 1) != 0:
+            raise RuntimeError(
+                f"KVarN requires power-of-2 head_dim, got {model_config.head_dim}"
+            )
+
         # Model config
         model_config = model_runner.model_config
         self.num_heads = model_config.get_total_num_attention_heads() // model_runner.tp_size

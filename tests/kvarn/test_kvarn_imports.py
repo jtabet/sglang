@@ -52,10 +52,20 @@ def test_import_triton_decode():
     from sglang.srt.layers.attention.kvarn_ops.triton_decode import (
         _kvarn_scatter_store_kernel,
         _kvarn_build_packed_kv_kernel,
+        _kvarn_fused_decode_kernel,
+        _kvarn_fused_verify_stage1,
+        kvarn_decode_attention,
+        kvarn_verify_attention,
+        kvarn_scatter_store,
     )
     # These are Triton JIT kernels — just verify they're decorated.
     assert _kvarn_scatter_store_kernel is not None
     assert _kvarn_build_packed_kv_kernel is not None
+    assert _kvarn_fused_decode_kernel is not None
+    assert _kvarn_fused_verify_stage1 is not None
+    assert callable(kvarn_decode_attention)
+    assert callable(kvarn_verify_attention)
+    assert callable(kvarn_scatter_store)
 
 
 if __name__ == "__main__":
