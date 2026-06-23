@@ -647,74 +647,130 @@ class KVarNAttnBackend(AttentionBackend):
                 V_packed[token_offset:token_offset + seq_len] = V_full
                 token_offset += seq_len
 
-        # Run SDPA per request
+        # Run attention via flash_attn_varlen (batched, no Python loop)
+        # This matches vLLM's _cached_multiquery_path: one flash_attn_varlen
+        # call for the whole batch instead of per-request SDPA.
         out = torch.empty(N, self.num_heads, self.head_dim, dtype=q.dtype, device=q.device)
 
-        extend_seq_lens = forward_batch.extend_seq_lens
-        extend_prefix_lens = forward_batch.extend_prefix_lens
+        extend_seq_lens = getattr(forward_batch, 'extend_seq_lens', None)
+        extend_prefix_lens = getattr(forward_batch, 'extend_prefix_lens', None)
 
         if extend_seq_lens is not None:
-            token_offset = 0
-            for i in range(extend_seq_lens.shape[0]):
-                ext_len = int(extend_seq_lens[i].item())
-                prefix_len = int(extend_prefix_lens[i].item()) if extend_prefix_lens is not None else 0
-                seq_len = prefix_len + ext_len
+            # Extend mode: each request has prefix (cached) + new tokens
+            qlens = extend_seq_lens.to(torch.int32)
+            prefix_lens = extend_prefix_lens.to(torch.int32) if extend_prefix_lens is not None else torch.zeros_like(qlens)
+            seq_lens_full = (prefix_lens + qlens).to(torch.int32)
+        else:
+            # Pure prefill: all tokens are new
+            qlens = seq_lens_t[:B].to(torch.int32)
+            prefix_lens = torch.zeros_like(qlens)
+            seq_lens_full = qlens
 
-                q_start = token_offset
-                q_end = token_offset + ext_len
-                token_offset = q_end
+        # Build cu_seqlens for flash_attn_varlen
+        cu_q = torch.zeros(B + 1, dtype=torch.int32, device=self.device)
+        cu_q[1:] = torch.cumsum(qlens, dim=0)
+        cu_k = torch.zeros(B + 1, dtype=torch.int32, device=self.device)
+        cu_k[1:] = torch.cumsum(seq_lens_full, dim=0)
 
-                if ext_len <= 0:
-                    continue
+        try:
+            from flash_attn_interface import flash_attn_varlen_func as _fa_varlen
+            _has_flash = True
+        except ImportError:
+            try:
+                from sgl_kernel.flash_attn import flash_attn_varlen_func as _fa_varlen
+                _has_flash = True
+            except ImportError:
+                _has_flash = False
 
-                kv_start = int(cu_seqlens[i].item())
-                kv_end = kv_start + seq_len
+        use_flash = os.environ.get("KVARN_USE_FLASH", "0") == "1" and _has_flash and total_tokens > 0
 
-                q_i = q_rot[q_start:q_end].transpose(0, 1).unsqueeze(0).float()
-                K_t = K_packed[kv_start:kv_end].transpose(0, 1).unsqueeze(0).float()
-                V_t = V_packed[kv_start:kv_end].transpose(0, 1).unsqueeze(0).float()
+        if use_flash:
+            # flash_attn_varlen: q [N, Hq, D], K [total_k, Hk, D], V [total_k, Hk, vD]
+            # For GQA: Hq must be a multiple of Hk
+            # Causal mask is bottom-right aligned: query token t attends to keys <= prefix+t
+            # This matches the extend semantics when seqlen_q < seqlen_k
+            q_for_fa = q_rot[:N].contiguous()
+            K_for_fa = K_packed[:total_tokens].contiguous()
+            V_for_fa = V_packed[:total_tokens].contiguous()
 
-                if prefix_len == 0:
+            fa_out = _fa_varlen(
+                q_for_fa, K_for_fa, V_for_fa,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_k=cu_k,
+                max_seqlen_q=int(qlens.max().item()) if B > 0 else 1,
+                max_seqlen_k=int(seq_lens_full.max().item()) if B > 0 else 1,
+                softmax_scale=self.scale,
+                causal=True,
+            )[0]
+            # fa_out may be [N, Hq, D] or [N, Hq*D] depending on implementation
+            if fa_out.dim() == 2:
+                fa_out = fa_out.view(N, self.num_heads, self.head_dim)
+            # Un-rotate each head: [N, Hq, D] @ [D, D]^T = [N, Hq, D]
+            out[:] = (fa_out.float() @ H.T).to(q.dtype)
+        else:
+            # Fallback: per-request SDPA
+            if extend_seq_lens is not None:
+                token_offset = 0
+                for i in range(extend_seq_lens.shape[0]):
+                    ext_len = int(extend_seq_lens[i].item())
+                    prefix_len = int(extend_prefix_lens[i].item()) if extend_prefix_lens is not None else 0
+                    seq_len = prefix_len + ext_len
+
+                    q_start = token_offset
+                    q_end = token_offset + ext_len
+                    token_offset = q_end
+
+                    if ext_len <= 0:
+                        continue
+
+                    kv_start = int(cu_seqlens[i].item())
+                    kv_end = kv_start + seq_len
+
+                    q_i = q_rot[q_start:q_end].transpose(0, 1).unsqueeze(0).float()
+                    K_t = K_packed[kv_start:kv_end].transpose(0, 1).unsqueeze(0).float()
+                    V_t = V_packed[kv_start:kv_end].transpose(0, 1).unsqueeze(0).float()
+
+                    if prefix_len == 0:
+                        o = F.scaled_dot_product_attention(
+                            q_i, K_t, V_t, is_causal=True, scale=self.scale,
+                            enable_gqa=self.num_kv_heads < self.num_heads,
+                        )
+                    else:
+                        q_len = ext_len
+                        q_pos = torch.arange(q_len, device=q.device).unsqueeze(1) + prefix_len
+                        k_pos = torch.arange(seq_len, device=q.device).unsqueeze(0)
+                        mask = k_pos <= q_pos
+                        o = F.scaled_dot_product_attention(
+                            q_i, K_t, V_t, attn_mask=mask, scale=self.scale,
+                            enable_gqa=self.num_kv_heads < self.num_heads,
+                        )
+
+                    o = o[0].transpose(0, 1)
+                    out[q_start:q_end] = (o.float() @ H.T).to(q.dtype)
+            else:
+                seq_lens = forward_batch.seq_lens
+                token_offset = 0
+                for i in range(seq_lens.shape[0]):
+                    seq_len = int(seq_lens[i].item())
+                    q_start = token_offset
+                    q_end = token_offset + seq_len
+                    token_offset = q_end
+                    if seq_len <= 0:
+                        continue
+
+                    kv_start = int(cu_seqlens[i].item())
+                    kv_end = kv_start + seq_len
+
+                    q_i = q_rot[q_start:q_end].transpose(0, 1).unsqueeze(0).float()
+                    K_t = K_packed[kv_start:kv_end].transpose(0, 1).unsqueeze(0).float()
+                    V_t = V_packed[kv_start:kv_end].transpose(0, 1).unsqueeze(0).float()
+
                     o = F.scaled_dot_product_attention(
                         q_i, K_t, V_t, is_causal=True, scale=self.scale,
                         enable_gqa=self.num_kv_heads < self.num_heads,
                     )
-                else:
-                    q_len = ext_len
-                    q_pos = torch.arange(q_len, device=q.device).unsqueeze(1) + prefix_len
-                    k_pos = torch.arange(seq_len, device=q.device).unsqueeze(0)
-                    mask = k_pos <= q_pos
-                    o = F.scaled_dot_product_attention(
-                        q_i, K_t, V_t, attn_mask=mask, scale=self.scale,
-                        enable_gqa=self.num_kv_heads < self.num_heads,
-                    )
-
-                o = o[0].transpose(0, 1)
-                out[q_start:q_end] = (o.float() @ H.T).to(q.dtype)
-        else:
-            seq_lens = forward_batch.seq_lens
-            token_offset = 0
-            for i in range(seq_lens.shape[0]):
-                seq_len = int(seq_lens[i].item())
-                q_start = token_offset
-                q_end = token_offset + seq_len
-                token_offset = q_end
-                if seq_len <= 0:
-                    continue
-
-                kv_start = int(cu_seqlens[i].item())
-                kv_end = kv_start + seq_len
-
-                q_i = q_rot[q_start:q_end].transpose(0, 1).unsqueeze(0).float()
-                K_t = K_packed[kv_start:kv_end].transpose(0, 1).unsqueeze(0).float()
-                V_t = V_packed[kv_start:kv_end].transpose(0, 1).unsqueeze(0).float()
-
-                o = F.scaled_dot_product_attention(
-                    q_i, K_t, V_t, is_causal=True, scale=self.scale,
-                    enable_gqa=self.num_kv_heads < self.num_heads,
-                )
-                o = o[0].transpose(0, 1)
-                out[q_start:q_end] = (o.float() @ H.T).to(q.dtype)
+                    o = o[0].transpose(0, 1)
+                    out[q_start:q_end] = (o.float() @ H.T).to(q.dtype)
 
         return out.view(N, self.num_heads * self.head_dim)
 
