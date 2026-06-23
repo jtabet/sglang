@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -536,3 +537,144 @@ def _kvarn_fused_decode_stage2(
     O = tl.load(MidO_ptr + n * stride_mo_n + s_offs[:, None] * stride_mo_s + d_offs[None, :])
     out = tl.sum(w[:, None] * O, axis=0) / denom
     tl.store(Out_ptr + n * stride_o_n + d_offs, out.to(tl.float16))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Python driver: kvarn_decode_attention
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def kvarn_decode_attention(
+    query: torch.Tensor,            # [B, Hq, D]   fp16/bf16
+    kv_cache: torch.Tensor,         # [num_blocks, num_kv_heads, TILE_BYTES] uint8
+    hadamard: torch.Tensor,         # [D, D]       fp32
+    scale: float,
+    cfg,
+    impl,                           # KVarNAttnBackend (has pool + scratch buffers)
+    block_table: torch.Tensor,      # [B, max_blocks] int32
+    seq_lens: torch.Tensor,         # [B] int32
+    cu_seqlens: torch.Tensor,       # [B+1] int32 (prefix sum)
+) -> torch.Tensor:
+    """Fused decode driver — dequant int4 in registers + online-softmax.
+
+    Never materializes a full fp16 K/V buffer to HBM. Moves ~int4 (0.25x FP16)
+    KV traffic for the bulk history.
+
+    Output: [B, Hq, D] in query's dtype, un-rotated frame.
+    """
+    B, Hq, D = query.shape
+    Hk = kv_cache.shape[1]
+    device = query.device
+    out_dtype = query.dtype
+    group = cfg.group
+    N = B * Hq
+
+    # 1. Q rotation — fp16 matmul
+    H16 = hadamard.to(torch.float16)
+    q_rot_fp16 = torch.mm(query.reshape(N, D).to(torch.float16), H16)
+
+    # 2. Fused decode kernel
+    max_blocks_per_req = block_table.shape[1]
+    _qpk = Hq // Hk
+    _qpk_pad = 1 << (_qpk - 1).bit_length() if _qpk > 1 else 1
+
+    fused_out = torch.empty(N, D, dtype=torch.float16, device=device)
+
+    use_fused = os.environ.get("KVARN_FUSED_DECODE", "1") == "1"
+
+    common = dict(
+        MAX_BLOCKS_PER_REQ=max_blocks_per_req, D=D, GROUP=group,
+        Q_PER_KV=_qpk, Q_PER_KV_PAD=_qpk_pad,
+        SLIDING_WINDOW=0,
+        K_BITS=cfg.key_bits, V_BITS=cfg.value_bits,
+        NUM_BLOCKS_LOOKUP=impl._block_lookup_size,
+        K_PACKED_OFFSET=cfg.k_packed_offset, K_S_COL_OFFSET=cfg.k_s_col_offset,
+        K_ZP_OFFSET=cfg.k_zp_offset, K_S_ROW_OFFSET=cfg.k_s_row_offset,
+        V_PACKED_OFFSET=cfg.v_packed_offset, V_S_COL_OFFSET=cfg.v_s_col_offset,
+        V_S_ROW_OFFSET=cfg.v_s_row_offset, V_ZP_OFFSET=cfg.v_zp_offset,
+        VQ_INDIRECT=False,
+    )
+
+    if use_fused:
+        # Single-stage fused decode: (B, Hk) grid, online softmax
+        _kvarn_fused_decode_kernel[(B, Hk)](
+            q_rot_fp16.view(B, Hq, D), seq_lens, block_table, seq_lens,
+            impl._block_to_slot_t,
+            kv_cache, impl.tail_K[0] if isinstance(impl.tail_K, list) else impl.tail_K,
+            impl.tail_V[0] if isinstance(impl.tail_V, list) else impl.tail_V,
+            fused_out.view(B, Hq, D), scale,
+            Hq * D, D, block_table.stride(0),
+            kv_cache.stride(0), kv_cache.stride(1),
+            impl._tail_K_stride0, impl._tail_K_stride1, impl._tail_K_stride2,
+            Hq * D, D,
+            **common,
+        )
+        output_rot = fused_out
+    else:
+        # Materialize path: build packed fp16 K/V then FlashAttention
+        total_tokens = cu_seqlens[-1].item()
+        K_packed = torch.empty(total_tokens, Hk, D, dtype=torch.float16, device=device)
+        V_packed = torch.empty(total_tokens, Hk, D, dtype=torch.float16, device=device)
+
+        _kvarn_build_packed_kv_kernel[(B * max_blocks_per_req, Hk)](
+            block_table, seq_lens, cu_seqlens,
+            impl._block_to_slot_t,
+            kv_cache,
+            impl.tail_K[0] if isinstance(impl.tail_K, list) else impl.tail_K,
+            impl.tail_V[0] if isinstance(impl.tail_V, list) else impl.tail_V,
+            K_packed, V_packed,
+            block_table.stride(0),
+            kv_cache.stride(0), kv_cache.stride(1),
+            impl._tail_K_stride0, impl._tail_K_stride1, impl._tail_K_stride2,
+            K_packed.stride(0), K_packed.stride(1),
+            MAX_BLOCKS_PER_REQ=max_blocks_per_req,
+            D=D, GROUP=group,
+            K_BITS=cfg.key_bits, V_BITS=cfg.value_bits,
+            NUM_BLOCKS_LOOKUP=impl._block_lookup_size,
+            K_PACKED_OFFSET=cfg.k_packed_offset, K_S_COL_OFFSET=cfg.k_s_col_offset,
+            K_ZP_OFFSET=cfg.k_zp_offset, K_S_ROW_OFFSET=cfg.k_s_row_offset,
+            V_PACKED_OFFSET=cfg.v_packed_offset, V_S_COL_OFFSET=cfg.v_s_col_offset,
+            V_S_ROW_OFFSET=cfg.v_s_row_offset, V_ZP_OFFSET=cfg.v_zp_offset,
+            num_warps=4, num_stages=2,
+        )
+        # Use SDPA for the attention (no flash_attn_varlen_func in sglang)
+        # For decode: each query is 1 token, attending to all keys
+        output_rot = torch.empty(B, Hq, D, dtype=torch.float16, device=device)
+        for i in range(B):
+            seq_len = int(seq_lens[i].item())
+            q_i = q_rot_fp16.view(B, Hq, D)[i:i+1].transpose(0, 1).unsqueeze(0).float()
+            K_t = K_packed[cu_seqlens[i]:cu_seqlens[i]+seq_len].transpose(0, 1).unsqueeze(0).float()
+            V_t = V_packed[cu_seqlens[i]:cu_seqlens[i]+seq_len].transpose(0, 1).unsqueeze(0).float()
+            o = F.scaled_dot_product_attention(
+                q_i, K_t, V_t, is_causal=False, scale=scale,
+                enable_gqa=Hk < Hq,
+            )
+            output_rot[i] = o[0, :, 0, :].to(torch.float16)
+
+    # 3. Un-rotate output
+    out_unrot = torch.mm(output_rot.reshape(N, D), H16)
+    return out_unrot.view(B, Hq, D).to(out_dtype)
+
+
+def kvarn_scatter_store(
+    k_rot: torch.Tensor,     # [N, Hk, D] fp16 (already rotated)
+    v_rot: torch.Tensor,     # [N, Hk, D] fp16
+    slot_mapping: torch.Tensor,  # [N] int32 (out_cache_loc)
+    block_to_slot_t: torch.Tensor,  # [num_blocks_lookup] int32
+    pool_K: torch.Tensor,    # [POOL_SIZE, group, Hk, D] fp16
+    pool_V: torch.Tensor,    # [POOL_SIZE, group, Hk, D] fp16
+    group: int,
+    D: int,
+    num_blocks_lookup: int,
+):
+    """Scatter already-rotated K/V into the tail pool via block_to_slot lookup."""
+    N = k_rot.shape[0]
+    Hk = k_rot.shape[1]
+    _kvarn_scatter_store_kernel[(N, Hk)](
+        k_rot, v_rot, slot_mapping, block_to_slot_t,
+        pool_K, pool_V,
+        k_rot.stride(0), k_rot.stride(1),
+        pool_K.stride(0), pool_K.stride(1), pool_K.stride(2),
+        GROUP=group, D=D, NUM_BLOCKS_LOOKUP=num_blocks_lookup,
+        num_warps=4,
+    )

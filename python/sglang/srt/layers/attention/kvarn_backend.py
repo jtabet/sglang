@@ -185,6 +185,17 @@ class KVarNAttnBackend(AttentionBackend):
         # Initialize free slots
         self._free_slots = list(range(self.pool_slots))
 
+        # Block-to-slot GPU lookup tensor (used by Triton kernels)
+        self._block_lookup_size = self.num_blocks
+        self._block_to_slot_t = torch.full(
+            (self.num_blocks,), -1, dtype=torch.int32, device=device,
+        )
+
+        # Store tail pool strides for Triton kernel launches
+        self._tail_K_stride0 = self.tail_K[0].stride(0)
+        self._tail_K_stride1 = self.tail_K[0].stride(1)
+        self._tail_K_stride2 = self.tail_K[0].stride(2)
+
         logger.info(
             f"KVarN pools allocated: tail_pool_slots={self.pool_slots}, "
             f"compressed_blocks={self.num_blocks}, "
@@ -200,6 +211,9 @@ class KVarNAttnBackend(AttentionBackend):
         self._block_to_slot[block_id] = slot
         self._slot_to_block[slot] = block_id
         self._block_fill[block_id] = 0
+        # Update GPU lookup tensor
+        if self._block_to_slot_t is not None and block_id < self._block_lookup_size:
+            self._block_to_slot_t[block_id] = slot
         return slot
 
     def _free_slot(self, block_id: int):
@@ -209,6 +223,9 @@ class KVarNAttnBackend(AttentionBackend):
             self._slot_to_block.pop(slot, None)
             self._block_fill.pop(block_id, None)
             self._free_slots.append(slot)
+            # Update GPU lookup tensor: -1 means block is in int4 cache
+            if self._block_to_slot_t is not None and block_id < self._block_lookup_size:
+                self._block_to_slot_t[block_id] = -1
 
     def get_slot_for_block(self, block_id: int) -> Optional[int]:
         """Get the tail pool slot for a block, or None if flushed."""
@@ -275,20 +292,37 @@ class KVarNAttnBackend(AttentionBackend):
         sinks=None,
     ) -> torch.Tensor:
         """Decode forward: one token per request."""
+        from sglang.srt.layers.attention.kvarn_ops.triton_decode import (
+            kvarn_scatter_store,
+        )
+
         layer_id = layer.layer_id
-        N = q.shape[0]  # num decode tokens (= batch_size for pure decode)
+        N = q.shape[0]
         H = self._get_hadamard(self.device)
 
         q_3d = q.view(N, self.num_heads, self.head_dim)
         k_3d = k.view(N, self.num_kv_heads, self.head_dim)
         v_3d = v.view(N, self.num_kv_heads, self.v_head_dim)
 
-        # Rotate K/V and store to tail pool
+        # Store K/V to tail pool
         if save_kv_cache:
-            self._store_to_tail_pool(layer_id, k_3d, v_3d, forward_batch.out_cache_loc)
+            self._ensure_slots_for_tokens(forward_batch.out_cache_loc)
+            use_triton_store = os.environ.get("KVARN_TRITON_STORE", "1") == "1"
+            if use_triton_store:
+                k_rot = (k_3d.float() @ H).to(torch.float16)
+                v_rot = (v_3d.float() @ H).to(torch.float16)
+                kvarn_scatter_store(
+                    k_rot, v_rot,
+                    forward_batch.out_cache_loc.to(torch.int32),
+                    self._block_to_slot_t,
+                    self.tail_K[layer_id], self.tail_V[layer_id],
+                    self.group, self.head_dim, self._block_lookup_size,
+                )
+            else:
+                self._store_to_tail_pool(layer_id, k_3d, v_3d, forward_batch.out_cache_loc)
 
         # Rotate Q
-        q_rot = self._rotate(q_3d, H)
+        q_rot = (q_3d.float() @ H).to(q.dtype)
 
         # Gather K/V per request and run SDPA
         out = torch.empty(N, self.num_heads, self.head_dim, dtype=q.dtype, device=q.device)
@@ -301,23 +335,18 @@ class KVarNAttnBackend(AttentionBackend):
             req_idx = int(req_pool_indices[i].item())
             seq_len = int(seq_lens[i].item())
 
-            # Build block table for this request
             block_ids = self._get_block_ids_for_request(req_idx, seq_len, req_to_token)
-
-            # Gather K/V from tail pool + int4 cache
             K_full, V_full = self._gather_request_kv(layer_id, block_ids, seq_len)
 
-            # Run SDPA for this single query token
-            q_i = q_rot[i:i+1].transpose(0, 1).unsqueeze(0).float()  # [1, Hq, 1, D]
-            K_t = K_full.transpose(0, 1).unsqueeze(0).float()  # [1, Hk, seq_len, D]
-            V_t = V_full.transpose(0, 1).unsqueeze(0).float()  # [1, Hk, seq_len, D]
+            q_i = q_rot[i:i+1].transpose(0, 1).unsqueeze(0).float()
+            K_t = K_full.transpose(0, 1).unsqueeze(0).float()
+            V_t = V_full.transpose(0, 1).unsqueeze(0).float()
 
             o = F.scaled_dot_product_attention(
                 q_i, K_t, V_t, is_causal=False, scale=self.scale,
                 enable_gqa=self.num_kv_heads < self.num_heads,
             )
-            # Un-rotate
-            o = o[0, :, 0, :].to(q.dtype)  # [Hq, D]
+            o = o[0, :, 0, :].to(q.dtype)
             out[i] = (o.float() @ H.T).to(q.dtype)
 
         return out.view(N, self.num_heads * self.head_dim)
@@ -334,34 +363,50 @@ class KVarNAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         """Extend forward: multiple tokens per request (prefill/chunked-prefill).
 
-        Handles both first-chunk prefill (prefix_len=0) and extend
-        (prefix_len>0) and target_verify (ext_len=1, prefix=seq-1).
+        Uses Python gather + SDPA for correctness. The build_packed_kv
+        Triton kernel will be used once debugged.
         """
+        from sglang.srt.layers.attention.kvarn_ops.triton_decode import (
+            kvarn_scatter_store,
+        )
+
         layer_id = layer.layer_id
-        N = q.shape[0]  # total num tokens in batch
+        N = q.shape[0]
         H = self._get_hadamard(self.device)
 
         q_3d = q.view(N, self.num_heads, self.head_dim)
         k_3d = k.view(N, self.num_kv_heads, self.head_dim)
         v_3d = v.view(N, self.num_kv_heads, self.v_head_dim)
 
-        # Rotate K/V and store to tail pool
+        # Store K/V to tail pool
         if save_kv_cache:
-            self._store_to_tail_pool(layer_id, k_3d, v_3d, forward_batch.out_cache_loc)
+            self._ensure_slots_for_tokens(forward_batch.out_cache_loc)
+            use_triton_store = os.environ.get("KVARN_TRITON_STORE", "1") == "1"
+            if use_triton_store:
+                k_rot = (k_3d.float() @ H).to(torch.float16)
+                v_rot = (v_3d.float() @ H).to(torch.float16)
+                kvarn_scatter_store(
+                    k_rot, v_rot,
+                    forward_batch.out_cache_loc.to(torch.int32),
+                    self._block_to_slot_t,
+                    self.tail_K[layer_id], self.tail_V[layer_id],
+                    self.group, self.head_dim, self._block_lookup_size,
+                )
+            else:
+                self._store_to_tail_pool(layer_id, k_3d, v_3d, forward_batch.out_cache_loc)
 
         # Rotate Q
-        q_rot = self._rotate(q_3d, H)
+        q_rot = (q_3d.float() @ H).to(q.dtype)
 
-        extend_seq_lens = forward_batch.extend_seq_lens
-        extend_prefix_lens = forward_batch.extend_prefix_lens
-
+        # Gather K/V per request and run SDPA
         out = torch.empty(N, self.num_heads, self.head_dim, dtype=q.dtype, device=q.device)
 
         req_pool_indices = forward_batch.req_pool_indices
         req_to_token = self.model_runner.req_to_token_pool.req_to_token
+        extend_seq_lens = forward_batch.extend_seq_lens
+        extend_prefix_lens = forward_batch.extend_prefix_lens
 
         if extend_seq_lens is not None:
-            # Extend mode: each request has prefix (cached) + new tokens
             token_offset = 0
             for i in range(extend_seq_lens.shape[0]):
                 req_idx = int(req_pool_indices[i].item())
@@ -376,50 +421,39 @@ class KVarNAttnBackend(AttentionBackend):
                 if ext_len <= 0:
                     continue
 
-                # Build block table for this request (full seq_len)
                 block_ids = self._get_block_ids_for_request(req_idx, seq_len, req_to_token)
-
-                # Gather K/V for the full sequence (in rotated frame)
                 K_full, V_full = self._gather_request_kv(layer_id, block_ids, seq_len)
 
-                # Run SDPA: query attends to all tokens (prefix + new), causal
-                q_i = q_rot[q_start:q_end].transpose(0, 1).unsqueeze(0).float()  # [1, Hq, ext_len, D]
-                K_t = K_full.transpose(0, 1).unsqueeze(0).float()  # [1, Hk, seq_len, D]
-                V_t = V_full.transpose(0, 1).unsqueeze(0).float()  # [1, Hk, seq_len, D]
+                q_i = q_rot[q_start:q_end].transpose(0, 1).unsqueeze(0).float()
+                K_t = K_full.transpose(0, 1).unsqueeze(0).float()
+                V_t = V_full.transpose(0, 1).unsqueeze(0).float()
 
                 if prefix_len == 0:
-                    # First-chunk prefill: standard causal attention
                     o = F.scaled_dot_product_attention(
                         q_i, K_t, V_t, is_causal=True, scale=self.scale,
                         enable_gqa=self.num_kv_heads < self.num_heads,
                     )
                 else:
-                    # Extend: query at position prefix_len+j attends to keys 0..prefix_len+j
                     q_len = ext_len
-                    q_pos = torch.arange(q_len, device=q.device).unsqueeze(1) + prefix_len  # [q_len, 1]
-                    k_pos = torch.arange(seq_len, device=q.device).unsqueeze(0)  # [1, seq_len]
-                    mask = k_pos <= q_pos  # [q_len, seq_len]
-
+                    q_pos = torch.arange(q_len, device=q.device).unsqueeze(1) + prefix_len
+                    k_pos = torch.arange(seq_len, device=q.device).unsqueeze(0)
+                    mask = k_pos <= q_pos
                     o = F.scaled_dot_product_attention(
                         q_i, K_t, V_t, attn_mask=mask, scale=self.scale,
                         enable_gqa=self.num_kv_heads < self.num_heads,
                     )
 
-                o = o[0].transpose(0, 1)  # [ext_len, Hq, D]
+                o = o[0].transpose(0, 1)
                 out[q_start:q_end] = (o.float() @ H.T).to(q.dtype)
         else:
-            # Fallback: no extend_seq_lens — shouldn't happen but handle gracefully
-            # Treat as pure prefill using seq_lens
             seq_lens = forward_batch.seq_lens
             token_offset = 0
             for i in range(seq_lens.shape[0]):
                 req_idx = int(req_pool_indices[i].item())
                 seq_len = int(seq_lens[i].item())
-
                 q_start = token_offset
                 q_end = token_offset + seq_len
                 token_offset = q_end
-
                 if seq_len <= 0:
                     continue
 
@@ -441,17 +475,48 @@ class KVarNAttnBackend(AttentionBackend):
 
     # ── Store path ──────────────────────────────────────────────────────────
 
+    def _ensure_slots_for_tokens(self, out_cache_loc: torch.Tensor):
+        """Pre-allocate tail pool slots for any new blocks in this batch.
+        Must be called BEFORE the Triton scatter store kernel."""
+        loc_cpu = out_cache_loc.cpu()
+        for i in range(loc_cpu.shape[0]):
+            slot_idx = int(loc_cpu[i].item())
+            if slot_idx < 0:
+                continue
+            block_id = slot_idx // self.page_size
+            if block_id not in self._block_to_slot:
+                self._alloc_slot(block_id)
+                if block_id < KVaRN_SINK_BLOCKS:
+                    self._sink_block_ids.add(block_id)
+            self._block_fill[block_id] = self._block_fill.get(block_id, 0) + 1
+
+    def _update_block_fill(self, out_cache_loc: torch.Tensor):
+        """Update block fill tracking after scatter store. Called after
+        the Triton scatter store to track which blocks are full."""
+        loc_cpu = out_cache_loc.cpu()
+        for i in range(loc_cpu.shape[0]):
+            slot_idx = int(loc_cpu[i].item())
+            if slot_idx < 0:
+                continue
+            block_id = slot_idx // self.page_size
+            # Allocate a tail pool slot for new blocks
+            if block_id not in self._block_to_slot:
+                self._alloc_slot(block_id)
+                if block_id < KVaRN_SINK_BLOCKS:
+                    self._sink_block_ids.add(block_id)
+            self._block_fill[block_id] = self._block_fill.get(block_id, 0) + 1
+
     def _store_to_tail_pool(
         self,
         layer_id: int,
-        k: torch.Tensor,  # [N, Hk, D] bf16/fp16
+        k: torch.Tensor,  # [N, Hk, D] bf16/fp16 (NOT yet rotated)
         v: torch.Tensor,  # [N, Hk, vD] bf16/fp16
         out_cache_loc: torch.Tensor,  # [N] slot indices
     ):
         """Rotate K/V and store to tail pool using block-to-slot mapping.
 
-        Vectorized: allocates tail pool slots for new blocks, then scatters
-        K/V to the tail pool using index_put_.
+        Assumes slots have already been allocated by _ensure_slots_for_tokens.
+        Uses vectorized index_put_ for the scatter.
         """
         H = self._get_hadamard(self.device)
 
@@ -464,25 +529,13 @@ class KVarNAttnBackend(AttentionBackend):
         block_ids = loc // self.page_size  # [N]
         pos_in_block = loc % self.page_size  # [N]
 
-        # Find new blocks that need tail pool slots allocated
-        unique_blocks = torch.unique(block_ids)
-        new_blocks = [int(b.item()) for b in unique_blocks if int(b.item()) not in self._block_to_slot]
-
-        for b in new_blocks:
-            self._alloc_slot(b)
-            if b < KVaRN_SINK_BLOCKS:
-                self._sink_block_ids.add(b)
-
-        # Build tail pool slot indices for each token
-        # We need a GPU tensor mapping block_id -> tail_pool_slot
-        # For now, build a CPU mapping and transfer
+        # Build tail pool slot indices for each token using the CPU dict
         tail_slots = torch.empty_like(loc, dtype=torch.long)
         for i in range(loc.shape[0]):
-            tail_slots[i] = self._block_to_slot[int(block_ids[i].item())]
+            bid = int(block_ids[i].item())
+            tail_slots[i] = self._block_to_slot[bid]
 
-        # Scatter to tail pool: tail_K[layer_id][tail_slots, pos_in_block] = k_rot
-        # This is a scatter along two dimensions: slot and pos_in_block
-        # Use index_put_ with linear index: slot * group + pos_in_block
+        # Scatter to tail pool via linear index: slot * group + pos_in_block
         linear_idx = tail_slots * self.group + pos_in_block
 
         K_flat = self.tail_K[layer_id].view(
@@ -491,18 +544,8 @@ class KVarNAttnBackend(AttentionBackend):
         V_flat = self.tail_V[layer_id].view(
             self.pool_slots * self.group, self.num_kv_heads, self.v_head_dim
         )
-        K_flat.index_put_(
-            (linear_idx,), k_rot, accumulate=False,
-        )
-        V_flat.index_put_(
-            (linear_idx,), v_rot, accumulate=False,
-        )
-
-        # Update block fill counts (CPU)
-        for b in unique_blocks:
-            bid = int(b.item())
-            count = int((block_ids == b).sum().item())
-            self._block_fill[bid] = self._block_fill.get(bid, 0) + count
+        K_flat.index_put_((linear_idx,), k_rot, accumulate=False)
+        V_flat.index_put_((linear_idx,), v_rot, accumulate=False)
 
     # ── Gather path ─────────────────────────────────────────────────────────
 
@@ -523,13 +566,49 @@ class KVarNAttnBackend(AttentionBackend):
             token_pos = b * self.page_size
             slot = int(req_to_token[req_idx, token_pos].item())
             if slot < 0:
-                # Unallocated position — use a placeholder block_id
-                # This shouldn't happen for a valid seq_len
                 block_ids.append(-1)
             else:
                 block_id = slot // self.page_size
                 block_ids.append(block_id)
         return block_ids
+
+    def _build_block_table(
+        self,
+        forward_batch: "ForwardBatch",
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build block_table, seq_lens, cu_seqlens for the fused Triton kernel.
+
+        block_table: [B, max_blocks] int32 — block_id per (request, block)
+        seq_lens: [B] int32 — sequence length per request
+        cu_seqlens: [B+1] int32 — prefix sum of seq_lens
+        """
+        B = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        req_to_token = self.model_runner.req_to_token_pool.req_to_token
+
+        max_seq_len = int(seq_lens.max().item()) if B > 0 else 1
+        max_blocks = (max_seq_len + self.page_size - 1) // self.page_size
+        max_blocks = max(max_blocks, 1)
+
+        block_table = torch.zeros(B, max_blocks, dtype=torch.int32, device=self.device)
+        seq_lens_t = seq_lens.to(torch.int32)
+
+        for i in range(B):
+            req_idx = int(req_pool_indices[i].item())
+            seq_len = int(seq_lens[i].item())
+            n_blocks = (seq_len + self.page_size - 1) // self.page_size
+            for b in range(n_blocks):
+                token_pos = b * self.page_size
+                if token_pos < req_to_token.shape[1]:
+                    slot = int(req_to_token[req_idx, token_pos].item())
+                    if slot >= 0:
+                        block_table[i, b] = slot // self.page_size
+
+        cu_seqlens = torch.zeros(B + 1, dtype=torch.int32, device=self.device)
+        cu_seqlens[1:] = torch.cumsum(seq_lens_t, dim=0)
+
+        return block_table, seq_lens_t, cu_seqlens
 
     def _gather_request_kv(
         self,
