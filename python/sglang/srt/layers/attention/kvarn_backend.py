@@ -222,6 +222,14 @@ class KVarNAttnBackend(AttentionBackend):
         # Cached fp16 Hadamard for fast matmul in store path
         self._H_fp16 = self._get_hadamard(device).to(torch.float16).contiguous()
 
+        # Pre-allocated Q rotation buffer (CUDA graph capture-safe)
+        max_decode_tokens = max(max_running * 1, 1)
+        max_prefill = max_prefill_tokens or 16384
+        self._q_rot_fp16_buf = torch.empty(
+            max(max_decode_tokens, max_prefill), self.num_heads * self.head_dim,
+            dtype=torch.float16, device=device,
+        )
+
         logger.info(
             f"KVarN pools allocated: tail_pool_slots={self.pool_slots}, "
             f"compressed_blocks={self.num_blocks}, "

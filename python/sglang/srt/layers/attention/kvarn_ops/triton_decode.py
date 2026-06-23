@@ -584,8 +584,13 @@ def kvarn_decode_attention(
     N = B * Hq
 
     # 1. Q rotation — fp16 matmul
+    # Use pre-allocated buffer when available (CUDA graph capture-safe)
     H16 = hadamard.to(torch.float16)
-    q_rot_fp16 = torch.mm(query.reshape(N, D).to(torch.float16), H16)
+    if hasattr(impl, '_q_rot_fp16_buf') and impl._q_rot_fp16_buf is not None:
+        q_rot_fp16 = impl._q_rot_fp16_buf[:N]
+        torch.mm(query.reshape(N, D).to(torch.float16), H16, out=q_rot_fp16)
+    else:
+        q_rot_fp16 = torch.mm(query.reshape(N, D).to(torch.float16), H16)
 
     # 2. Fused decode kernel
     max_blocks_per_req = block_table.shape[1]
@@ -610,19 +615,67 @@ def kvarn_decode_attention(
     )
 
     if use_fused:
-        # Single-stage fused decode: (B, Hk) grid, online softmax
-        _kvarn_fused_decode_kernel[(B, Hk)](
-            q_rot_fp16.view(B, Hq, D), seq_lens, block_table, seq_lens,
-            impl._block_to_slot_t,
-            kv_cache, tail_K, tail_V,
-            fused_out.view(B, Hq, D), scale,
-            Hq * D, D, block_table.stride(0),
-            kv_cache.stride(0), kv_cache.stride(1),
-            impl._tail_K_stride0, impl._tail_K_stride1, impl._tail_K_stride2,
-            Hq * D, D,
-            **common,
-        )
-        output_rot = fused_out
+        use_split = os.environ.get("KVARN_SPLIT_K", "0") == "1"
+        if use_split:
+            # Split-K (two-stage flash-decoding): only a win in the LOW-batch /
+            # long-context regime (few programs → the KV-split dim adds the
+            # missing parallelism). At BURST (high batch) the single-stage
+            # (B,Hk) grid already saturates the GPU.
+            kv_splits = adaptive_num_kv_splits(max_blocks_per_req)
+            mid_O = torch.empty(B, Hq, kv_splits, D, dtype=torch.float32, device=device)
+            mid_lse = torch.empty(B, Hq, kv_splits, dtype=torch.float32, device=device)
+            _bn = int(os.environ.get("KVARN_BLOCK_N", "16"))
+            _nw = int(os.environ.get("KVARN_NUM_WARPS", "4"))
+            _ns = int(os.environ.get("KVARN_NUM_STAGES", "2"))
+            _kvarn_fused_decode_stage1[(B, Hk, kv_splits)](
+                q_rot_fp16.view(B, Hq, D), seq_lens, block_table, seq_lens,
+                impl._block_to_slot_t,
+                kv_cache, tail_K, tail_V,
+                mid_O, mid_lse, scale,
+                Hq * D, D, block_table.stride(0),
+                kv_cache.stride(0), kv_cache.stride(1),
+                impl._tail_K_stride0, impl._tail_K_stride1, impl._tail_K_stride2,
+                Hq * D, D,
+                D * kv_splits, D, kv_splits,
+                MAX_BLOCKS_PER_REQ=max_blocks_per_req,
+                D=D, GROUP=group, BLOCK_N=_bn,
+                Q_PER_KV=_qpk, Q_PER_KV_PAD=_qpk_pad,
+                NUM_KV_SPLITS=kv_splits,
+                SLIDING_WINDOW=sliding_window,
+                K_BITS=cfg.key_bits, V_BITS=cfg.value_bits,
+                NUM_BLOCKS_LOOKUP=impl._block_lookup_size,
+                K_PACKED_OFFSET=cfg.k_packed_offset, K_S_COL_OFFSET=cfg.k_s_col_offset,
+                K_ZP_OFFSET=cfg.k_zp_offset, K_S_ROW_OFFSET=cfg.k_s_row_offset,
+                V_PACKED_OFFSET=cfg.v_packed_offset, V_S_COL_OFFSET=cfg.v_s_col_offset,
+                V_S_ROW_OFFSET=cfg.v_s_row_offset, V_ZP_OFFSET=cfg.v_zp_offset,
+                VQ_INDIRECT=False,
+                num_warps=_nw, num_stages=_ns,
+            )
+            fused_out = torch.empty(B, Hq, D, dtype=torch.float16, device=device)
+            _kvarn_fused_decode_stage2[(B, Hk)](
+                mid_O, mid_lse, fused_out,
+                Hq * D, D,
+                D * kv_splits, D, kv_splits,
+                Hq * D, D,
+                D=D, NUM_KV_SPLITS=kv_splits,
+                Q_PER_KV=_qpk, Q_PER_KV_PAD=_qpk_pad,
+                num_warps=1,
+            )
+            output_rot = fused_out
+        else:
+            # Single-stage fused decode: (B, Hk) grid, online softmax
+            _kvarn_fused_decode_kernel[(B, Hk)](
+                q_rot_fp16.view(B, Hq, D), seq_lens, block_table, seq_lens,
+                impl._block_to_slot_t,
+                kv_cache, tail_K, tail_V,
+                fused_out.view(B, Hq, D), scale,
+                Hq * D, D, block_table.stride(0),
+                kv_cache.stride(0), kv_cache.stride(1),
+                impl._tail_K_stride0, impl._tail_K_stride1, impl._tail_K_stride2,
+                Hq * D, D,
+                **common,
+            )
+            output_rot = fused_out
     else:
         # Materialize path: build packed fp16 K/V then SDPA
         total_tokens = cu_seqlens[-1].item()
