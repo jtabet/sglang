@@ -173,6 +173,8 @@ class KVarNFlushManager:
         Hk = self.num_kv_heads
         D = self.head_dim
         G = self.group
+        pack_k = 8 // cfg.key_bits
+        pack_v = 8 // cfg.value_bits
 
         for layer_id in range(self.num_layers):
             k_pool = tail_k_pools[layer_id]
@@ -181,9 +183,9 @@ class KVarNFlushManager:
 
             for bid in block_ids:
                 for h in range(Hk):
-                    # Dequant K tile
+                    # Dequant K tile: packed as [D, G // pack_k]
                     off = cfg.k_packed_offset
-                    k_packed = k_cache[bid, h, off:off + D * (G // 2)].reshape(D, G // 2)
+                    k_packed = k_cache[bid, h, off:off + D * (G // pack_k)].reshape(D, G // pack_k)
                     off = cfg.k_s_col_offset
                     s_col_K = k_cache[bid, h, off:off + D * 2].view(torch.float16)
                     off = cfg.k_zp_offset
@@ -197,9 +199,9 @@ class KVarNFlushManager:
                     slot_start = bid * G
                     k_pool[slot_start:slot_start + G, h, :] = K_deq.t().to(k_pool.dtype)
 
-                    # Dequant V tile
+                    # Dequant V tile: packed as [G, D // pack_v]
                     off = cfg.v_packed_offset
-                    v_packed = k_cache[bid, h, off:off + G * (D // 2)].reshape(G, D // 2)
+                    v_packed = k_cache[bid, h, off:off + G * (D // pack_v)].reshape(G, D // pack_v)
                     off = cfg.v_s_col_offset
                     s_col_V = k_cache[bid, h, off:off + D * 2].view(torch.float16)
                     off = cfg.v_s_row_offset
