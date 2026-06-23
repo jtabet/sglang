@@ -498,17 +498,24 @@ class KVarNAttnBackend(AttentionBackend):
     def _ensure_slots_for_tokens(self, out_cache_loc: torch.Tensor):
         """Pre-allocate tail pool slots for any new blocks in this batch.
         Must be called BEFORE the Triton scatter store kernel."""
-        loc_cpu = out_cache_loc.cpu()
-        for i in range(loc_cpu.shape[0]):
-            slot_idx = int(loc_cpu[i].item())
-            if slot_idx < 0:
-                continue
-            block_id = slot_idx // self.page_size
-            if block_id not in self._block_to_slot:
-                self._alloc_slot(block_id)
-                if block_id < KVaRN_SINK_BLOCKS:
-                    self._sink_block_ids.add(block_id)
-            self._block_fill[block_id] = self._block_fill.get(block_id, 0) + 1
+        # Compute block_ids for all tokens (vectorized on GPU)
+        block_ids_t = out_cache_loc // self.page_size  # [N] on GPU
+        # Find unique block_ids that need slots (CPU)
+        block_ids_cpu = block_ids_t.cpu()
+        unique_new = set()
+        for bid in block_ids_cpu.tolist():
+            if bid >= 0 and bid not in self._block_to_slot:
+                unique_new.add(bid)
+
+        for bid in unique_new:
+            self._alloc_slot(bid)
+            if bid < KVaRN_SINK_BLOCKS:
+                self._sink_block_ids.add(bid)
+
+        # Update block fill counts (CPU)
+        for bid in block_ids_cpu.tolist():
+            if bid >= 0:
+                self._block_fill[bid] = self._block_fill.get(bid, 0) + 1
 
     def _update_block_fill(self, out_cache_loc: torch.Tensor):
         """Update block fill tracking after scatter store. Called after
@@ -603,30 +610,38 @@ class KVarNAttnBackend(AttentionBackend):
         cu_seqlens: [B+1] int32 — prefix sum of seq_lens
         """
         B = forward_batch.batch_size
-        req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
+        req_pool_indices = forward_batch.req_pool_indices
         req_to_token = self.model_runner.req_to_token_pool.req_to_token
 
         max_seq_len = int(seq_lens.max().item()) if B > 0 else 1
         max_blocks = (max_seq_len + self.page_size - 1) // self.page_size
         max_blocks = max(max_blocks, 1)
 
+        # Vectorized block_table construction:
+        # For each request, get the first slot of each page from req_to_token
+        # block_id = slot // page_size
         block_table = torch.zeros(B, max_blocks, dtype=torch.int32, device=self.device)
         seq_lens_t = seq_lens.to(torch.int32)
 
-        for i in range(B):
-            req_idx = int(req_pool_indices[i].item())
-            seq_len = int(seq_lens[i].item())
-            n_blocks = (seq_len + self.page_size - 1) // self.page_size
-            for b in range(n_blocks):
-                token_pos = b * self.page_size
-                if token_pos < req_to_token.shape[1]:
-                    slot = int(req_to_token[req_idx, token_pos].item())
-                    if slot >= 0:
-                        block_table[i, b] = slot // self.page_size
+        if B > 0:
+            # Build column indices: [0, page_size, 2*page_size, ...]
+            col_offsets = torch.arange(max_blocks, device=self.device) * self.page_size
+            # For each request, get req_idx
+            req_indices = req_pool_indices.long()
+            # Gather first slot of each page: req_to_token[req_idx, col_offset]
+            # Shape: [B, max_blocks]
+            token_positions = col_offsets.unsqueeze(0).expand(B, max_blocks)
+            # Clamp to valid range to avoid OOB
+            max_token_pos = req_to_token.shape[1] - 1
+            token_positions = token_positions.clamp(max=max_token_pos)
+            slots = req_to_token[req_indices.unsqueeze(1), token_positions]
+            # block_id = slot // page_size (negative slots → negative block_id → ignored by kernel)
+            block_table = (slots // self.page_size).to(torch.int32)
 
         cu_seqlens = torch.zeros(B + 1, dtype=torch.int32, device=self.device)
-        cu_seqlens[1:] = torch.cumsum(seq_lens_t, dim=0)
+        if B > 0:
+            cu_seqlens[1:] = torch.cumsum(seq_lens_t, dim=0)
 
         return block_table, seq_lens_t, cu_seqlens
 
