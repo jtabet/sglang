@@ -582,10 +582,61 @@ class KVarNAttnBackend(AttentionBackend):
         if is_verify:
             return self._fused_verify_path(q_3d, layer, forward_batch, H)
 
-        # Normal extend/prefill path: build_packed_kv + SDPA
+        # Check if this is a first-chunk prefill (all tokens new, no cached prefix)
+        extend_seq_lens = getattr(forward_batch, 'extend_seq_lens', None)
+        extend_prefix_lens = getattr(forward_batch, 'extend_prefix_lens', None)
+        is_first_chunk = False
+        if os.environ.get("KVARN_FIRST_CHUNK", "0") == "1":
+            if extend_prefix_lens is not None and extend_seq_lens is not None:
+                # All requests must have prefix_len=0 AND ext_len=seq_len
+                is_first_chunk = (
+                    int(extend_prefix_lens.min().item()) == 0 and
+                    int((extend_seq_lens == forward_batch.seq_lens[:extend_seq_lens.shape[0]]).all().item())
+                )
+
         # Rotate Q
         q_rot = (q_3d.float() @ H).to(torch.float16)
 
+        if is_first_chunk:
+            # First-chunk prefill: all K/V are new (just stored to tail pool).
+            # Use the raw rotated K/V directly — no need to gather from cache.
+            # This matches vLLM's _prefill_first_chunk.
+            if save_kv_cache and os.environ.get("KVARN_TRITON_STORE", "1") == "1":
+                k_for_attn = self._k_rot_scratch[:N]
+                v_for_attn = self._v_rot_scratch[:N]
+            else:
+                k_for_attn = (k_3d.float() @ H).to(torch.float16)
+                v_for_attn = (v_3d.float() @ H).to(torch.float16)
+
+            B = forward_batch.batch_size
+            out = torch.empty(N, self.num_heads, self.head_dim, dtype=q.dtype, device=q.device)
+            seq_lens = forward_batch.seq_lens
+            qsl = torch.zeros(B + 1, dtype=torch.int32, device=self.device)
+            qsl[1:] = torch.cumsum(seq_lens.to(torch.int32), dim=0)
+
+            token_offset = 0
+            for i in range(B):
+                seq_len = int(seq_lens[i].item())
+                q_start = token_offset
+                q_end = token_offset + seq_len
+                token_offset = q_end
+                if seq_len <= 0:
+                    continue
+
+                q_i = q_rot[q_start:q_end].transpose(0, 1).unsqueeze(0).float()
+                K_t = k_for_attn[q_start:q_end].transpose(0, 1).unsqueeze(0).float()
+                V_t = v_for_attn[q_start:q_end].transpose(0, 1).unsqueeze(0).float()
+
+                o = F.scaled_dot_product_attention(
+                    q_i, K_t, V_t, is_causal=True, scale=self.scale,
+                    enable_gqa=self.num_kv_heads < self.num_heads,
+                )
+                o = o[0].transpose(0, 1)
+                out[q_start:q_end] = (o.float() @ H.T).to(q.dtype)
+
+            return out.view(N, self.num_heads * self.head_dim)
+
+        # Normal extend path: build_packed_kv + SDPA
         # Build block_table, seq_lens, cu_seqlens
         block_table, seq_lens_t, cu_seqlens = self._build_block_table(forward_batch)
 
