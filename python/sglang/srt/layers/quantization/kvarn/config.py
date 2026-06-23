@@ -179,6 +179,100 @@ class KVarNConfig:
         return slots * self._slot_bytes_per_layer(num_kv_heads) * max(num_layers, 1)
 
     @staticmethod
+    def num_kvarn_layers(model_config, parallel_config=None) -> int:
+        """Number of layers the KVarN fp16 tail pool actually spans = the
+        full-attention layers. On a hybrid model (Qwen3.5/3.6, Jamba, ...) the
+        Mamba/linear-attention layers have no KVarN pool, so sizing the pool by
+        ALL layers over-reserves it ~Nx and starves the Mamba/KV caches (OOM or
+        cap collapse). For a dense transformer this equals total layers, so the
+        dense path is unchanged. Falls back to total layers if the per-type
+        count is unavailable."""
+        try:
+            if hasattr(model_config, 'get_num_layers_by_block_type'):
+                n = model_config.get_num_layers_by_block_type(parallel_config, "attention")
+                if n and n > 0:
+                    return n
+            if hasattr(model_config, 'num_attention_layers'):
+                n = model_config.num_attention_layers
+                if n and n > 0:
+                    return n
+        except Exception:
+            pass
+
+        # Fallback: total layers
+        if hasattr(model_config, 'num_layers'):
+            return model_config.num_layers
+        if hasattr(model_config, 'get_num_layers'):
+            return model_config.get_num_layers(parallel_config) if parallel_config else model_config.get_num_layers()
+        return 24  # Safe default
+
+    @staticmethod
+    def estimate_weight_bytes(model: str, tensor_parallel_size: int = 1) -> int | None:
+        """Best-effort per-rank model weight size in bytes, read from the
+        checkpoint files on disk (exact, and cheap, with no CUDA context).
+        Returns None if the files can't be located, so the caller falls back
+        to the legacy budget.
+
+        Resolves a local directory directly, or the local HF cache snapshot for
+        a repo id (never downloads). Prefers the shards named in a
+        ``*.safetensors.index.json`` manifest, which is exactly the set the
+        loader reads. This avoids double-counting a repo that ships both a
+        single consolidated checkpoint and the sharded HF set. Divides by the
+        tensor-parallel degree (weights shard ~evenly across ranks)."""
+        import glob as _glob
+        import json as _json
+
+        try:
+            d = model
+            if not os.path.isdir(d):
+                try:
+                    from huggingface_hub import snapshot_download
+                    d = snapshot_download(model, local_files_only=True)
+                except Exception:
+                    return None
+
+            # 1) Prefer the loader's own manifest
+            for ext in ("safetensors", "bin"):
+                indexes = _glob.glob(
+                    os.path.join(d, "**", f"*.{ext}.index.json"), recursive=True
+                )
+                if not indexes:
+                    continue
+                try:
+                    with open(indexes[0]) as fh:
+                        weight_map = _json.load(fh).get("weight_map", {})
+                    base = os.path.dirname(indexes[0])
+                    names = sorted(set(weight_map.values()))
+                    shards = [os.path.join(base, s) for s in names]
+                    if names and all(os.path.exists(p) for p in shards):
+                        total = sum(os.path.getsize(p) for p in shards)
+                        if total > 0:
+                            return total // max(tensor_parallel_size, 1)
+                except Exception:
+                    pass
+
+            # 2) No usable manifest: prefer a canonical single-file checkpoint
+            for single in ("model.safetensors", "consolidated.safetensors"):
+                p = os.path.join(d, single)
+                if os.path.exists(p):
+                    total = os.path.getsize(p)
+                    if total > 0:
+                        return total // max(tensor_parallel_size, 1)
+
+            # 3) Fallback: sum whatever weight shards are present
+            files = _glob.glob(os.path.join(d, "**", "*.safetensors"), recursive=True)
+            if not files:
+                files = _glob.glob(os.path.join(d, "**", "*.bin"), recursive=True)
+            if not files:
+                return None
+            total = sum(os.path.getsize(f) for f in files)
+            if total <= 0:
+                return None
+            return total // max(tensor_parallel_size, 1)
+        except Exception:
+            return None
+
+    @staticmethod
     def get_boundary_skip_layers(num_layers: int, n: int = 2) -> list[str]:
         if n <= 0 or num_layers <= 0:
             return []
