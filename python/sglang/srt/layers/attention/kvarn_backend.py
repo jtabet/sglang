@@ -155,9 +155,13 @@ class KVarNAttnBackend(AttentionBackend):
         max_prefill_tokens = mr.server_args.max_prefill_tokens or 16384
 
         # Tail pool size: 2 * max_running (sink + in-progress tail per request)
-        # + prefill_blocks + headroom
-        prefill_blocks = (max_prefill_tokens + self.group - 1) // self.group
-        self.pool_slots = max(2 * max_running + prefill_blocks + 8, 8)
+        # + prefill_blocks + headroom. Can be overridden via KVARN_POOL_SLOTS.
+        env_slots = int(os.environ.get("KVARN_POOL_SLOTS", "0"))
+        if env_slots > 0:
+            self.pool_slots = max(env_slots, 8)
+        else:
+            prefill_blocks = (max_prefill_tokens + self.group - 1) // self.group
+            self.pool_slots = max(2 * max_running + prefill_blocks + 8, 8)
 
         # Compressed cache: one slot per scheduler page
         self.num_blocks = mr.max_total_num_tokens // self.page_size
@@ -357,7 +361,11 @@ class KVarNAttnBackend(AttentionBackend):
         self._cg_max_blocks = max_blocks_per_req
 
         # Warm up Triton kernels to avoid JIT stalls during capture / serving
-        self._warmup_kernels(max_batch_size, max_blocks_per_req)
+        # Only warm up scatter store (fast). The fused decode kernel has
+        # autotuning configs that can take a long time on first run — let
+        # it autotune during normal serving (first request is slow, then fast).
+        if os.environ.get("KVARN_WARMUP_KERNELS", "0") == "1":
+            self._warmup_kernels(max_batch_size, max_blocks_per_req)
 
     def _warmup_kernels(self, max_batch_size: int, max_blocks_per_req: int):
         """Warm up all Triton kernels with dummy inputs to trigger JIT compilation."""
@@ -911,7 +919,12 @@ class KVarNAttnBackend(AttentionBackend):
 
     def _ensure_slots_for_tokens(self, out_cache_loc: torch.Tensor):
         """Pre-allocate tail pool slots for any new blocks in this batch.
-        Must be called BEFORE the Triton scatter store kernel."""
+        Must be called BEFORE the Triton scatter store kernel.
+
+        Note: _block_fill is NOT updated here — it's already set correctly
+        by _maybe_flush_blocks from the committed boundary computation.
+        Matching vLLM: fill tracking lives in the builder, not the store path.
+        """
         # Compute block_ids for all tokens (vectorized on GPU)
         block_ids_t = out_cache_loc // self.page_size  # [N] on GPU
         # Find unique block_ids that need slots (CPU)
@@ -925,11 +938,6 @@ class KVarNAttnBackend(AttentionBackend):
             self._alloc_slot(bid)
             if bid < KVaRN_SINK_BLOCKS:
                 self._sink_block_ids.add(bid)
-
-        # Update block fill counts (CPU)
-        for bid in block_ids_cpu.tolist():
-            if bid >= 0:
-                self._block_fill[bid] = self._block_fill.get(bid, 0) + 1
 
     def _update_block_fill(self, out_cache_loc: torch.Tensor):
         """Update block fill tracking after scatter store. Called after
