@@ -102,8 +102,9 @@ class KVarNAttnBackend(AttentionBackend):
         )
         num_layers = self.model_runner.num_effective_layers
         bytes_per_block = cfg.tile_bytes_aligned * Hk * num_layers
-        max_blocks_by_mem = 512 * 1024 * 1024 // bytes_per_block
-        num_blocks = min(num_blocks, max_blocks_by_mem, 256)
+        # Cap compressed cache at 1GB (was 512MB) to allow more blocks
+        max_blocks_by_mem = 1024 * 1024 * 1024 // bytes_per_block
+        num_blocks = min(num_blocks, max_blocks_by_mem, 1024)
 
         logger.info(
             f"KVarN flush manager: pool_size={pool_size}, page_size={page_size}, "
