@@ -234,8 +234,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 )
                 # Tail pool overhead: small constant, ~2*max_num_seqs blocks.
                 # Per-token cost is dominated by the compressed cache.
-                # Add ~20% overhead for the tail pool.
-                overhead = 0.20
+                # Add ~30% overhead for the tail pool + runtime allocations.
+                overhead = 0.30
                 cell_size = int(compressed_per_token * num_layers * (1 + overhead))
 
         return cell_size
