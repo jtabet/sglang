@@ -226,9 +226,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 n = model_config.get_num_kv_heads(tp_size)
                 G = kvarn_cfg.group
                 # Compressed bytes per token (K+V) per layer:
-                # tile_bytes covers group tokens, divided by group gives per-token
+                # tile_bytes covers group tokens for one head and already
+                # includes both K and V (packed + scales). Divide by group for
+                # per-token, multiply by n heads.
                 compressed_per_token = (
-                    kvarn_cfg.tile_bytes_aligned * n * 2 // G  # K+V tiles
+                    kvarn_cfg.tile_bytes_aligned * n // G
                 )
                 # Tail pool overhead: small constant, ~2*max_num_seqs blocks.
                 # Per-token cost is dominated by the compressed cache.
