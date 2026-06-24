@@ -3292,6 +3292,34 @@ class ServerArgs:
             raise RuntimeError("KV4 is not tested on non-CUDA platforms.")
 
     def _handle_page_size(self):
+        # KVarN requires page_size to match the tile group size, regardless
+        # of whether another subsystem (e.g. DSA) already set it.
+        if self.kv_cache_dtype.startswith("kvarn_"):
+            from sglang.srt.layers.quantization.kvarn.config import (
+                KVARN_PRESETS,
+            )
+            preset = KVARN_PRESETS.get(self.kv_cache_dtype, {})
+            kvarn_group = preset.get("group", 128)
+            if self.page_size != kvarn_group:
+                logger.info(
+                    f"Overriding page_size={self.page_size} -> {kvarn_group} "
+                    f"for KVarN (kv_cache_dtype={self.kv_cache_dtype})."
+                )
+                self.page_size = kvarn_group
+            else:
+                logger.info(
+                    f"Setting page_size={self.page_size} for KVarN "
+                    f"(kv_cache_dtype={self.kv_cache_dtype})."
+                )
+            # KVarN supports CUDA graph for decode (fused Triton kernel).
+            # Prefill CUDA graph is not supported (Python gather + SDPA path).
+            if self.cuda_graph_config.prefill.backend != Backend.DISABLED:
+                logger.info(
+                    "Disabling prefill CUDA graph for KVarN (eager extend path)."
+                )
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            return
+
         if self.page_size is None:
             # SHUFFLE 5D vectorized KV layout (aiter backend + pa_decode_gluon)
             # is tuned for and prefers page_size=64 — making it the default
@@ -3309,25 +3337,6 @@ class ServerArgs:
                     "Setting page_size=64 as default for "
                     "SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d."
                 )
-            elif self.kv_cache_dtype.startswith("kvarn_"):
-                # KVarN requires page_size to match the tile group size.
-                # The group is embedded in the preset name (e.g. g128).
-                from sglang.srt.layers.quantization.kvarn.config import (
-                    KVARN_PRESETS,
-                )
-                preset = KVARN_PRESETS.get(self.kv_cache_dtype, {})
-                self.page_size = preset.get("group", 128)
-                logger.info(
-                    f"Setting page_size={self.page_size} for KVarN "
-                    f"(kv_cache_dtype={self.kv_cache_dtype})."
-                )
-                # KVarN supports CUDA graph for decode (fused Triton kernel).
-                # Prefill CUDA graph is not supported (Python gather + SDPA path).
-                if self.cuda_graph_config.prefill.backend != Backend.DISABLED:
-                    logger.info(
-                        "Disabling prefill CUDA graph for KVarN (eager extend path)."
-                    )
-                    self.cuda_graph_config.prefill.backend = Backend.DISABLED
             elif not is_musa():
                 self.page_size = 1
             else:
