@@ -135,9 +135,12 @@ class KVarNAttnBackend(AttentionBackend):
         # model_config since they're not "hybrid SWA" models).
         full_attn_ids = getattr(model_config, "full_attention_layer_ids", None)
         if full_attn_ids is None:
+            # Hybrid GDN models (Qwen3.5) expose full_attention_layer_ids on
+            # the HF text config, not on model_config.
             hf_config = getattr(model_config, "hf_config", None)
             if hf_config is not None:
-                full_attn_ids = getattr(hf_config, "full_attention_layer_ids", None)
+                text_config = getattr(hf_config, "text_config", hf_config)
+                full_attn_ids = getattr(text_config, "full_attention_layer_ids", None)
         if full_attn_ids is not None and len(full_attn_ids) > 0:
             self.num_layers = len(full_attn_ids)
             self.full_attn_layer_ids = list(full_attn_ids)
