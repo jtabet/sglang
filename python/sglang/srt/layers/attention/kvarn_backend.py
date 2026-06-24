@@ -219,14 +219,16 @@ class KVarNAttnBackend(AttentionBackend):
         max_running = mr.server_args.max_running_requests or 256
         max_prefill_tokens = mr.server_args.max_prefill_tokens or 16384
 
-        # Tail pool size: 2 * max_running (sink + in-progress tail per request)
-        # + prefill_blocks + headroom. Can be overridden via KVARN_POOL_SLOTS.
+        # Tail pool size: each running request can have up to
+        # ceil(chunked_prefill_size / group) in-flight blocks in the tail
+        # pool (not yet flushed), plus 1 sink block + 1 active partial block.
+        # Can be overridden via KVARN_POOL_SLOTS.
         env_slots = int(os.environ.get("KVARN_POOL_SLOTS", "0"))
         if env_slots > 0:
             self.pool_slots = max(env_slots, 8)
         else:
             prefill_blocks = (max_prefill_tokens + self.group - 1) // self.group
-            self.pool_slots = max(2 * max_running + prefill_blocks + 8, 8)
+            self.pool_slots = max(max_running * (prefill_blocks + 2) + 8, 8)
 
         # Compressed cache: one slot per scheduler page
         self.num_blocks = mr.max_total_num_tokens // self.page_size
