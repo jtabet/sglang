@@ -756,40 +756,40 @@ class ModelRunnerKVCacheMixin:
                     )
                 else:
                     extra_args = {}
-                if self.use_mla_backend:
-                    extra_args = {
-                        "kv_lora_rank": self.model_config.kv_lora_rank,
-                        "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
-                    }
-                self.token_to_kv_pool = HybridLinearKVPool(
-                    page_size=self.page_size,
-                    size=self.max_total_num_tokens,
-                    dtype=self.kv_cache_dtype,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_attention_tp_size()
-                    ),
-                    head_dim=self.model_config.head_dim,
-                    # if draft worker, we only need 1 attention layer's kv pool
-                    full_attention_layer_ids=(
-                        [0]
-                        if self.is_draft_worker
-                        else [
-                            i
-                            for i in config.full_attention_layer_ids
-                            if self.start_layer <= i < self.end_layer
-                        ]
-                    ),
-                    enable_kvcache_transpose=False,
-                    device=self.device,
-                    mamba_pool=self.req_to_token_pool.mamba_pool,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                    enable_kv_cache_copy=(
-                        self.server_args.speculative_algorithm is not None
-                    ),
-                    use_mla=self.use_mla_backend,
-                    start_layer=self.start_layer,
-                    **extra_args,
-                )
+                    if self.use_mla_backend:
+                        extra_args = {
+                            "kv_lora_rank": self.model_config.kv_lora_rank,
+                            "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
+                        }
+                    self.token_to_kv_pool = HybridLinearKVPool(
+                        page_size=self.page_size,
+                        size=self.max_total_num_tokens,
+                        dtype=self.kv_cache_dtype,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        # if draft worker, we only need 1 attention layer's kv pool
+                        full_attention_layer_ids=(
+                            [0]
+                            if self.is_draft_worker
+                            else [
+                                i
+                                for i in config.full_attention_layer_ids
+                                if self.start_layer <= i < self.end_layer
+                            ]
+                        ),
+                        enable_kvcache_transpose=False,
+                        device=self.device,
+                        mamba_pool=self.req_to_token_pool.mamba_pool,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        enable_kv_cache_copy=(
+                            self.server_args.speculative_algorithm is not None
+                        ),
+                        use_mla=self.use_mla_backend,
+                        start_layer=self.start_layer,
+                        **extra_args,
+                    )
             else:
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                     self.token_to_kv_pool = MHATokenToKVPoolFP4(
