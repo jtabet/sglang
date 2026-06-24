@@ -130,10 +130,17 @@ class KVarNAttnBackend(AttentionBackend):
         # use the KV cache.  Linear/SSM layers have their own state and must NOT
         # be allocated compressed-cache buffers — otherwise we waste 4x memory
         # on models where 48/64 layers are linear attention.
+        # Check both model_config and the HF config (hybrid GDN models like
+        # Qwen3.5 expose full_attention_layer_ids on the HF config, not on
+        # model_config since they're not "hybrid SWA" models).
         full_attn_ids = getattr(model_config, "full_attention_layer_ids", None)
+        if full_attn_ids is None:
+            hf_config = getattr(model_config, "hf_config", None)
+            if hf_config is not None:
+                full_attn_ids = getattr(hf_config, "full_attention_layer_ids", None)
         if full_attn_ids is not None and len(full_attn_ids) > 0:
             self.num_layers = len(full_attn_ids)
-            self.full_attn_layer_ids = full_attn_ids
+            self.full_attn_layer_ids = list(full_attn_ids)
             # Map absolute layer_id -> compressed-cache index (0..N-1)
             self._layer_id_to_idx = {lid: i for i, lid in enumerate(full_attn_ids)}
         else:
