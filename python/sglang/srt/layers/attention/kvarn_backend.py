@@ -125,7 +125,21 @@ class KVarNAttnBackend(AttentionBackend):
         if self.v_head_dim is None:
             self.v_head_dim = self.head_dim
         self.scale = float(model_config.scaling) if hasattr(model_config, "scaling") else 1.0 / (self.head_dim ** 0.5)
-        self.num_layers = model_config.num_attention_layers
+
+        # For hybrid models (e.g. Qwen3.5 GDN), only the full-attention layers
+        # use the KV cache.  Linear/SSM layers have their own state and must NOT
+        # be allocated compressed-cache buffers — otherwise we waste 4x memory
+        # on models where 48/64 layers are linear attention.
+        full_attn_ids = getattr(model_config, "full_attention_layer_ids", None)
+        if full_attn_ids is not None and len(full_attn_ids) > 0:
+            self.num_layers = len(full_attn_ids)
+            self.full_attn_layer_ids = full_attn_ids
+            # Map absolute layer_id -> compressed-cache index (0..N-1)
+            self._layer_id_to_idx = {lid: i for i, lid in enumerate(full_attn_ids)}
+        else:
+            self.num_layers = model_config.num_attention_layers
+            self.full_attn_layer_ids = None
+            self._layer_id_to_idx = None  # identity mapping
 
         # Hadamard rotation matrix (shared across all layers)
         self._H: Optional[torch.Tensor] = None  # [D, D] fp32, lazy
@@ -169,9 +183,16 @@ class KVarNAttnBackend(AttentionBackend):
         logger.info(
             f"KVarNAttnBackend: group={self.group}, num_kv_heads={self.num_kv_heads}, "
             f"head_dim={self.head_dim}, num_layers={self.num_layers}, "
+            f"full_attn_layer_ids={self.full_attn_layer_ids}, "
             f"pool_slots={self.pool_slots} (allocated later), "
             f"page_size={self.page_size}"
         )
+
+    def _li(self, layer_id: int) -> int:
+        """Map absolute layer_id to compressed-cache index."""
+        if self._layer_id_to_idx is not None:
+            return self._layer_id_to_idx[layer_id]
+        return layer_id
 
     def _get_hadamard(self, device: torch.device) -> torch.Tensor:
         """Get or build the Hadamard rotation matrix."""
@@ -305,12 +326,13 @@ class KVarNAttnBackend(AttentionBackend):
         return self._block_to_slot.get(block_id)
 
     def get_kv_cache_int4(self, layer_id: int) -> torch.Tensor:
-        """Get the int4 compressed cache for a layer."""
-        return self.kv_cache_int4[layer_id]
+        """Get the compressed int4 cache tensor for a layer."""
+        return self.kv_cache_int4[self._li(layer_id)]
 
     def get_tail_pool(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Get the fp16 tail pool K/V for a layer."""
-        return self.tail_K[layer_id], self.tail_V[layer_id]
+        """Get the tail pool K/V tensors for a layer."""
+        li = self._li(layer_id)
+        return self.tail_K[li], self.tail_V[li]
 
     # ── AttentionBackend interface ─────────────────────────────────────────
 
@@ -516,7 +538,7 @@ class KVarNAttnBackend(AttentionBackend):
                     k_rot, v_rot,
                     forward_batch.out_cache_loc.to(torch.int32),
                     self._block_to_slot_t,
-                    self.tail_K[layer_id], self.tail_V[layer_id],
+                    self.tail_K[self._li(layer_id)], self.tail_V[self._li(layer_id)],
                     self.group, self.head_dim, self._block_lookup_size,
                 )
             else:
@@ -535,9 +557,9 @@ class KVarNAttnBackend(AttentionBackend):
 
             out = kvarn_decode_attention(
                 query=q_3d,
-                kv_cache=self.kv_cache_int4[layer_id],
-                tail_K=self.tail_K[layer_id],
-                tail_V=self.tail_V[layer_id],
+                kv_cache=self.kv_cache_int4[self._li(layer_id)],
+                tail_K=self.tail_K[self._li(layer_id)],
+                tail_V=self.tail_V[self._li(layer_id)],
                 hadamard=H,
                 scale=self.scale,
                 cfg=self.cfg,
@@ -618,7 +640,7 @@ class KVarNAttnBackend(AttentionBackend):
                     k_rot, v_rot,
                     forward_batch.out_cache_loc.to(torch.int32),
                     self._block_to_slot_t,
-                    self.tail_K[layer_id], self.tail_V[layer_id],
+                    self.tail_K[self._li(layer_id)], self.tail_V[self._li(layer_id)],
                     self.group, self.head_dim, self._block_lookup_size,
                 )
             else:
@@ -710,12 +732,12 @@ class KVarNAttnBackend(AttentionBackend):
             _kvarn_build_packed_kv_kernel[(B * max_blocks, self.num_kv_heads)](
                 block_table, seq_lens_t, cu_seqlens,
                 self._block_to_slot_t,
-                self.kv_cache_int4[layer_id],
-                self.tail_K[layer_id], self.tail_V[layer_id],
+                self.kv_cache_int4[self._li(layer_id)],
+                self.tail_K[self._li(layer_id)], self.tail_V[self._li(layer_id)],
                 K_packed, V_packed,
                 block_table.stride(0),
-                self.kv_cache_int4[layer_id].stride(0),
-                self.kv_cache_int4[layer_id].stride(1),
+                self.kv_cache_int4[self._li(layer_id)].stride(0),
+                self.kv_cache_int4[self._li(layer_id)].stride(1),
                 self._tail_K_stride0, self._tail_K_stride1, self._tail_K_stride2,
                 K_packed.stride(0), K_packed.stride(1),
                 MAX_BLOCKS_PER_REQ=max_blocks,
@@ -941,9 +963,9 @@ class KVarNAttnBackend(AttentionBackend):
 
         out = kvarn_verify_attention(
             query=q_3d,
-            kv_cache=self.kv_cache_int4[layer_id],
-            tail_K=self.tail_K[layer_id],
-            tail_V=self.tail_V[layer_id],
+            kv_cache=self.kv_cache_int4[self._li(layer_id)],
+            tail_K=self.tail_K[self._li(layer_id)],
+            tail_V=self.tail_V[self._li(layer_id)],
             hadamard=H,
             scale=self.scale,
             cfg=self.cfg,
@@ -1029,10 +1051,10 @@ class KVarNAttnBackend(AttentionBackend):
         # Scatter to tail pool via linear index: slot * group + pos_in_block
         linear_idx = tail_slots * self.group + pos_in_block
 
-        K_flat = self.tail_K[layer_id].view(
+        K_flat = self.tail_K[self._li(layer_id)].view(
             self.pool_slots * self.group, self.num_kv_heads, self.head_dim
         )
-        V_flat = self.tail_V[layer_id].view(
+        V_flat = self.tail_V[self._li(layer_id)].view(
             self.pool_slots * self.group, self.num_kv_heads, self.v_head_dim
         )
         K_flat.index_put_((linear_idx,), k_rot, accumulate=False)
@@ -1137,8 +1159,8 @@ class KVarNAttnBackend(AttentionBackend):
             slot = self._block_to_slot.get(block_id)
             if slot is not None:
                 # Block is in tail pool (in-progress or sink) — already rotated
-                K_parts.append(self.tail_K[layer_id][slot])
-                V_parts.append(self.tail_V[layer_id][slot])
+                K_parts.append(self.tail_K[self._li(layer_id)][slot])
+                V_parts.append(self.tail_V[self._li(layer_id)][slot])
             else:
                 # Block is flushed to int4 cache — dequant returns rotated frame
                 K_blk, V_blk = self._read_block_dequantized(layer_id, block_id)
@@ -1149,8 +1171,8 @@ class KVarNAttnBackend(AttentionBackend):
             block_id = block_ids[n_full]
             slot = self._block_to_slot.get(block_id)
             if slot is not None:
-                K_parts.append(self.tail_K[layer_id][slot, :tail_len])
-                V_parts.append(self.tail_V[layer_id][slot, :tail_len])
+                K_parts.append(self.tail_K[self._li(layer_id)][slot, :tail_len])
+                V_parts.append(self.tail_V[self._li(layer_id)][slot, :tail_len])
             else:
                 K_parts.append(torch.zeros(
                     tail_len, self.num_kv_heads, D,
@@ -1383,4 +1405,4 @@ class KVarNAttnBackend(AttentionBackend):
 
     def get_kv_buffer(self, layer_id: int):
         """Get KV buffer — returns tail pool for this layer."""
-        return self.tail_K[layer_id], self.tail_V[layer_id]
+        return self.tail_K[self._li(layer_id)], self.tail_V[self._li(layer_id)]
