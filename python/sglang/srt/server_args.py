@@ -3306,6 +3306,11 @@ class ServerArgs:
                     f"for KVarN (kv_cache_dtype={self.kv_cache_dtype})."
                 )
                 self.page_size = kvarn_group
+                # Clear cached mamba_cache_chunk_size so it recomputes
+                # with the new page_size (it may have been accessed earlier
+                # by _handle_mamba_backend which runs before us).
+                if hasattr(self, "_mamba_cache_chunk_size"):
+                    del self._mamba_cache_chunk_size
             else:
                 logger.info(
                     f"Setting page_size={self.page_size} for KVarN "
