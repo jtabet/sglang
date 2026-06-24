@@ -1243,6 +1243,13 @@ class KVarNAttnBackend(AttentionBackend):
         extend_seq_lens = getattr(forward_batch, 'extend_seq_lens', None)
         extend_prefix_lens = getattr(forward_batch, 'extend_prefix_lens', None)
         forward_mode = getattr(forward_batch, 'forward_mode', None)
+
+        # Determine if this is an extend/prefill step (all tokens committed)
+        # vs speculative decode (only sl - q_len is committed).
+        is_extend = (forward_mode is not None
+                     and hasattr(forward_mode, 'is_extend')
+                     and forward_mode.is_extend())
+
         if forward_mode is not None and hasattr(forward_mode, 'is_decode') and forward_mode.is_decode():
             query_lens_cpu = [1] * B
         elif extend_seq_lens is not None:
@@ -1282,7 +1289,9 @@ class KVarNAttnBackend(AttentionBackend):
                 continue
             row = block_table_rows[b]
             q_len = query_lens_cpu[b] if b < len(query_lens_cpu) else 1
-            committed = max(sl - q_len, 0)
+            # For extend/prefill, ALL tokens are committed (not speculative).
+            # For speculative decode, only sl - q_len is committed.
+            committed = sl if is_extend else max(sl - q_len, 0)
             for k in range(committed // GROUP,
                            min((sl - 1) // GROUP, len(row) - 1) + 1):
                 bid = row[k] if k < len(row) else -1
@@ -1321,7 +1330,9 @@ class KVarNAttnBackend(AttentionBackend):
             if sl <= 0:
                 continue
             q_len = query_lens_cpu[b] if b < len(query_lens_cpu) else 1
-            committed_len = max(sl - q_len, 0)
+            # For extend/prefill, all tokens are committed. For speculative
+            # decode, only sl - q_len is committed.
+            committed_len = sl if is_extend else max(sl - q_len, 0)
             k = min(committed_len // GROUP - 1, len(row) - 1)
             while 1 <= k:
                 bid = row[k] if k < len(row) else -1
