@@ -84,6 +84,13 @@ class KVarNAttnBackend(AttentionBackend):
         self.server_args = model_runner.server_args
         self.device = model_runner.device
 
+        # Expose pool references for the scheduler / hybrid backend.
+        # The token_to_kv_pool is a NoOpMHATokenToKVPool (large logical size,
+        # tiny physical allocation) — real K/V storage lives in the KVarN
+        # backend's tail pool + int4 compressed cache.
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.req_to_token_pool = model_runner.req_to_token_pool
+
         # Get KVarN config
         if kvarn_config is not None:
             kvarn_cfg = kvarn_config
