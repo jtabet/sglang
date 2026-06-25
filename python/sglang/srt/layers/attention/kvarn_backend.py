@@ -1433,6 +1433,20 @@ class KVarNAttnBackend(AttentionBackend):
 
     # ── HiCache support: gather/scatter for CPU offload ────────────────────
 
+    # ── HiCache support: raw int4 tile copy ────────────────────────────────
+
+    def flush_block_for_hicache(self, block_id: int):
+        """Flush a block from tail pool to int4 cache if not already flushed.
+
+        Called by NoOpMHATokenToKVPool.get_cpu_copy before copying tiles to
+        CPU, ensuring the CPU copy always gets compact int4 tiles (not fp16).
+        Sink blocks are also flushed — HiCache eviction means the request is
+        done, so the sink no longer needs fp16 residency.
+        """
+        if block_id in self._block_to_slot:
+            self._flush_block(block_id)
+            self._sink_block_ids.discard(block_id)
+
     def gather_blocks_fp16(self, layer_idx, block_ids, indices, page_size):
         """Gather K/V for given token indices from KVarN storage (HiCache).
 

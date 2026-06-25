@@ -1711,8 +1711,12 @@ class NoOpMHATokenToKVPool(MHATokenToKVPool):
     # data lives in the KVarN backend's compressed int4 cache + fp16 tail
     # pool, not in this pool's placeholder buffers. A reference to the
     # KVarNAttnBackend is set via `set_kvarn_backend()` after the backend is
-    # created. When set, get_cpu_copy/load_cpu_copy gather/scatter through
-    # the KVarN backend; otherwise they raise (no HiCache without KVarN ref).
+    # created.
+    #
+    # We copy raw int4 tiles (not dequantized fp16) to CPU — this preserves
+    # the compression ratio (~2x smaller than fp8) and avoids the
+    # dequant→requant round-trip on restore. Blocks still in the fp16 tail
+    # pool are flushed to int4 first, so the CPU copy is always compact tiles.
 
     _kvarn_backend = None
 
@@ -1725,22 +1729,24 @@ class NoOpMHATokenToKVPool(MHATokenToKVPool):
                 "NoOpMHATokenToKVPool.get_cpu_copy requires a KVarN backend "
                 "reference for HiCache. Call set_kvarn_backend() first."
             )
-        import torch
         from sglang.srt.hardware_backend.cuda import current_platform
 
         current_platform.synchronize()
-        kv_cache_cpu = []
         backend = self._kvarn_backend
         page_size = self.page_size
-        # Convert token indices to block_ids and positions
         block_ids = (indices // page_size).unique(sorted=True)
-        for layer_idx in range(self.layer_num):
-            # Gather K/V for these blocks from KVarN's compressed cache + tail
-            K_full, V_full = backend.gather_blocks_fp16(layer_idx, block_ids, indices, page_size)
-            kv_cache_cpu.append([
-                K_full.to("cpu", non_blocking=True),
-                V_full.to("cpu", non_blocking=True),
-            ])
+
+        # Flush any blocks still in the tail pool to int4 so the CPU copy
+        # gets compact tiles (not fp16). This also frees tail pool slots.
+        for bid in block_ids.tolist():
+            backend.flush_block_for_hicache(int(bid))
+
+        # Copy raw int4 tiles to CPU: [num_blocks, Hk, tile_bytes] per layer
+        kv_cache_cpu = []
+        for li in range(self.layer_num):
+            int4_cache = backend.kv_cache_int4[li]  # [num_blocks, Hk, tile_bytes] uint8
+            tile_copy = int4_cache[block_ids].to("cpu", non_blocking=True)
+            kv_cache_cpu.append(tile_copy)
         current_platform.synchronize()
         return kv_cache_cpu
 
@@ -1750,18 +1756,18 @@ class NoOpMHATokenToKVPool(MHATokenToKVPool):
                 "NoOpMHATokenToKVPool.load_cpu_copy requires a KVarN backend "
                 "reference for HiCache. Call set_kvarn_backend() first."
             )
-        import torch
         from sglang.srt.hardware_backend.cuda import current_platform
 
         current_platform.synchronize()
         backend = self._kvarn_backend
         page_size = self.page_size
         block_ids = (indices // page_size).unique(sorted=True)
-        for layer_idx in range(self.layer_num):
-            k_cpu, v_cpu = kv_cache_cpu[layer_idx]
-            K_full = k_cpu.to(self.device, non_blocking=True)
-            V_full = v_cpu.to(self.device, non_blocking=True)
-            backend.scatter_blocks_fp16(layer_idx, block_ids, indices, K_full, V_full, page_size)
+
+        # Write raw int4 tiles back to the compressed cache directly.
+        for li in range(self.layer_num):
+            tile_cpu = kv_cache_cpu[li]  # [n_blocks, Hk, tile_bytes] uint8
+            tile_gpu = tile_cpu.to(self.device, non_blocking=True)
+            backend.kv_cache_int4[li][block_ids] = tile_gpu
         current_platform.synchronize()
 
     def get_key_buffer(self, layer_id: int):
