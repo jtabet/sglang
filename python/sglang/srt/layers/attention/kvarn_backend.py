@@ -834,7 +834,10 @@ class KVarNAttnBackend(AttentionBackend):
                 max_seqlen_k=int(seq_lens_full.max().item()) if B > 0 else 1,
                 softmax_scale=self.scale,
                 causal=True,
-            )[0]
+            )
+            # flash_attn_interface returns (output, lse); sgl_kernel returns output
+            if isinstance(fa_out, tuple):
+                fa_out = fa_out[0]
             # fa_out may be [N, Hq, D] or [N, Hq*D] depending on implementation
             if fa_out.dim() == 2:
                 fa_out = fa_out.view(N, self.num_heads, self.head_dim)
