@@ -1706,69 +1706,16 @@ class NoOpMHATokenToKVPool(MHATokenToKVPool):
         )
 
     # ── HiCache support ────────────────────────────────────────────────────
-    # When KVarN is used with hierarchical cache, the NoOp pool must be able
-    # to save/restore KV data for HiCache eviction/loading. The actual KV
-    # data lives in the KVarN backend's compressed int4 cache + fp16 tail
-    # pool, not in this pool's placeholder buffers. A reference to the
-    # KVarNAttnBackend is set via `set_kvarn_backend()` after the backend is
-    # created.
-    #
-    # We copy raw int4 tiles (not dequantized fp16) to CPU — this preserves
-    # the compression ratio (~2x smaller than fp8) and avoids the
-    # dequant→requant round-trip on restore. Blocks still in the fp16 tail
-    # pool are flushed to int4 first, so the CPU copy is always compact tiles.
+    # A reference to the KVarNAttnBackend is set via `set_kvarn_backend()`
+    # after the backend is created. The actual HiCache transfer is handled
+    # by KVarNHostKVCache (in memory_pool_host.py), which reads int4 tiles
+    # directly from the backend's kv_cache_int4 buffers. The NoOp pool just
+    # needs to expose the backend reference so the host pool can find it.
 
     _kvarn_backend = None
 
     def set_kvarn_backend(self, backend):
         self._kvarn_backend = backend
-
-    def get_cpu_copy(self, indices, mamba_indices=None):
-        if self._kvarn_backend is None:
-            raise RuntimeError(
-                "NoOpMHATokenToKVPool.get_cpu_copy requires a KVarN backend "
-                "reference for HiCache. Call set_kvarn_backend() first."
-            )
-        from sglang.srt.hardware_backend.cuda import current_platform
-
-        current_platform.synchronize()
-        backend = self._kvarn_backend
-        page_size = self.page_size
-        block_ids = (indices // page_size).unique(sorted=True)
-
-        # Flush any blocks still in the tail pool to int4 so the CPU copy
-        # gets compact tiles (not fp16). This also frees tail pool slots.
-        for bid in block_ids.tolist():
-            backend.flush_block_for_hicache(int(bid))
-
-        # Copy raw int4 tiles to CPU: [num_blocks, Hk, tile_bytes] per layer
-        kv_cache_cpu = []
-        for li in range(self.layer_num):
-            int4_cache = backend.kv_cache_int4[li]  # [num_blocks, Hk, tile_bytes] uint8
-            tile_copy = int4_cache[block_ids].to("cpu", non_blocking=True)
-            kv_cache_cpu.append(tile_copy)
-        current_platform.synchronize()
-        return kv_cache_cpu
-
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
-        if self._kvarn_backend is None:
-            raise RuntimeError(
-                "NoOpMHATokenToKVPool.load_cpu_copy requires a KVarN backend "
-                "reference for HiCache. Call set_kvarn_backend() first."
-            )
-        from sglang.srt.hardware_backend.cuda import current_platform
-
-        current_platform.synchronize()
-        backend = self._kvarn_backend
-        page_size = self.page_size
-        block_ids = (indices // page_size).unique(sorted=True)
-
-        # Write raw int4 tiles back to the compressed cache directly.
-        for li in range(self.layer_num):
-            tile_cpu = kv_cache_cpu[li]  # [n_blocks, Hk, tile_bytes] uint8
-            tile_gpu = tile_cpu.to(self.device, non_blocking=True)
-            backend.kv_cache_int4[li][block_ids] = tile_gpu
-        current_platform.synchronize()
 
     def get_key_buffer(self, layer_id: int):
         # Return the placeholder. The FA backend reads this before taking the
