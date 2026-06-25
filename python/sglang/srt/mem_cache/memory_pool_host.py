@@ -1012,27 +1012,40 @@ class KVarNHostKVCache(HostKVCache):
     ):
         """Flush blocks to int4 on GPU, then copy tiles to host for all layers.
 
-        host_indices and device_indices are token-level. We convert to
-        block_ids (token_idx // page_size) and copy the corresponding tiles.
+        host_indices and device_indices are token-level and positionally aligned:
+        host_indices[i] receives data from device_indices[i]. Both are page-aligned
+        (HiCache operates in full pages). We derive the block<->host-page mapping
+        from this positional correspondence.
         """
-        from sglang.srt.hardware_backend.cuda import current_platform
+        from sglang.srt.platforms import current_platform
 
         current_platform.synchronize()
         backend = self._kvarn_backend
 
-        # Convert token indices to unique block_ids
-        block_ids = (device_indices // self.page_size).unique(sorted=True)
-        host_block_ids = (host_indices // self.page_size).unique(sorted=True)
+        # Build block_id -> host_page_id mapping from positional correspondence
+        device_blocks = device_indices // self.page_size
+        host_pages = host_indices // self.page_size
+        # Each token in a page maps to the same host page, so any representative works
+        block_to_host_page = {}
+        for db, hp in zip(device_blocks.tolist(), host_pages.tolist()):
+            block_to_host_page[db] = hp
+
+        unique_block_ids = torch.tensor(
+            sorted(block_to_host_page.keys()), dtype=torch.long, device=device_indices.device
+        )
+        host_page_ids = torch.tensor(
+            [block_to_host_page[b] for b in unique_block_ids.tolist()],
+            dtype=torch.long, device=device_indices.device,
+        )
 
         # Flush any blocks still in the tail pool to int4 so we copy compact tiles
-        for bid in block_ids.tolist():
+        for bid in unique_block_ids.tolist():
             backend.flush_block_for_hicache(int(bid))
 
-        # Copy int4 tiles from GPU to host for all layers at once
+        # Copy int4 tiles from GPU to host for all layers
         for li in range(self._num_compressed_layers):
-            gpu_tiles = backend.kv_cache_int4[li][block_ids]  # [n_blocks, Hk, tile_bytes] uint8
-            host_page_offsets = host_block_ids  # page index in host buffer
-            self.kv_buffer[host_page_offsets, li] = gpu_tiles.to(self.device, non_blocking=True)
+            gpu_tiles = backend.kv_cache_int4[li][unique_block_ids]  # [n_blocks, Hk, tile_bytes]
+            self.kv_buffer[host_page_ids, li] = gpu_tiles.to(self.device, non_blocking=True)
 
         current_platform.synchronize()
 
@@ -1041,25 +1054,33 @@ class KVarNHostKVCache(HostKVCache):
     ):
         """Copy int4 tiles from host to GPU int4 cache for one layer.
 
-        layer_id is 0-based into the compressed layer range (0..15).
+        host_indices and device_indices are positionally aligned token-level
+        tensors. layer_id is 0-based into the compressed layer range (0..15).
         """
-        from sglang.srt.hardware_backend.cuda import current_platform
-
         backend = self._kvarn_backend
 
-        # Map layer_id to compressed layer index
         if layer_id < 0 or layer_id >= self._num_compressed_layers:
             return
 
-        block_ids = (device_indices // self.page_size).unique(sorted=True)
-        host_block_ids = (host_indices // self.page_size).unique(sorted=True)
+        # Build block_id -> host_page_id mapping
+        device_blocks = device_indices // self.page_size
+        host_pages = host_indices // self.page_size
+        block_to_host_page = {}
+        for db, hp in zip(device_blocks.tolist(), host_pages.tolist()):
+            block_to_host_page[db] = hp
+
+        unique_block_ids = torch.tensor(
+            sorted(block_to_host_page.keys()), dtype=torch.long, device=device_indices.device
+        )
+        host_page_ids = torch.tensor(
+            [block_to_host_page[b] for b in unique_block_ids.tolist()],
+            dtype=torch.long, device=device_indices.device,
+        )
 
         # Copy tiles from host to GPU
-        host_tiles = self.kv_buffer[host_block_ids, layer_id]  # [n_blocks, Hk, tile_bytes] uint8
+        host_tiles = self.kv_buffer[host_page_ids, layer_id]  # [n_blocks, Hk, tile_bytes] uint8
         gpu_tiles = host_tiles.to(backend.device, non_blocking=True)
-        backend.kv_cache_int4[layer_id][block_ids] = gpu_tiles
-
-        current_platform.synchronize()
+        backend.kv_cache_int4[layer_id][unique_block_ids] = gpu_tiles
 
     def get_data_page(self, index, flat: bool = True):
         """Get a page of tiles from the host buffer (for storage backend)."""
