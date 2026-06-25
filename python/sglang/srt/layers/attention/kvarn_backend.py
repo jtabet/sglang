@@ -815,7 +815,7 @@ class KVarNAttnBackend(AttentionBackend):
             except ImportError:
                 _has_flash = False
 
-        use_flash = os.environ.get("KVARN_USE_FLASH", "0") == "1" and _has_flash and total_tokens > 0
+        use_flash = os.environ.get("KVARN_USE_FLASH", "1") == "1" and _has_flash and total_tokens > 0
 
         if use_flash:
             # flash_attn_varlen: q [N, Hq, D], K [total_k, Hk, D], V [total_k, Hk, vD]
