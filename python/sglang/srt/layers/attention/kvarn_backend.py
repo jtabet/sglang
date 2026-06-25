@@ -1430,3 +1430,95 @@ class KVarNAttnBackend(AttentionBackend):
     def get_kv_buffer(self, layer_id: int):
         """Get KV buffer — returns tail pool for this layer."""
         return self.tail_K[self._li(layer_id)], self.tail_V[self._li(layer_id)]
+
+    # ── HiCache support: gather/scatter for CPU offload ────────────────────
+
+    def gather_blocks_fp16(self, layer_idx, block_ids, indices, page_size):
+        """Gather K/V for given token indices from KVarN storage (HiCache).
+
+        Returns K [len(indices), Hk, D] and V [len(indices), Hk, vD] in fp16,
+        in the ROTATED frame (as stored). Used by NoOpMHATokenToKVPool.
+        get_cpu_copy to save KV to CPU for HiCache eviction.
+
+        layer_idx: 0-based index into the full-attention layer set
+        block_ids: unique block IDs covering the indices
+        indices: token positions (absolute slot indices)
+        page_size: scheduler page size (= group)
+        """
+        group = self.group
+        D = self.head_dim
+        vD = self.v_head_dim
+        device = self.device
+        li = layer_idx  # 0-based, matches _li() output
+
+        K_out = torch.empty(len(indices), self.num_kv_heads, D,
+                            dtype=torch.float16, device=device)
+        V_out = torch.empty(len(indices), self.num_kv_heads, vD,
+                            dtype=torch.float16, device=device)
+
+        # For each block, gather from tail pool or int4 cache
+        for bid in block_ids.tolist():
+            mask = (indices // page_size) == bid
+            block_indices = indices[mask]
+            pos_in_block = (block_indices % page_size).to(torch.long)
+            n = len(block_indices)
+            if n == 0:
+                continue
+
+            slot = self._block_to_slot.get(int(bid))
+            if slot is not None:
+                # Block in tail pool (fp16, rotated)
+                K_blk = self.tail_K[li][slot, pos_in_block]  # [n, Hk, D]
+                V_blk = self.tail_V[li][slot, pos_in_block]  # [n, Hk, vD]
+            else:
+                # Block in int4 cache — dequant full block, then slice
+                K_full, V_full = self._read_block_dequantized(li, int(bid))
+                K_blk = K_full[pos_in_block]  # [n, Hk, D]
+                V_blk = V_full[pos_in_block]  # [n, Hk, vD]
+
+            K_out[mask] = K_blk
+            V_out[mask] = V_blk
+
+        return K_out, V_out
+
+    def scatter_blocks_fp16(self, layer_idx, block_ids, indices, K_data, V_data, page_size):
+        """Scatter K/V back to KVarN storage (HiCache restore from CPU).
+
+        Writes the fp16 K/V (rotated frame) back to KVarN's tail pool,
+        then flushes full blocks to int4. Used by NoOpMHATokenToKVPool.
+        load_cpu_copy to restore KV from CPU for HiCache loading.
+
+        layer_idx: 0-based index into the full-attention layer set
+        block_ids: unique block IDs covering the indices
+        indices: token positions (absolute slot indices)
+        K_data: [len(indices), Hk, D] fp16 (rotated frame)
+        V_data: [len(indices), Hk, vD] fp16 (rotated frame)
+        page_size: scheduler page size (= group)
+        """
+        group = self.group
+        li = layer_idx
+        device = self.device
+
+        for bid in block_ids.tolist():
+            mask = (indices // page_size) == bid
+            block_indices = indices[mask]
+            pos_in_block = (block_indices % page_size).to(torch.long)
+            n = len(block_indices)
+            if n == 0:
+                continue
+
+            bid_int = int(bid)
+            # Ensure a tail pool slot exists for this block
+            slot = self._block_to_slot.get(bid_int)
+            if slot is None:
+                self._alloc_slot(bid_int)
+                slot = self._block_to_slot[bid_int]
+
+            # Write data to tail pool
+            self.tail_K[li][slot, pos_in_block] = K_data[mask]
+            self.tail_V[li][slot, pos_in_block] = V_data[mask]
+
+            # If block is now full, flush to int4
+            self._block_fill[bid_int] = self._block_fill.get(bid_int, 0) + n
+            if self._block_fill.get(bid_int, 0) >= group and bid_int not in self._sink_block_ids:
+                self._flush_block(bid_int)

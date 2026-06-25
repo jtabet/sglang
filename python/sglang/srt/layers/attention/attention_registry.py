@@ -182,7 +182,15 @@ def create_kvarn_backend(runner):
         runner.server_args.kv_cache_dtype,
         head_dim=runner.model_config.head_dim,
     )
-    return KVarNAttnBackend(runner, kvarn_config)
+    backend = KVarNAttnBackend(runner, kvarn_config)
+
+    # Wire up HiCache support: let the NoOp pool call back to the KVarN
+    # backend for get_cpu_copy / load_cpu_copy (KV save/restore on evict).
+    token_to_kv_pool = getattr(runner, "token_to_kv_pool", None)
+    if token_to_kv_pool is not None and hasattr(token_to_kv_pool, "set_kvarn_backend"):
+        token_to_kv_pool.set_kvarn_backend(backend)
+
+    return backend
 
 
 @register_attention_backend("torch_native")
