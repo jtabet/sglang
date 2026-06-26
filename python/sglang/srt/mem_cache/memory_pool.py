@@ -792,17 +792,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def mamba2_layer_cache(self, layer_id: int):
         assert layer_id in self.mamba_map
         if self.layer_transfer_counter is not None:
-            # Map model layer_id to transfer layer index.
-            # The layer_done_counter has transfer_layer_num events, indexed by
-            # model layer index (the load loop iterates 0..transfer_layer_num-1).
-            # Model layers >= transfer_layer_num are not covered by the load loop
-            # (a framework limitation), so we clamp to avoid IndexError.
-            transfer_idx = min(
-                layer_id - self.start_layer,
-                self.layer_transfer_counter.num_layers - 1,
-            )
-            if transfer_idx >= 0:
-                self.layer_transfer_counter.wait_until(transfer_idx)
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.mamba_pool.mamba2_layer_cache(self.mamba_map[layer_id])
 
     def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:

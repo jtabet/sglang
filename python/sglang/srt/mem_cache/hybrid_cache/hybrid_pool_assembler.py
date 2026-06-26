@@ -1065,9 +1065,16 @@ class _KVarNNopaStrategy(StackStrategy):
     ):
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
-        # The NoOp pool IS the full KV pool for HiCache purposes.
-        # full_layer_mapping maps 0-based pool layer index -> 0-based pool layer index
-        full_layer_mapping = {i: i for i in range(kvcache.layer_num)}
+        # Build full_layer_mapping: model layer ID -> 0-based pool layer index.
+        # The KVarN backend stores the actual full attention layer IDs from the
+        # model config (e.g. [3, 7, 11, 15, 19, ...] for Qwen3.5). We map each
+        # to its 0-based compressed layer index (0, 1, 2, ...).
+        kvarn_backend = getattr(kvcache, "_kvarn_backend", None)
+        assert kvarn_backend is not None, (
+            "KVarNNopaStrategy requires the NoOp pool to have a KVarN backend"
+        )
+        full_attn_ids = kvarn_backend.full_attn_layer_ids
+        full_layer_mapping = {model_id: pool_id for pool_id, model_id in enumerate(full_attn_ids)}
         mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
         host_pool_group, cache_controller = build_hybrid_mamba_stack(
             params=params,
@@ -1099,7 +1106,7 @@ class _KVarNNopaStrategy(StackStrategy):
                 ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
             },
             register_req_to_token_counter=True,
-            transfer_layer_num=len(full_layer_mapping | mamba_layer_mapping),
+            transfer_layer_num=max(max(full_layer_mapping), max(mamba_layer_mapping)) + 1,
             pools_desc="KVarN KV + MAMBA",
         )
 
