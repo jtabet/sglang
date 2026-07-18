@@ -215,6 +215,11 @@ class KVarNAttnBackend(AttentionBackend):
         if self.pool_slots > 0:
             return  # Already initialized
 
+        # Cache SM count for split-K auto-enable heuristic in the Triton kernel.
+        if not hasattr(self, "_sm_count") or self._sm_count == 0:
+            self._sm_count = torch.cuda.get_device_properties(
+                self.device).multi_processor_count
+
         mr = self.model_runner
         max_running = mr.server_args.max_running_requests or 256
         max_prefill_tokens = mr.server_args.max_prefill_tokens or 16384
@@ -281,11 +286,38 @@ class KVarNAttnBackend(AttentionBackend):
         self._H_fp16 = self._get_hadamard(device).to(torch.float16).contiguous()
 
         # Pre-allocated Q rotation buffer (CUDA graph capture-safe)
+        # The decode driver reshapes Q from [B, Hq, D] to [B*Hq, D] and does
+        # torch.mm(q_flat, H16) → [B*Hq, D]. So the buffer must be sized
+        # [max_decode_rows, D] where max_decode_rows = max_running * Hq
+        # (matching vLLM's _shared_q_rot_fp16_buf sizing).
         max_decode_tokens = max(max_running * 1, 1)
         max_prefill = max_prefill_tokens or 16384
+        # Decode: B*Hq rows of D; Prefill: max_prefill rows of D.
+        # Take the max of both to cover any code path.
+        max_decode_rows = max(max_decode_tokens * self.num_heads, max_prefill)
         self._q_rot_fp16_buf = torch.empty(
-            max(max_decode_tokens, max_prefill), self.num_heads * self.head_dim,
+            max_decode_rows, self.head_dim,
             dtype=torch.float16, device=device,
+        )
+
+        # Pre-allocated fused-decode output + split-K mid buffers
+        # (CUDA graph capture-safe; reused across layers + steps).
+        # Sized for the decode regime: max_running * Hq rows (flat N = B*Hq).
+        # Layout matches vLLM: mid_o is [N, max_splits, D], mid_lse is [N, max_splits].
+        _max_n = max(max_running * self.num_heads, 1)
+        from sglang.srt.layers.attention.kvarn_ops.triton_decode import (
+            KVARN_MAX_KV_SPLITS,
+        )
+        self._fused_out_buf = torch.empty(
+            _max_n, self.head_dim, dtype=torch.float16, device=device,
+        )
+        self._mid_o_buf = torch.empty(
+            _max_n, KVARN_MAX_KV_SPLITS, self.head_dim,
+            dtype=torch.float32, device=device,
+        )
+        self._mid_lse_buf = torch.empty(
+            _max_n, KVARN_MAX_KV_SPLITS,
+            dtype=torch.float32, device=device,
         )
 
         logger.info(
@@ -358,6 +390,19 @@ class KVarNAttnBackend(AttentionBackend):
         out_cache_loc = getattr(forward_batch, 'out_cache_loc', None)
         if out_cache_loc is not None:
             self._ensure_slots_for_tokens(out_cache_loc)
+
+        # Debug: verify slot allocation
+        if os.environ.get("KVARN_DEBUG_INIT", "0") == "1":
+            B = forward_batch.batch_size
+            sl = forward_batch.seq_lens[:B].cpu().tolist() if B > 0 else []
+            loc = out_cache_loc.cpu().tolist() if out_cache_loc is not None else []
+            block_ids = set(l // self.page_size for l in loc if l >= 0)
+            slot_map = {bid: self._block_to_slot.get(bid) for bid in list(block_ids)[:8]}
+            logger.info(
+                f"KVARN_DEBUG_INIT: B={B} seq_lens={sl[:4]} "
+                f"block_ids={list(block_ids)[:8]} slot_map={slot_map} "
+                f"free_slots={len(self._free_slots)}/{self.pool_slots}"
+            )
 
     def init_forward_metadata_out_graph(
         self, forward_batch: "ForwardBatch", in_capture: bool = False,
@@ -554,6 +599,20 @@ class KVarNAttnBackend(AttentionBackend):
             else:
                 self._store_to_tail_pool(layer_id, k_3d, v_3d, forward_batch.out_cache_loc)
 
+            # Debug: verify K/V was actually stored to the tail pool
+            if os.environ.get("KVARN_DEBUG_STORE", "0") == "1" and layer_id == 0:
+                loc = forward_batch.out_cache_loc
+                block_ids = (loc // self.page_size).cpu().tolist()
+                for bid in set(block_ids):
+                    slot = self._block_to_slot.get(bid)
+                    if slot is not None:
+                        k_norm = self.tail_K[self._li(layer_id)][slot].norm().item()
+                        v_norm = self.tail_V[self._li(layer_id)][slot].norm().item()
+                        logger.info(
+                            f"KVARN_DEBUG_STORE: layer={layer_id} block={bid} "
+                            f"slot={slot} k_norm={k_norm:.4f} v_norm={v_norm:.4f}"
+                        )
+
         use_fused_decode = os.environ.get("KVARN_FUSED_DECODE", "1") == "1"
         if use_fused_decode:
             # Fused Triton decode kernel
@@ -564,6 +623,24 @@ class KVarNAttnBackend(AttentionBackend):
                 cu_seqlens = self._cg_cu_seqlens[:N+1]
             else:
                 block_table, seq_lens_t, cu_seqlens = self._build_block_table(forward_batch)
+
+            # Debug: verify block table and seq_lens are valid
+            if os.environ.get("KVARN_DEBUG_DECODE", "0") == "1" and layer_id == 0:
+                sl_list = seq_lens_t[:N].cpu().tolist()
+                bt_list = block_table[:N, :min(4, block_table.shape[1])].cpu().tolist()
+                b2s_list = self._block_to_slot_t.cpu().tolist()
+                slot_status = []
+                for row in bt_list:
+                    for bid in row:
+                        if bid >= 0:
+                            slot_status.append(
+                                f"bid={bid}->slot={b2s_list[bid] if bid < len(b2s_list) else -1}"
+                            )
+                logger.info(
+                    f"KVARN_DEBUG_DECODE: layer={layer_id} B={N} "
+                    f"seq_lens={sl_list[:4]} block_table={bt_list} "
+                    f"slots={slot_status[:8]}"
+                )
 
             out = kvarn_decode_attention(
                 query=q_3d,
@@ -579,6 +656,16 @@ class KVarNAttnBackend(AttentionBackend):
                 cu_seqlens=cu_seqlens,
                 sliding_window=getattr(layer, 'sliding_window_size', -1) if getattr(layer, 'sliding_window_size', -1) > 0 else 0,
             )
+
+            # Debug: check output is non-zero
+            if os.environ.get("KVARN_DEBUG_DECODE", "0") == "1" and layer_id == 0:
+                out_norm = out.norm().item()
+                out_max = out.abs().max().item()
+                logger.info(
+                    f"KVARN_DEBUG_DECODE: layer={layer_id} "
+                    f"out_norm={out_norm:.4f} out_max={out_max:.4f}"
+                )
+
             return out.view(N, self.num_heads * self.head_dim)
         else:
             # Python gather + SDPA fallback
@@ -655,6 +742,20 @@ class KVarNAttnBackend(AttentionBackend):
                 )
             else:
                 self._store_to_tail_pool(layer_id, k_3d, v_3d, forward_batch.out_cache_loc)
+
+            # Debug: verify K/V was actually stored to the tail pool
+            if os.environ.get("KVARN_DEBUG_STORE", "0") == "1" and layer_id == 0:
+                loc = forward_batch.out_cache_loc
+                block_ids = (loc // self.page_size).cpu().tolist()
+                for bid in set(block_ids[:8]):
+                    slot = self._block_to_slot.get(bid)
+                    if slot is not None:
+                        k_norm = self.tail_K[self._li(layer_id)][slot].norm().item()
+                        v_norm = self.tail_V[self._li(layer_id)][slot].norm().item()
+                        logger.info(
+                            f"KVARN_DEBUG_STORE_EXT: layer={layer_id} block={bid} "
+                            f"slot={slot} k_norm={k_norm:.4f} v_norm={v_norm:.4f}"
+                        )
 
         # Check if this is a target_verify (speculative decode) batch
         forward_mode = getattr(forward_batch, 'forward_mode', None)
@@ -1242,49 +1343,43 @@ class KVarNAttnBackend(AttentionBackend):
         req_pool_indices = forward_batch.req_pool_indices
         req_to_token = self.model_runner.req_to_token_pool.req_to_token
 
-        # Get per-request query lengths
+        # --- Query lengths (CPU) ---
         extend_seq_lens = getattr(forward_batch, 'extend_seq_lens', None)
-        extend_prefix_lens = getattr(forward_batch, 'extend_prefix_lens', None)
         forward_mode = getattr(forward_batch, 'forward_mode', None)
-
-        # Determine if this is an extend/prefill step (all tokens committed)
-        # vs speculative decode (only sl - q_len is committed).
-        is_extend = (forward_mode is not None
-                     and hasattr(forward_mode, 'is_extend')
-                     and forward_mode.is_extend())
 
         if forward_mode is not None and hasattr(forward_mode, 'is_decode') and forward_mode.is_decode():
             query_lens_cpu = [1] * B
         elif extend_seq_lens is not None:
-            ext_list = extend_seq_lens.cpu().tolist()
-            query_lens_cpu = ext_list
+            query_lens_cpu = extend_seq_lens.cpu().tolist()
         else:
-            # During CUDA graph replay, forward_mode may be a SimpleNamespace
-            # without is_decode(). Treat as decode (query_len=1).
-            if forward_mode is None:
-                query_lens_cpu = [1] * B
-            else:
-                query_lens_cpu = seq_lens.cpu().tolist()
+            # CUDA graph replay or unknown mode → treat as decode (q_len=1).
+            query_lens_cpu = [1] * B
 
         seq_lens_cpu = seq_lens.cpu().tolist()
 
-        # Build block_table for this batch
-        block_table_rows = []
-        for i in range(B):
-            req_idx = int(req_pool_indices[i].item())
-            sl = seq_lens_cpu[i]
-            n_blocks = (sl + self.page_size - 1) // self.page_size
-            row = []
-            for b in range(n_blocks):
-                token_pos = b * self.page_size
-                if token_pos < req_to_token.shape[1]:
-                    slot = int(req_to_token[req_idx, token_pos].item())
-                    row.append(slot // self.page_size if slot >= 0 else -1)
-                else:
-                    row.append(-1)
-            block_table_rows.append(row)
+        # --- Vectorized block_table construction (one GPU→CPU transfer) ---
+        # Replaces the per-block .item() loop that caused O(context) CUDA
+        # syncs per decode step (the throughput regression at long context).
+        # Matches vLLM's block_table_np (CPU array from scheduler metadata).
+        if B > 0:
+            max_seq = max(seq_lens_cpu) if seq_lens_cpu else 0
+            max_blocks = max((max_seq + self.page_size - 1) // self.page_size, 1)
+            col_offsets = torch.arange(max_blocks, device=self.device) * self.page_size
+            req_indices = req_pool_indices.long()
+            token_positions = col_offsets.unsqueeze(0).expand(B, max_blocks)
+            max_token_pos = req_to_token.shape[1] - 1
+            token_positions = token_positions.clamp(max=max_token_pos)
+            slots = req_to_token[req_indices.unsqueeze(1), token_positions]
+            block_table_rows = (slots // self.page_size).cpu().tolist()
+        else:
+            block_table_rows = []
 
-        # Identify blocks needed this step (sinks + blocks receiving writes)
+        # --- blocks_needed: blocks written this step ---
+        # committed = tokens already in pool before this step = sl - q_len.
+        # For the first chunk of a fresh prefill: committed=0 → range starts
+        # at k=0 → ALL blocks (including block 0) are covered, block 0 gets
+        # marked as a sink and _block_fill set correctly.  For decode:
+        # committed = sl-1 → only the current boundary block.
         blocks_needed: set[int] = set()
         for b in range(B):
             sl = seq_lens_cpu[b]
@@ -1292,9 +1387,7 @@ class KVarNAttnBackend(AttentionBackend):
                 continue
             row = block_table_rows[b]
             q_len = query_lens_cpu[b] if b < len(query_lens_cpu) else 1
-            # For extend/prefill, ALL tokens are committed (not speculative).
-            # For speculative decode, only sl - q_len is committed.
-            committed = sl if is_extend else max(sl - q_len, 0)
+            committed = max(sl - q_len, 0)
             for k in range(committed // GROUP,
                            min((sl - 1) // GROUP, len(row) - 1) + 1):
                 bid = row[k] if k < len(row) else -1
@@ -1302,7 +1395,27 @@ class KVarNAttnBackend(AttentionBackend):
                     blocks_needed.add(bid)
                     self._block_fill[bid] = min(sl, (k + 1) * GROUP) - k * GROUP
 
-        # Mark sinks (block_table[r][0] for requests that write block 0 this step)
+        # Safety superset: every block receiving a write this step is needed
+        # (matches vLLM slot_mapping_cpu superset, kvarn_attn.py:492-494).
+        # Prevents the reclaim loop from discarding a block that was just
+        # written to but not covered by the committed-boundary range above.
+        out_cache_loc = getattr(forward_batch, 'out_cache_loc', None)
+        if out_cache_loc is not None:
+            for s in out_cache_loc.cpu().tolist():
+                if s >= 0:
+                    blocks_needed.add(s // self.page_size)
+
+        # --- Sink marking (block_table[r][0]) ---
+        # A sink is an fp16-resident block kept for the request's lifetime.
+        # LIVE sinks (already marked) MUST be re-added to blocks_needed every
+        # step so the reclaim loop never touches them — without this lifeline,
+        # a sink whose _block_fill=0 (block 0 of any >128-token prompt, never
+        # updated by the committed-boundary range) would be discarded on the
+        # first decode step, freeing its tail slot without writing int4.
+        # The decode kernel would then read block 0 from the zero-initialized
+        # int4 cache → tokens 0-127 (system prompt + tool schemas) vanish →
+        # the model cannot see its tools.  (vLLM issue #10, fixed upstream
+        # by the same lifeline; the port had dropped it.)
         row0_set: set[int] = set()
         for b in range(B):
             if b >= len(block_table_rows) or not block_table_rows[b]:
@@ -1311,18 +1424,18 @@ class KVarNAttnBackend(AttentionBackend):
             if s0 < 0:
                 continue
             row0_set.add(s0)
-            if s0 not in self._sink_block_ids and s0 in blocks_needed:
+            if s0 in self._sink_block_ids:
+                blocks_needed.add(s0)          # lifeline: keep slot for request's lifetime
+            elif s0 in blocks_needed:          # written this step → fresh sink
                 self._sink_block_ids.add(s0)
-                if self._block_to_slot_t is not None and s0 < self._block_lookup_size:
-                    pass  # sinks tracked in CPU set only
 
-        # Un-retire any retired block named this step
+        # Un-retire any retired sink named this step
         for bid in [b for b in self._retired_sinks if b in blocks_needed]:
             self._retired_sinks.pop(bid, None)
             if bid not in row0_set and bid in self._sink_block_ids:
                 self._sink_block_ids.discard(bid)
 
-        # Walk backward from committed boundary to find full-but-unflushed blocks
+        # --- Flush walk: full-but-unflushed blocks below committed boundary ---
         flush_block_ids: list[int] = []
         flush_seen: set[int] = set()
         for b in range(B):
@@ -1333,9 +1446,7 @@ class KVarNAttnBackend(AttentionBackend):
             if sl <= 0:
                 continue
             q_len = query_lens_cpu[b] if b < len(query_lens_cpu) else 1
-            # For extend/prefill, all tokens are committed. For speculative
-            # decode, only sl - q_len is committed.
-            committed_len = sl if is_extend else max(sl - q_len, 0)
+            committed_len = max(sl - q_len, 0)
             k = min(committed_len // GROUP - 1, len(row) - 1)
             while 1 <= k:
                 bid = row[k] if k < len(row) else -1
@@ -1346,7 +1457,7 @@ class KVarNAttnBackend(AttentionBackend):
                 flush_block_ids.append(bid)
                 k -= 1
 
-        # Reclaim slot-holding blocks from finished requests
+        # --- Reclaim: slot-holding blocks of finished/preempted requests ---
         discard_ids: list[int] = []
         for bid in [b for b in self._block_to_slot
                     if b not in blocks_needed and b not in flush_seen]:
