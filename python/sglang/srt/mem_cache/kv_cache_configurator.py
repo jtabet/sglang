@@ -1507,6 +1507,23 @@ class KVCacheConfigurator:
             )
         rest_memory = available_gpu_memory - slack_gb
         if self.mambaish_config is not None:
+            # When KVarN is enabled, the KV pool is a NoOp placeholder and the
+            # real K/V storage (tail pool + int4 compressed cache) is allocated
+            # later by KVarNAttnBackend. The default mamba auto-sizing would
+            # give mamba ~47% of rest_memory (via mamba_full_memory_ratio),
+            # which over-allocates mamba and starves KVarN's compressed cache.
+            #
+            # Mamba only needs max_running * ratio slots (ratio = 3 base +
+            # 2 for overlap ping-pong). Cap it there so the rest goes to KVarN.
+            if (
+                self.server_args.kv_cache_dtype.startswith("kvarn_")
+                and self.server_args.max_mamba_cache_size is None
+                and self.server_args.max_running_requests is not None
+            ):
+                ratio = self._calculate_mamba_ratio()
+                self.server_args.max_mamba_cache_size = (
+                    self.server_args.max_running_requests * ratio
+                )
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 
         # Loaded weights (target + draft) can exceed the static budget

@@ -365,7 +365,7 @@ class KVarNAttnBackend(AttentionBackend):
         logger.info(
             f"KVarN pools allocated: tail_pool_slots={self.pool_slots}, "
             f"compressed_blocks={self.num_blocks}, "
-            f"tail_pool_bytes={self.pool_slots * self.group * self.num_kv_heads * self.head_dim * 2 * self.num_layers / 1e9:.2f} GB, "
+            f"tail_pool_bytes={self.pool_slots * self.group * self.num_kv_heads * self.head_dim * 4 * self.num_layers / 1e9:.2f} GB, "
             f"compressed_cache_bytes={self.num_blocks * tile_bytes * self.num_kv_heads * self.num_layers / 1e9:.2f} GB"
         )
 
