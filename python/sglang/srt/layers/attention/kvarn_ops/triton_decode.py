@@ -615,15 +615,29 @@ def kvarn_decode_attention(
     )
 
     if use_fused:
-        use_split = os.environ.get("KVARN_SPLIT_K", "0") == "1"
+        # Split-K (two-stage flash-decoding): only a win in the LOW-batch /
+        # long-context regime (few (B,Hk) programs → the KV-split dim adds the
+        # missing parallelism). At BURST (high batch) the single-stage (B,Hk)
+        # grid already saturates the GPU.
+        #
+        # Auto-enable when context is long (>= 16 blocks) AND the single-stage
+        # grid (B*Hk) doesn't already fill the SMs — matches vLLM reference
+        # (triton_kvarn_decode.py:911-923). Sliding-window layers read only
+        # ~window/GROUP blocks so never split them.
+        _sk_env = os.environ.get("KVARN_SPLIT_K")
+        _sw = int(getattr(impl, "sliding_window", 0) or 0) or sliding_window
+        if _sk_env is not None:
+            use_split = _sk_env == "1"
+        else:
+            sm_count = getattr(impl, "_sm_count", 0) or torch.cuda.get_device_properties(
+                device).multi_processor_count
+            use_split = (_sw <= 0) and (max_blocks_per_req >= 16) and (B * Hk <= sm_count)
         if use_split:
-            # Split-K (two-stage flash-decoding): only a win in the LOW-batch /
-            # long-context regime (few programs → the KV-split dim adds the
-            # missing parallelism). At BURST (high batch) the single-stage
-            # (B,Hk) grid already saturates the GPU.
             kv_splits = adaptive_num_kv_splits(max_blocks_per_req)
-            mid_O = torch.empty(B, Hq, kv_splits, D, dtype=torch.float32, device=device)
-            mid_lse = torch.empty(B, Hq, kv_splits, dtype=torch.float32, device=device)
+            # Use pre-allocated buffers (CUDA graph capture-safe)
+            mid_O = impl._mid_o_buf[:N, :kv_splits, :]
+            mid_lse = impl._mid_lse_buf[:N, :kv_splits]
+            fused_out = impl._fused_out_buf[:N]
             _bn = int(os.environ.get("KVARN_BLOCK_N", "16"))
             _nw = int(os.environ.get("KVARN_NUM_WARPS", "4"))
             _ns = int(os.environ.get("KVARN_NUM_STAGES", "2"))
@@ -635,12 +649,12 @@ def kvarn_decode_attention(
                 Hq * D, D, block_table.stride(0),
                 kv_cache.stride(0), kv_cache.stride(1),
                 impl._tail_K_stride0, impl._tail_K_stride1, impl._tail_K_stride2,
-                Hq * D, D,
-                D * kv_splits, D, kv_splits,
+                mid_O.stride(0), mid_O.stride(1), mid_lse.stride(0),
                 MAX_BLOCKS_PER_REQ=max_blocks_per_req,
                 D=D, GROUP=group, BLOCK_N=_bn,
                 Q_PER_KV=_qpk, Q_PER_KV_PAD=_qpk_pad,
                 NUM_KV_SPLITS=kv_splits,
+                HQ=Hq,
                 SLIDING_WINDOW=sliding_window,
                 K_BITS=cfg.key_bits, V_BITS=cfg.value_bits,
                 NUM_BLOCKS_LOOKUP=impl._block_lookup_size,
@@ -651,15 +665,10 @@ def kvarn_decode_attention(
                 VQ_INDIRECT=False,
                 num_warps=_nw, num_stages=_ns,
             )
-            fused_out = torch.empty(B, Hq, D, dtype=torch.float16, device=device)
-            _kvarn_fused_decode_stage2[(B, Hk)](
+            _kvarn_fused_decode_stage2[(N,)](
                 mid_O, mid_lse, fused_out,
-                Hq * D, D,
-                D * kv_splits, D, kv_splits,
-                Hq * D, D,
-                D=D, NUM_KV_SPLITS=kv_splits,
-                Q_PER_KV=_qpk, Q_PER_KV_PAD=_qpk_pad,
-                num_warps=1,
+                mid_O.stride(0), mid_O.stride(1), mid_lse.stride(0), fused_out.stride(0),
+                D=D, NUM_KV_SPLITS=kv_splits, num_warps=2,
             )
             output_rot = fused_out
         else:
@@ -739,7 +748,7 @@ def kvarn_scatter_store(
         k_rot.stride(0), k_rot.stride(1),
         pool_K.stride(0), pool_K.stride(1), pool_K.stride(2),
         GROUP=group, D=D, NUM_BLOCKS_LOOKUP=num_blocks_lookup,
-        num_warps=4,
+        num_warps=2, num_stages=2,
     )
 
 
