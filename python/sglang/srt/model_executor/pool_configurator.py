@@ -275,7 +275,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 )
                 # FP4 prefill uses one shared FP8 dequant workspace across layers.
                 cell_size += n * k * 2 * kv_size
-            elif mr.server_args.kv_cache_dtype.startswith("kvarn_"):
+            elif kvc.server_args.kv_cache_dtype.startswith("kvarn_"):
                 # KVarN dual-pool: the NoOp pool has a large logical size for
                 # the scheduler, but actual GPU memory = tail pool (small fp16)
                 # + int4 compressed cache. The cell_size should reflect the
@@ -285,7 +285,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 )
 
                 kvarn_cfg = KVarNConfig.from_cache_dtype(
-                    mr.server_args.kv_cache_dtype, head_dim=model_config.head_dim
+                    kvc.server_args.kv_cache_dtype, head_dim=model_config.head_dim
                 )
                 n = model_config.get_num_kv_heads(tp_size)
                 G = kvarn_cfg.group

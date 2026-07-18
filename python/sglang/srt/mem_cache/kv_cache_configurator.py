@@ -1308,7 +1308,6 @@ class KVCacheConfigurator:
             self.server_args.kv_cache_dtype,
             head_dim=self.model_config.head_dim,
         )
-        self.kvarn_config = kvarn_config
 
         if self.mambaish_config is not None:
             # Hybrid GDN model: NoOp pool covers only the full-attention layers.

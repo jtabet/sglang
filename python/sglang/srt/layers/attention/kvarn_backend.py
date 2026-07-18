@@ -118,8 +118,8 @@ class KVarNAttnBackend(AttentionBackend):
 
         # Model config
         model_config = model_runner.model_config
-        self.num_heads = model_config.get_total_num_attention_heads() // model_runner.tp_size
-        self.num_kv_heads = model_config.get_num_kv_heads(model_runner.tp_size)
+        self.num_heads = model_config.get_total_num_attention_heads() // model_runner.ps.tp_size
+        self.num_kv_heads = model_config.get_num_kv_heads(model_runner.ps.tp_size)
         self.head_dim = model_config.head_dim
         self.v_head_dim = model_config.v_head_dim
         if self.v_head_dim is None:
