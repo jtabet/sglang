@@ -80,8 +80,7 @@ def build_draft_tp_worker(
     # fa4-draft KV dtype override in configure_kv_cache_dtype), so nulling it
     # would silently skip those paths. context_length keeps the draft aligned
     # with the target.
-    draft_server_args.override(
-        "draft_worker.build",
+    draft_overrides = dict(
         skip_tokenizer_init=True,
         speculative_draft_attention_backend=draft_backend,
         prefill_attention_backend=None,
@@ -89,6 +88,13 @@ def build_draft_tp_worker(
         attention_backend=draft_backend,
         context_length=target_model_config.context_len,
     )
+    # The draft worker runs a standard attention backend (flashinfer/triton) and
+    # needs a regular fp16/bf16 KV pool — never KVarN's NoOp pool. Reset the KV
+    # cache dtype inherited from a KVarN target so the draft's
+    # KVCacheConfigurator builds a real KV pool.
+    if server_args.kv_cache_dtype.startswith("kvarn_"):
+        draft_overrides["kv_cache_dtype"] = "auto"
+    draft_server_args.override("draft_worker.build", **draft_overrides)
 
     saved_server_args = get_server_args()
     try:
