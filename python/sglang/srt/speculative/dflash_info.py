@@ -116,6 +116,30 @@ class DFlashVerifyInput(SpecInput):
             batch.seq_lens = saved_seq_lens
             batch.seq_lens_sum = saved_seq_lens_sum
 
+        # init_new treats TARGET_VERIFY like decode for position purposes
+        # (forward_batch_info.py: line 833 `is_target_verify()` branch) and
+        # therefore never copies batch.extend_lens -> ret.extend_seq_lens.
+        # Backends that key on extend_seq_lens (KVarN's fused verify path)
+        # see None. Populate the verify geometry explicitly: every request
+        # contributes `draft_token_num` new query tokens on top of its
+        # committed prefix, and the post-verify seq_len is committed + block.
+        device = verify_forward_batch.seq_lens.device
+        verify_extend_lens = torch.full(
+            (bs,), draft_token_num, dtype=torch.int32, device=device
+        )
+        # `verify_forward_batch.seq_lens` was built from the (bumped)
+        # batch.seq_lens, so it already holds committed + draft_token_num.
+        verify_prefix_lens = (
+            verify_forward_batch.seq_lens.to(torch.int32) - verify_extend_lens
+        )
+        verify_forward_batch.extend_seq_lens = verify_extend_lens
+        verify_forward_batch.extend_prefix_lens = verify_prefix_lens
+        if not gpu_only:
+            verify_forward_batch.extend_seq_lens_cpu = [draft_token_num] * bs
+            verify_forward_batch.extend_prefix_lens_cpu = (
+                verify_prefix_lens.cpu().tolist()
+            )
+
         can_run_cuda_graph = bool(
             target_worker.model_runner.decode_cuda_graph_runner
             and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
