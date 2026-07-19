@@ -21,6 +21,11 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_use_aux_hidden_state: bool = False
     dflash_draft_num_layers: Optional[int] = None
     dflash_target_layer_ids: Any = None
+    # Actual bytes/token of the DFLASH draft KV pool, used by the target's
+    # pool configurator to reserve draft-pool memory accurately. None falls
+    # back to the layer-ratio heuristic (fine when draft and target share
+    # per-layer KV cost, e.g. EAGLE-style drafters).
+    dflash_draft_kv_cell_size_per_token: Optional[int] = None
 
 
 def resolve_spec_aux_hidden_state_config(
@@ -163,3 +168,45 @@ def _resolve_dflash_aux_hidden_state(
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
         config.dflash_target_layer_ids = target_layer_ids
+        config.dflash_draft_kv_cell_size_per_token = (
+            _try_compute_dflash_draft_kv_cell_size(
+                server_args=server_args,
+                draft_model_config=draft_model_config,
+                draft_num_layers=int(draft_num_layers),
+            )
+        )
+
+
+def _try_compute_dflash_draft_kv_cell_size(
+    *,
+    server_args: ServerArgs,
+    draft_model_config: ModelConfig,
+    draft_num_layers: int,
+) -> Optional[int]:
+    """Best-effort draft KV pool bytes/token for target-side memory reservation.
+
+    Returns None (caller falls back to the layer-ratio heuristic) when the
+    value cannot be computed, e.g. the parallel state is not initialized.
+    """
+    try:
+        from sglang.srt.runtime_context import get_parallel
+        from sglang.srt.speculative.dflash_utils import (
+            compute_dflash_draft_kv_cell_size_per_token,
+        )
+
+        return compute_dflash_draft_kv_cell_size_per_token(
+            draft_model_config=draft_model_config,
+            draft_num_layers=draft_num_layers,
+            attn_tp_size=get_parallel().attn_tp_size,
+            server_args_kv_cache_dtype=server_args.kv_cache_dtype,
+            speculative_draft_attention_backend=(
+                server_args.speculative_draft_attention_backend
+            ),
+        )
+    except Exception:
+        logger.warning(
+            "Could not compute DFLASH draft KV cell size; falling back to "
+            "the layer-ratio draft-pool memory reservation.",
+            exc_info=True,
+        )
+        return None

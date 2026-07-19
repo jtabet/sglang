@@ -102,6 +102,7 @@ def _make_model_runner(
     mr.kv_cache_dtype = "fake_bf16"
 
     sa = SimpleNamespace()
+    sa.kv_cache_dtype = "fake_bf16"
     sa.swa_full_tokens_ratio = swa_full_tokens_ratio
     sa.page_size = page_size
     sa.disable_radix_cache = disable_radix_cache
@@ -134,7 +135,9 @@ def _make_model_runner(
     mr.ps = ParallelState.trivial()
     mr.pp_group = SimpleNamespace(rank_in_group=0)
     mr.spec_aux_config = SimpleNamespace(
-        eagle_draft_num_layers=None, dflash_draft_num_layers=None
+        eagle_draft_num_layers=None,
+        dflash_draft_num_layers=None,
+        dflash_draft_kv_cell_size_per_token=None,
     )
 
     return mr
@@ -542,6 +545,108 @@ class TestEagleConfigurator(unittest.TestCase):
         total_layers = num_layers + eagle_draft_num_layers
         used = config.max_total_num_tokens * full_pt * total_layers
         self.assertLessEqual(used, available)
+
+
+class TestDflashConfigurator(unittest.TestCase):
+    """DFLASH: draft KV pool spans the full shared token-index space, so the
+    target's token budget must cover target pool + draft pool together."""
+
+    def _run(self, mr, available):
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, 1)
+        return config
+
+    def _make_dflash_runner(self, num_layers, draft_num_layers):
+        mr = _make_model_runner(num_layers=num_layers)
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.spec_aux_config.dflash_draft_num_layers = draft_num_layers
+        return mr
+
+    def test_explicit_draft_cell_size_respects_budget(self):
+        """Dense bf16 draft behind a cheap (e.g. compressed) target: reserving
+        only the layer-ratio share of the target cell under-reserves the draft
+        pool and OOMs. The explicit per-token sum must hold target+draft within
+        budget."""
+        available = 10_000_000
+        num_layers = 32
+        draft_num_layers = 6
+
+        mr = self._make_dflash_runner(num_layers, draft_num_layers)
+        # Draft pool costs 2x the target pool per token (e.g. dense bf16 draft
+        # behind a KVarN-compressed target).
+        draft_cell = 2 * _full_per_token(mr) * num_layers
+        mr.spec_aux_config.dflash_draft_kv_cell_size_per_token = draft_cell
+
+        config = self._run(mr, available)
+
+        target_cell = _full_per_token(mr) * num_layers
+        used = config.max_total_num_tokens * (target_cell + draft_cell)
+        self.assertLessEqual(used, available)
+        # Should still utilize most of the budget.
+        self.assertGreater(used, available * 0.99)
+
+    def test_layer_ratio_fallback_when_cell_size_unknown(self):
+        """Without an explicit draft cell size, keep the layer-ratio heuristic
+        (correct when draft and target share per-layer KV cost)."""
+        available = 10_000_000
+        num_layers = 32
+        draft_num_layers = 4
+
+        mr = self._make_dflash_runner(num_layers, draft_num_layers)
+        assert mr.spec_aux_config.dflash_draft_kv_cell_size_per_token is None
+
+        config = self._run(mr, available)
+
+        full_pt = _full_per_token(mr)
+        used = config.max_total_num_tokens * full_pt * (num_layers + draft_num_layers)
+        self.assertLessEqual(used, available)
+
+
+class TestDflashDraftCellSize(unittest.TestCase):
+    """compute_dflash_draft_kv_cell_size_per_token dtype mirroring."""
+
+    def _compute(self, kv_cache_dtype, backend=None):
+        import torch
+
+        from sglang.srt.speculative.dflash_utils import (
+            compute_dflash_draft_kv_cell_size_per_token,
+        )
+
+        draft_mc = SimpleNamespace(
+            dtype=torch.bfloat16,
+            head_dim=128,
+            v_head_dim=128,
+            get_num_kv_heads=lambda tp: 8,
+        )
+        return compute_dflash_draft_kv_cell_size_per_token(
+            draft_model_config=draft_mc,
+            draft_num_layers=6,
+            attn_tp_size=1,
+            server_args_kv_cache_dtype=kv_cache_dtype,
+            speculative_draft_attention_backend=backend,
+        )
+
+    def test_kvarn_target_reserves_model_dtype(self):
+        # KVarN targets reset the draft to "auto" -> bf16 pool.
+        # 8 heads * (128+128) * 6 layers * 2 bytes = 24576
+        self.assertEqual(self._compute("kvarn_k4v2_g128"), 24576)
+
+    def test_auto_reserves_model_dtype(self):
+        self.assertEqual(self._compute("auto"), 24576)
+
+    def test_explicit_fp8_reserves_fp8(self):
+        # 8 * (128+128) * 6 * 1 byte = 12288
+        self.assertEqual(self._compute("fp8_e4m3"), 12288)
+
+    def test_fa4_backend_forces_model_dtype(self):
+        # fa4 draft attention needs K.dtype == Q.dtype; fp8 request ignored.
+        self.assertEqual(self._compute("fp8_e4m3", backend="fa4"), 24576)
 
 
 class TestFactory(unittest.TestCase):

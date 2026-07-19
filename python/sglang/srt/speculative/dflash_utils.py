@@ -97,6 +97,58 @@ def scale_kv_cell_size_per_token_for_dflash(
     ) // int(target_num_layers)
 
 
+def compute_dflash_draft_kv_cell_size_per_token(
+    *,
+    draft_model_config: Any,
+    draft_num_layers: int,
+    attn_tp_size: int,
+    server_args_kv_cache_dtype: str,
+    speculative_draft_attention_backend: Optional[str],
+) -> int:
+    """Actual bytes/token of the DFLASH draft KV pool (MHA draft: K+V, all layers).
+
+    The draft pool spans the full shared token-index space (draft and target
+    share one allocator so radix-cache/prefix-hit KV stays reusable), so the
+    target's pool configurator must reserve
+    `max_total_num_tokens * <this value>` for the draft pool on top of the
+    target's own per-token cost. The layer-ratio heuristic in
+    `scale_kv_cell_size_per_token_for_dflash` assumes the draft's per-layer KV
+    cost equals the target's, which under-reserves badly when the target uses
+    a compressed cache (e.g. KVarN) while the draft keeps a dense bf16 pool.
+
+    Mirrors the draft worker's KV dtype resolution (see
+    `configure_kv_cache_dtype` and the KVarN reset in `draft_worker_common`):
+    a KVarN target's dtype is reset to "auto" for the draft, and fa4 drafts
+    always use the model compute dtype.
+    """
+    if server_args_kv_cache_dtype == "auto" or server_args_kv_cache_dtype.startswith(
+        "kvarn_"
+    ):
+        kv_dtype = draft_model_config.dtype
+    elif server_args_kv_cache_dtype == "fp8_e4m3":
+        kv_dtype = torch.float8_e4m3fn
+    elif server_args_kv_cache_dtype == "fp8_e5m2":
+        kv_dtype = torch.float8_e5m2
+    elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):
+        kv_dtype = torch.bfloat16
+    else:
+        # Unknown/exotic dtype: reserve at model dtype (safe over-estimate).
+        kv_dtype = draft_model_config.dtype
+
+    # fa4 draft attention needs K.dtype == Q.dtype, so its pool is always
+    # model dtype regardless of the requested KV dtype.
+    if speculative_draft_attention_backend == "fa4":
+        kv_dtype = draft_model_config.dtype
+
+    kv_size = torch._utils._element_size(kv_dtype)
+    return (
+        int(draft_model_config.get_num_kv_heads(attn_tp_size))
+        * (int(draft_model_config.head_dim) + int(draft_model_config.v_head_dim))
+        * int(draft_num_layers)
+        * kv_size
+    )
+
+
 def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
     backend = attn_backend
     for _ in range(4):
