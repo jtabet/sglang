@@ -137,7 +137,10 @@ def _make_model_runner(
     mr.spec_aux_config = SimpleNamespace(
         eagle_draft_num_layers=None,
         dflash_draft_num_layers=None,
-        dflash_draft_kv_cell_size_per_token=None,
+        dflash_draft_total_num_kv_heads=None,
+        dflash_draft_head_dim=None,
+        dflash_draft_v_head_dim=None,
+        dflash_draft_kv_element_size=None,
     )
 
     return mr
@@ -578,28 +581,32 @@ class TestDflashConfigurator(unittest.TestCase):
         draft_num_layers = 6
 
         mr = self._make_dflash_runner(num_layers, draft_num_layers)
-        # Draft pool costs 2x the target pool per token (e.g. dense bf16 draft
-        # behind a KVarN-compressed target).
-        draft_cell = 2 * _full_per_token(mr) * num_layers
-        mr.spec_aux_config.dflash_draft_kv_cell_size_per_token = draft_cell
+        # Draft pool costs ~3x the target pool per token (e.g. dense bf16
+        # draft behind a KVarN-compressed target). Raw shape fields feed the
+        # lazy cell-size computation in the configurator.
+        mr.spec_aux_config.dflash_draft_total_num_kv_heads = 16
+        mr.spec_aux_config.dflash_draft_head_dim = 128
+        mr.spec_aux_config.dflash_draft_v_head_dim = 128
+        mr.spec_aux_config.dflash_draft_kv_element_size = 2  # bf16
 
         config = self._run(mr, available)
 
         target_cell = _full_per_token(mr) * num_layers
+        draft_cell = 16 * (128 + 128) * draft_num_layers * 2
         used = config.max_total_num_tokens * (target_cell + draft_cell)
         self.assertLessEqual(used, available)
         # Should still utilize most of the budget.
         self.assertGreater(used, available * 0.99)
 
     def test_layer_ratio_fallback_when_cell_size_unknown(self):
-        """Without an explicit draft cell size, keep the layer-ratio heuristic
+        """Without the raw draft KV shape, keep the layer-ratio heuristic
         (correct when draft and target share per-layer KV cost)."""
         available = 10_000_000
         num_layers = 32
         draft_num_layers = 4
 
         mr = self._make_dflash_runner(num_layers, draft_num_layers)
-        assert mr.spec_aux_config.dflash_draft_kv_cell_size_per_token is None
+        assert mr.spec_aux_config.dflash_draft_total_num_kv_heads is None
 
         config = self._run(mr, available)
 
@@ -609,44 +616,93 @@ class TestDflashConfigurator(unittest.TestCase):
 
 
 class TestDflashDraftCellSize(unittest.TestCase):
-    """compute_dflash_draft_kv_cell_size_per_token dtype mirroring."""
+    """Draft KV cell-size helpers: dtype mirroring and the tp-aware formula."""
 
-    def _compute(self, kv_cache_dtype, backend=None):
+    def test_resolve_element_size_kvarn_target(self):
+        # KVarN targets reset the draft to "auto" -> model dtype (bf16 = 2 bytes).
         import torch
 
+        from sglang.srt.speculative.dflash_utils import (
+            resolve_dflash_draft_kv_element_size,
+        )
+
+        self.assertEqual(
+            resolve_dflash_draft_kv_element_size(
+                draft_model_dtype=torch.bfloat16,
+                server_args_kv_cache_dtype="kvarn_k4v2_g128",
+                speculative_draft_attention_backend=None,
+            ),
+            2,
+        )
+
+    def test_resolve_element_size_fp8(self):
+        import torch
+
+        from sglang.srt.speculative.dflash_utils import (
+            resolve_dflash_draft_kv_element_size,
+        )
+
+        self.assertEqual(
+            resolve_dflash_draft_kv_element_size(
+                draft_model_dtype=torch.bfloat16,
+                server_args_kv_cache_dtype="fp8_e4m3",
+                speculative_draft_attention_backend=None,
+            ),
+            1,
+        )
+
+    def test_resolve_element_size_fa4_forces_model_dtype(self):
+        # fa4 draft attention needs K.dtype == Q.dtype; fp8 request ignored.
+        import torch
+
+        from sglang.srt.speculative.dflash_utils import (
+            resolve_dflash_draft_kv_element_size,
+        )
+
+        self.assertEqual(
+            resolve_dflash_draft_kv_element_size(
+                draft_model_dtype=torch.bfloat16,
+                server_args_kv_cache_dtype="fp8_e4m3",
+                speculative_draft_attention_backend="fa4",
+            ),
+            2,
+        )
+
+    def test_compute_cell_size(self):
+        # 8 kv heads (tp=1) * (128+128) * 6 layers * 2 bytes = 24576
         from sglang.srt.speculative.dflash_utils import (
             compute_dflash_draft_kv_cell_size_per_token,
         )
 
-        draft_mc = SimpleNamespace(
-            dtype=torch.bfloat16,
-            head_dim=128,
-            v_head_dim=128,
-            get_num_kv_heads=lambda tp: 8,
-        )
-        return compute_dflash_draft_kv_cell_size_per_token(
-            draft_model_config=draft_mc,
-            draft_num_layers=6,
-            attn_tp_size=1,
-            server_args_kv_cache_dtype=kv_cache_dtype,
-            speculative_draft_attention_backend=backend,
+        self.assertEqual(
+            compute_dflash_draft_kv_cell_size_per_token(
+                draft_total_num_kv_heads=8,
+                draft_head_dim=128,
+                draft_v_head_dim=128,
+                draft_num_layers=6,
+                draft_kv_element_size=2,
+                attn_tp_size=1,
+            ),
+            24576,
         )
 
-    def test_kvarn_target_reserves_model_dtype(self):
-        # KVarN targets reset the draft to "auto" -> bf16 pool.
-        # 8 heads * (128+128) * 6 layers * 2 bytes = 24576
-        self.assertEqual(self._compute("kvarn_k4v2_g128"), 24576)
+    def test_compute_cell_size_tp_division(self):
+        # 16 total heads, tp=2 -> 8 per rank.
+        from sglang.srt.speculative.dflash_utils import (
+            compute_dflash_draft_kv_cell_size_per_token,
+        )
 
-    def test_auto_reserves_model_dtype(self):
-        self.assertEqual(self._compute("auto"), 24576)
-
-    def test_explicit_fp8_reserves_fp8(self):
-        # 8 * (128+128) * 6 * 1 byte = 12288
-        self.assertEqual(self._compute("fp8_e4m3"), 12288)
-
-    def test_fa4_backend_forces_model_dtype(self):
-        # fa4 draft attention needs K.dtype == Q.dtype; fp8 request ignored.
-        self.assertEqual(self._compute("fp8_e4m3", backend="fa4"), 24576)
+        self.assertEqual(
+            compute_dflash_draft_kv_cell_size_per_token(
+                draft_total_num_kv_heads=16,
+                draft_head_dim=128,
+                draft_v_head_dim=128,
+                draft_num_layers=6,
+                draft_kv_element_size=2,
+                attn_tp_size=2,
+            ),
+            24576,
+        )
 
 
 class TestFactory(unittest.TestCase):

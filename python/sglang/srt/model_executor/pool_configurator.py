@@ -156,6 +156,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # more per layer than the layer-ratio heuristic assumes).
         if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
             from sglang.srt.speculative.dflash_utils import (
+                compute_dflash_draft_kv_cell_size_per_token,
                 scale_kv_cell_size_per_token_for_dflash,
             )
 
@@ -165,15 +166,33 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
+                sa = kvc.spec_aux_config
+                draft_cell = None
+                # The raw KV-shape fields are populated target-side without the
+                # parallel state; resolve the tp-dependent cell size here,
+                # where attn_tp_size is available.
+                if all(
+                    getattr(sa, f, None) is not None
+                    for f in (
+                        "dflash_draft_total_num_kv_heads",
+                        "dflash_draft_head_dim",
+                        "dflash_draft_v_head_dim",
+                        "dflash_draft_kv_element_size",
+                    )
+                ):
+                    draft_cell = compute_dflash_draft_kv_cell_size_per_token(
+                        draft_total_num_kv_heads=sa.dflash_draft_total_num_kv_heads,
+                        draft_head_dim=sa.dflash_draft_head_dim,
+                        draft_v_head_dim=sa.dflash_draft_v_head_dim,
+                        draft_num_layers=int(draft_num_layers),
+                        draft_kv_element_size=sa.dflash_draft_kv_element_size,
+                        attn_tp_size=get_parallel().attn_tp_size,
+                    )
                 self._cell_size = scale_kv_cell_size_per_token_for_dflash(
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers),
-                    draft_cell_size_per_token=getattr(
-                        kvc.spec_aux_config,
-                        "dflash_draft_kv_cell_size_per_token",
-                        None,
-                    ),
+                    draft_cell_size_per_token=draft_cell,
                 )
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
