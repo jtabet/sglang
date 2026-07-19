@@ -241,8 +241,13 @@ class KVarNAttnBackend(AttentionBackend):
         prefill_blocks = (max_prefill_tokens + self.group - 1) // self.group
         self.pool_slots = max(2 * max_running + prefill_blocks + 8, 8)
 
-        # Compressed cache: one slot per scheduler page
-        self.num_blocks = mr.max_total_num_tokens // self.page_size
+        # Compressed cache: one slot per scheduler page.
+        # The paged allocator uses 1-based page_ids (page 0 is reserved as a
+        # dummy/padding slot for padded tokens), so block_ids range from 1 to
+        # num_pages inclusive. Size the compressed cache and block-to-slot
+        # lookup tensor with +1 entry (matching the standard MHATokenToKVPool
+        # convention of size + page_size) so block_id = num_pages is in range.
+        self.num_blocks = mr.max_total_num_tokens // self.page_size + 1
 
         device = self.device
 

@@ -234,6 +234,22 @@ class KVarNFlushManager:
         vpb = cfg.v_packed_bytes
         nB = len(block_ids)
 
+        # Defensive bounds check: block_ids and slots must be in range.
+        # A failure here indicates the compressed cache or tail pool is
+        # undersized relative to the scheduler's page allocator.
+        max_bid = max(block_ids)
+        max_slot = max(slots)
+        if max_bid >= compressed_cache[0].shape[0]:
+            raise IndexError(
+                f"KVarN flush: block_id {max_bid} >= compressed_blocks "
+                f"{compressed_cache[0].shape[0]}"
+            )
+        if max_slot >= tail_K[0].shape[0]:
+            raise IndexError(
+                f"KVarN flush: slot {max_slot} >= tail_pool_slots "
+                f"{tail_K[0].shape[0]}"
+            )
+
         # Chunk to bound transient gather memory
         CHUNK_BLOCKS = max(1, 2048 // max(Hk, 1))
 
