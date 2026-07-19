@@ -69,12 +69,52 @@ class DFlashVerifyInput(SpecInput):
             if batch.forward_mode.is_idle()
             else ForwardMode.TARGET_VERIFY
         )
-        verify_forward_batch = ForwardBatch.init_new(
-            batch,
-            target_worker.model_runner,
-            capture_hidden_mode=self.capture_hidden_mode,
-            return_hidden_states_before_norm=False,
-        )
+
+        # TARGET_VERIFY is an extend-mode forward (init_new copies
+        # batch.extend_lens / batch.prefix_lens onto the ForwardBatch). The
+        # verify block is `draft_token_num` new tokens per request on top of
+        # the committed prefix, so populate those two fields explicitly —
+        # otherwise init_new inherits stale prefill values and backends that
+        # key on extend_seq_lens (KVarN's fused verify path) read garbage.
+        # Mirrors eagle_worker_common.prepare_for_draft_extend.
+        bs = len(batch.seq_lens)
+        gpu_only = batch.seq_lens_cpu is None
+        draft_token_num = int(self.draft_token_num)
+        saved_prefix_lens = batch.prefix_lens
+        saved_extend_lens = batch.extend_lens
+        saved_seq_lens = batch.seq_lens
+        saved_seq_lens_sum = batch.seq_lens_sum
+        try:
+            if gpu_only:
+                batch.prefix_lens = batch.seq_lens.to(torch.int32)
+                batch.extend_lens = torch.full(
+                    (bs,),
+                    draft_token_num,
+                    dtype=torch.int32,
+                    device=batch.seq_lens.device,
+                )
+                # KVarN's fused verify path computes `committed = seq_lens -
+                # extend_lens`, so seq_lens must be the *post-verify* length.
+                batch.seq_lens = batch.seq_lens + draft_token_num
+                batch.seq_lens_sum = int(batch.seq_lens.sum().item())
+            else:
+                batch.prefix_lens = batch.seq_lens_cpu.tolist()
+                batch.extend_lens = [draft_token_num] * bs
+                # The caller already bumped seq_lens_cpu to committed + block;
+                # bump the GPU mirror to match for backends that read it.
+                batch.seq_lens = batch.seq_lens + draft_token_num
+                batch.seq_lens_sum = int(batch.seq_lens.sum().item())
+            verify_forward_batch = ForwardBatch.init_new(
+                batch,
+                target_worker.model_runner,
+                capture_hidden_mode=self.capture_hidden_mode,
+                return_hidden_states_before_norm=False,
+            )
+        finally:
+            batch.prefix_lens = saved_prefix_lens
+            batch.extend_lens = saved_extend_lens
+            batch.seq_lens = saved_seq_lens
+            batch.seq_lens_sum = saved_seq_lens_sum
 
         can_run_cuda_graph = bool(
             target_worker.model_runner.decode_cuda_graph_runner

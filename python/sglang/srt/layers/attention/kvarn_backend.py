@@ -1064,15 +1064,23 @@ class KVarNAttnBackend(AttentionBackend):
         extend_seq_lens = forward_batch.extend_seq_lens
         extend_prefix_lens = forward_batch.extend_prefix_lens
 
-        # query_start_loc: cumulative sum of extend_seq_lens
+        # query_start_loc: cumulative sum of extend_seq_lens. TARGET_VERIFY is
+        # an extend-mode forward, so extend_seq_lens must be populated (one
+        # entry per request = draft block size). The fallback below would
+        # silently treat every request as a single-token verify, which is
+        # wrong for any speculative algorithm with draft_token_num > 1 and
+        # leads to garbage vq_req/vq_seqlen -> CUDA illegal address.
         if extend_seq_lens is not None:
             qlens = extend_seq_lens.to(torch.long)
             qsl = torch.zeros(B + 1, dtype=torch.long, device=device)
             qsl[1:] = torch.cumsum(qlens, dim=0)
         else:
-            # Fallback: treat all tokens as one per request
-            qlens = torch.ones(B, dtype=torch.long, device=device)
-            qsl = torch.arange(B + 1, dtype=torch.long, device=device)
+            raise RuntimeError(
+                "KVarN fused verify path requires forward_batch.extend_seq_lens "
+                "(expected draft_token_num per request). Got None — "
+                "TARGET_VERIFY was not set up as an extend forward. "
+                f"B={B}, NQ={NQ}, forward_mode={forward_batch.forward_mode}."
+            )
 
         # vq_req: which request each token belongs to
         vq_req_long = torch.repeat_interleave(
