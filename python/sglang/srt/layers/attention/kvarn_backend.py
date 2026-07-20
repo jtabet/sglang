@@ -56,11 +56,6 @@ class KVarNAttnBackend(AttentionBackend):
 
     needs_cpu_seq_lens: bool = False
 
-    # The fused verify path (_fused_verify_path) allocates fresh tensors per
-    # call (block tables, vq_req, vq_seqlen, ...) and is eager-only; it cannot
-    # be CUDA-graph-captured. See the docstring on _fused_verify_path.
-    supports_target_verify_cuda_graph: bool = False
-
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int]:
         """Block sizes (page sizes) the KVarN kernels support."""
@@ -507,6 +502,57 @@ class KVarNAttnBackend(AttentionBackend):
             # Fill cu_seqlens
             self._cg_cu_seqlens[1 : B + 1] = torch.cumsum(self._cg_seq_lens[:B], dim=0)
 
+            # Fill verify-specific buffers when this is a TARGET_VERIFY batch
+            # (extend_seq_lens is populated by Fix 4 / dflash_info.prepare_for_verify).
+            # All computation is eager (outside the graph); the captured
+            # _fused_verify_path only reads the filled static buffers.
+            extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
+            if extend_seq_lens is not None:
+                self._fill_cg_verify_buffers(B, extend_seq_lens)
+
+    def _fill_cg_verify_buffers(
+        self, B: int, extend_seq_lens: torch.Tensor
+    ) -> None:
+        """Fill _cg_vq_req / _cg_vq_seqlen / _cg_qsl / _cg_committed for the
+        captured verify path. Runs eagerly in init_forward_metadata_out_graph.
+        """
+        device = self.device
+        qlens = extend_seq_lens.to(torch.long)[:B]
+        NQ = int(qlens.sum().item())
+        if NQ > self._cg_max_num_tokens:
+            raise RuntimeError(
+                f"Verify token count {NQ} exceeds CUDA graph max "
+                f"{self._cg_max_num_tokens}"
+            )
+
+        # qsl: cumulative sum of extend_seq_lens [B+1]
+        self._cg_qsl.zero_()
+        self._cg_qsl[1 : B + 1] = torch.cumsum(qlens, dim=0)
+
+        # vq_req: which request each query token belongs to [NQ]
+        # repeat_interleave(arange(B), qlens) — eager fill into static buffer
+        self._cg_vq_req[:NQ].zero_()
+        self._cg_vq_seqlen[:NQ].zero_()
+        if NQ > 0:
+            vq_req_long = torch.repeat_interleave(
+                torch.arange(B, device=device), qlens
+            )
+            self._cg_vq_req[:NQ] = vq_req_long.to(torch.int32)
+
+            # committed = seq_len - extend_len (cached prefix per request)
+            committed = self._cg_seq_lens[:B].to(torch.long) - qlens
+            self._cg_committed[:B] = committed.to(torch.int32)
+
+            # pos_in_req: position within each request's query block [NQ]
+            pos_in_req = torch.arange(NQ, device=device) - self._cg_qsl[:B][
+                vq_req_long
+            ]
+
+            # vq_seqlen: causal length = committed[vq_req] + pos + 1
+            self._cg_vq_seqlen[:NQ] = (
+                committed[vq_req_long] + pos_in_req + 1
+            ).to(torch.int32)
+
     def init_cuda_graph_state(self, max_batch_size: int, max_num_token: int):
         """Pre-allocate CUDA graph state (static buffers for block_table, etc.)."""
         if self.pool_slots == 0:
@@ -530,6 +576,25 @@ class KVarNAttnBackend(AttentionBackend):
         )
         self._cg_max_batch_size = max_batch_size
         self._cg_max_blocks = max_blocks_per_req
+
+        # Verify-specific static buffers (for graph-capturable _fused_verify_path)
+        # _cg_vq_req[NQ]: which request each query token belongs to
+        # _cg_vq_seqlen[NQ]: causal length per query token
+        # _cg_qsl[B+1]: cumulative sum of extend_seq_lens (query start locs)
+        # _cg_committed[B]: cached prefix length per request (seq_len - extend_len)
+        self._cg_vq_req = torch.zeros(
+            max_num_token, dtype=torch.int32, device=self.device
+        )
+        self._cg_vq_seqlen = torch.zeros(
+            max_num_token, dtype=torch.int32, device=self.device
+        )
+        self._cg_qsl = torch.zeros(
+            max_batch_size + 1, dtype=torch.int64, device=self.device
+        )
+        self._cg_committed = torch.zeros(
+            max_batch_size, dtype=torch.int32, device=self.device
+        )
+        self._cg_max_num_tokens = max_num_token
 
         # Warm up scatter store kernel (fast). The fused decode kernel has
         # autotuning configs that can take a long time on first run — let
@@ -588,6 +653,39 @@ class KVarNAttnBackend(AttentionBackend):
             )
         except Exception as e:
             logger.warning(f"KVarN kernel warmup failed (non-fatal): {e}")
+
+        # Warm up fused verify kernel (used by spec decode TARGET_VERIFY)
+        try:
+            from sglang.srt.layers.attention.kvarn_ops.triton_decode import (
+                kvarn_verify_attention,
+            )
+
+            NQ_warmup = B * 16  # draft_token_num per request, rough
+            dummy_vq_req = torch.zeros(
+                NQ_warmup, dtype=torch.int32, device=device
+            )
+            dummy_vq_seqlen = torch.ones(
+                NQ_warmup, dtype=torch.int32, device=device
+            )
+            _ = kvarn_verify_attention(
+                query=torch.zeros(
+                    NQ_warmup, Hq, D, dtype=torch.float16, device=device
+                ),
+                kv_cache=self.kv_cache_int4[0],
+                tail_K=self.tail_K[0],
+                tail_V=self.tail_V[0],
+                hadamard=self._H_fp16.float(),
+                scale=self.scale,
+                cfg=self.cfg,
+                impl=self,
+                block_table=dummy_bt,
+                vq_req=dummy_vq_req,
+                vq_seqlen=dummy_vq_seqlen,
+                max_ctx_blocks=max_blocks_per_req,
+                sliding_window=0,
+            )
+        except Exception as e:
+            logger.warning(f"KVarN verify kernel warmup failed (non-fatal): {e}")
 
         logger.info("KVarN Triton kernels warmed up")
 
@@ -1049,8 +1147,13 @@ class KVarNAttnBackend(AttentionBackend):
         tiles + the fp16 pool directly without materializing the whole
         context to fp16 scratch.
 
-        Eager-only (verify steps are not graph-captured): fresh small
-        tensors per call are fine.
+        Graph-capturable: when CUDA graph buffers are available
+        (``self._cg_block_table`` exists) and the batch fits, all metadata
+        (block_table, vq_req, vq_seqlen) is pre-computed into static buffers
+        by ``_fill_cg_verify_buffers`` in ``init_forward_metadata_out_graph``
+        (eager, before capture/replay). The captured forward only launches
+        ``kvarn_verify_attention`` reading those buffers — no fresh
+        allocations inside the graph.
         """
         from sglang.srt.layers.attention.kvarn_ops.triton_decode import (
             kvarn_verify_attention,
@@ -1060,48 +1163,48 @@ class KVarNAttnBackend(AttentionBackend):
         NQ = q_3d.shape[0]
         device = q_3d.device
 
-        # Build block_table, seq_lens for the verify kernel
-        block_table, seq_lens_t, cu_seqlens = self._build_block_table(forward_batch)
-        B = block_table.shape[0]
-        max_ctx_blocks = block_table.shape[1]
-
-        # Build per-token vq_req and vq_seqlen
         extend_seq_lens = forward_batch.extend_seq_lens
-        extend_prefix_lens = forward_batch.extend_prefix_lens
-
-        # query_start_loc: cumulative sum of extend_seq_lens. TARGET_VERIFY is
-        # an extend-mode forward, so extend_seq_lens must be populated (one
-        # entry per request = draft block size). The fallback below would
-        # silently treat every request as a single-token verify, which is
-        # wrong for any speculative algorithm with draft_token_num > 1 and
-        # leads to garbage vq_req/vq_seqlen -> CUDA illegal address.
-        if extend_seq_lens is not None:
-            qlens = extend_seq_lens.to(torch.long)
-            qsl = torch.zeros(B + 1, dtype=torch.long, device=device)
-            qsl[1:] = torch.cumsum(qlens, dim=0)
-        else:
+        if extend_seq_lens is None:
             raise RuntimeError(
                 "KVarN fused verify path requires forward_batch.extend_seq_lens "
                 "(expected draft_token_num per request). Got None — "
                 "TARGET_VERIFY was not set up as an extend forward. "
-                f"B={B}, NQ={NQ}, forward_mode={forward_batch.forward_mode}."
+                f"NQ={NQ}, forward_mode={forward_batch.forward_mode}."
             )
 
-        # vq_req: which request each token belongs to
-        vq_req_long = torch.repeat_interleave(
-            torch.arange(B, device=device),
-            qlens,
+        # Use static CUDA graph buffers when available; fall back to fresh
+        # tensors for eager mode.
+        use_cg = (
+            hasattr(self, "_cg_block_table")
+            and hasattr(self, "_cg_vq_req")
+            and forward_batch.batch_size <= self._cg_max_batch_size
+            and NQ <= self._cg_max_num_tokens
         )
-        vq_req = vq_req_long.to(torch.int32)
 
-        # pos_in_req: position of each token within its request
-        pos_in_req = torch.arange(NQ, device=device) - qsl[:-1][vq_req_long]
+        if use_cg:
+            B = forward_batch.batch_size
+            block_table = self._cg_block_table[:B]
+            max_ctx_blocks = block_table.shape[1]
+            vq_req = self._cg_vq_req[:NQ]
+            vq_seqlen = self._cg_vq_seqlen[:NQ]
+        else:
+            # Eager: build fresh tensors
+            block_table, seq_lens_t, _ = self._build_block_table(forward_batch)
+            B = block_table.shape[0]
+            max_ctx_blocks = block_table.shape[1]
 
-        # committed = seq_len - qlen (the cached prefix length)
-        committed = seq_lens_t[:B].to(torch.long) - qlens
+            qlens = extend_seq_lens.to(torch.long)
+            vq_req_long = torch.repeat_interleave(
+                torch.arange(B, device=device),
+                qlens,
+            )
+            vq_req = vq_req_long.to(torch.int32)
 
-        # vq_seqlen: causal length = committed + pos + 1
-        vq_seqlen = (committed[vq_req_long] + pos_in_req + 1).to(torch.int32)
+            qsl = torch.zeros(B + 1, dtype=torch.long, device=device)
+            qsl[1:] = torch.cumsum(qlens, dim=0)
+            pos_in_req = torch.arange(NQ, device=device) - qsl[:-1][vq_req_long]
+            committed = seq_lens_t[:B].to(torch.long) - qlens
+            vq_seqlen = (committed[vq_req_long] + pos_in_req + 1).to(torch.int32)
 
         sliding_window = getattr(layer, "sliding_window_size", -1)
         if sliding_window is None or sliding_window <= 0:
