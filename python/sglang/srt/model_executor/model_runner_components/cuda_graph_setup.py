@@ -287,6 +287,23 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> DecodeGraphCapture:
     if model_runner.device == "cpu" and not get_flags().capture.enable_torch_compile:
         return no_capture
 
+    # KVarN's fused verify path is eager-only (fresh tensors per call); skip
+    # target-verify graph capture so the server starts instead of crashing.
+    # The draft worker has its own backend and is unaffected.
+    if (
+        model_runner.spec_algorithm.is_speculative()
+        and not model_runner.is_draft_worker
+        and not getattr(
+            model_runner.attn_backend, "supports_target_verify_cuda_graph", True
+        )
+    ):
+        logger.info(
+            "Skip target verify CUDA graph: attention backend %s does not "
+            "support verify graph capture (eager verify instead).",
+            type(model_runner.attn_backend).__name__,
+        )
+        return no_capture
+
     tic = time.perf_counter()
     before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
     graph_backend = defaultdict(

@@ -56,6 +56,11 @@ class KVarNAttnBackend(AttentionBackend):
 
     needs_cpu_seq_lens: bool = False
 
+    # The fused verify path (_fused_verify_path) allocates fresh tensors per
+    # call (block tables, vq_req, vq_seqlen, ...) and is eager-only; it cannot
+    # be CUDA-graph-captured. See the docstring on _fused_verify_path.
+    supports_target_verify_cuda_graph: bool = False
+
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int]:
         """Block sizes (page sizes) the KVarN kernels support."""
