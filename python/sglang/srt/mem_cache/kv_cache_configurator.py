@@ -1506,6 +1506,37 @@ class KVCacheConfigurator:
                 / 1024,
             )
 
+        # Transient runtime workspace for prefill: activations, GDN
+        # conv/recurrent buffers, attention and Triton autotune workspaces all
+        # scale with the per-forward prefill chunk, and the (1 - mem_fraction)
+        # slack alone can be too small in absolute terms on small GPUs to cover
+        # them. Measured on a 24 GB GPU (hybrid GDN 9B, chunk=8192,
+        # hidden=4096, bf16): ~1.2 GB of runtime growth before an OOM in
+        # fused_qkv_split_gdn_prefill — i.e. ~20x (chunk x hidden x dtype).
+        # Reserve it explicitly so pool sizing can't spend it on KV capacity.
+        # Target worker only: GPU memory is shared, and this term is sized on
+        # total runtime demand (the draft's window-capped prefill is included
+        # in the measurement).
+        if not self.is_draft_worker:
+            prefill_chunk = self.server_args.chunked_prefill_size
+            if prefill_chunk is None or prefill_chunk <= 0:
+                prefill_chunk = self.server_args.max_prefill_tokens
+            runtime_reserve_gb = (
+                prefill_chunk
+                * self.model_config.hidden_size
+                * torch._utils._element_size(self.model_config.dtype)
+                * 20
+                / (1024**3)
+            )
+            slack_gb += runtime_reserve_gb
+            logger.info(
+                "Prefill runtime workspace reserve: %.2f GB "
+                "(chunk=%d, hidden=%d), total slack %.2f GB",
+                runtime_reserve_gb,
+                prefill_chunk,
+                self.model_config.hidden_size,
+                slack_gb,
+            )
         rest_memory = available_gpu_memory - slack_gb
         if self.mambaish_config is not None:
             # When KVarN is enabled, the KV pool is a NoOp placeholder and the

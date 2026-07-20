@@ -63,6 +63,7 @@ def _make_model_runner(
     disaggregation_mode="null",
     max_running_requests=None,
     disaggregation_decode_extra_slots=0,
+    hidden_size=0,
 ):
     """Create a mock ModelRunner with the fields configurators need."""
     mr = MagicMock()
@@ -94,6 +95,8 @@ def _make_model_runner(
     mc.swa_v_head_dim = swa_v_head_dim or v_head_dim
     mc.get_num_kv_heads = lambda tp_size: num_kv_heads
     mc.get_swa_num_kv_heads = lambda tp_size: swa_num_kv_heads or num_kv_heads
+    mc.hidden_size = hidden_size
+    mc.dtype = "fake_bf16"  # torch._utils._element_size is patched in mock_cpu_env
     mc.hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
     mc.hf_config.get_text_config = lambda: mc.hf_config
     mc.linear_attn_registry_result = None
@@ -107,6 +110,7 @@ def _make_model_runner(
     sa.page_size = page_size
     sa.disable_radix_cache = disable_radix_cache
     sa.chunked_prefill_size = chunked_prefill_size
+    sa.max_prefill_tokens = 16384
     sa.disable_overlap_schedule = disable_overlap_schedule
     sa.speculative_num_draft_tokens = speculative_num_draft_tokens
     sa.max_speculative_num_draft_tokens = (
@@ -219,6 +223,60 @@ class TestDefaultConfigurator(unittest.TestCase):
         _, _, config = self._run(10_000_000)
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
+
+
+class TestPrefillRuntimeWorkspaceReserve(unittest.TestCase):
+    """KVCacheConfigurator._profile_available_bytes reserves transient prefill
+    workspace for the target worker (chunk x hidden x dtype x 20), never for
+    the draft worker. Built via __new__ to isolate the slack arithmetic from
+    the dataclass's unrelated construction machinery.
+    """
+
+    def _profile(self, *, hidden_size, is_draft_worker, chunked_prefill_size=8192):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        mr = _make_model_runner(
+            hidden_size=hidden_size, chunked_prefill_size=chunked_prefill_size
+        )
+        mr.server_args.mem_fraction_static = 0.875
+        cfg = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        cfg.device = "cpu"
+        cfg.gpu_id = 0
+        cfg.server_args = mr.server_args
+        cfg.model_config = mr.model_config
+        cfg.is_draft_worker = is_draft_worker
+        cfg.mambaish_config = None
+        with (
+            mock_cpu_env(),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_available_gpu_memory",
+                return_value=20.0,
+            ),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_world_group",
+                return_value=SimpleNamespace(world_size=1, cpu_group=None),
+            ),
+        ):
+            return cfg._profile_available_bytes(pre_model_load_memory=24.0)
+
+    def test_reserve_scales_with_chunk_and_hidden(self):
+        # slack = 24 * (1 - 0.875) = 3.0; reserve = 8192*4096*2*20 / 2^30 = 1.25
+        # (_profile_available_bytes returns bytes: GiB x 2^30)
+        self.assertEqual(self._profile(hidden_size=0, is_draft_worker=False), 17 << 30)
+        self.assertEqual(
+            self._profile(hidden_size=4096, is_draft_worker=False),
+            int(15.75 * (1 << 30)),
+        )
+
+    def test_chunk_fallback_to_max_prefill_tokens(self):
+        # chunked_prefill_size=-1 -> max_prefill_tokens (16384): reserve = 2.5
+        self.assertEqual(
+            self._profile(hidden_size=4096, is_draft_worker=False, chunked_prefill_size=-1),
+            int(14.5 * (1 << 30)),
+        )
+
+    def test_draft_worker_not_reserved(self):
+        self.assertEqual(self._profile(hidden_size=4096, is_draft_worker=True), 17 << 30)
 
 
 class TestHybridSWAConfigurator(unittest.TestCase):
