@@ -21,11 +21,6 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    Phase,
-    check_cuda_graph_backend,
-)
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     get_kv_cache_quant_method,
     resolve_kv_cache_quant,
@@ -1511,34 +1506,6 @@ class KVCacheConfigurator:
                 / 1024,
             )
 
-        # Speculative decoding with CUDA graphs: the target verify graph
-        # captures a full forward pass (max_bs × num_draft_tokens tokens
-        # through all transformer layers), plus Triton autotune allocates
-        # kernel workspace during capture. This memory is not accounted for
-        # by the generic (1 - mem_fraction) slack. Empirically, the graph +
-        # workspace is ~15% of the target model weights (measured 1.7 GB for
-        # an 11.4 GB 9B model). Reserve it so the pool configurator doesn't
-        # fill all available memory with KV capacity → OOM at graph capture
-        # or runtime.
-        if (
-            self.spec_algorithm.is_speculative()
-            and not self.is_draft_worker
-            and not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
-        ):
-            weights_gb = pre_model_load_memory - available_gpu_memory
-            # Only count target weights; draft weights are loaded after this
-            # profiling runs on the target worker, so available_gpu_memory
-            # already reflects target-only weight usage.
-            graph_reserve_gb = weights_gb * 0.15
-            slack_gb += graph_reserve_gb
-            logger.info(
-                "Spec decode CUDA graph reserve: %.2f GB (%.0f%% of %.2f GB "
-                "target weights), total slack %.2f GB",
-                graph_reserve_gb,
-                15,
-                weights_gb,
-                slack_gb,
-            )
         rest_memory = available_gpu_memory - slack_gb
         if self.mambaish_config is not None:
             # When KVarN is enabled, the KV pool is a NoOp placeholder and the
