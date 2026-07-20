@@ -1513,7 +1513,7 @@ class KVCacheConfigurator:
 
         # Speculative decoding with CUDA graphs: the target verify graph
         # (max_bs × num_draft_tokens forward captured for every bucket) plus
-        # Triton autotune workspace for the verify kernels needs ~2 GB of
+        # Triton autotune workspace for the verify kernels needs ~1 GB of
         # runtime headroom that the generic (1 - mem_fraction) slack doesn't
         # account for. Without this reserve, the pool configurator fills all
         # available memory with KV capacity, leaving nothing for graph capture
@@ -1523,7 +1523,7 @@ class KVCacheConfigurator:
             and not self.is_draft_worker
             and not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
         ):
-            slack_gb += 2.0
+            slack_gb += 1.0
         rest_memory = available_gpu_memory - slack_gb
         if self.mambaish_config is not None:
             # When KVarN is enabled, the KV pool is a NoOp placeholder and the
