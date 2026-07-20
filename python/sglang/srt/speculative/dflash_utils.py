@@ -102,22 +102,31 @@ def resolve_dflash_draft_kv_element_size(
     draft_model_dtype: "torch.dtype",
     server_args_kv_cache_dtype: str,
     speculative_draft_attention_backend: Optional[str],
+    speculative_draft_kv_cache_dtype: str = "auto",
 ) -> int:
     """Bytes per draft KV element, mirroring the draft worker's dtype resolution.
 
-    See `configure_kv_cache_dtype` and the KVarN reset in `draft_worker_common`:
-    a KVarN target's dtype is reset to "auto" for the draft, and fa4 drafts
+    See `configure_kv_cache_dtype` and the override logic in
+    `draft_worker_common`: an explicit --speculative-draft-kv-cache-dtype wins;
+    otherwise the draft inherits the target's dtype, except KVarN targets which
+    fall back to the draft model dtype (no real pool to inherit). fa4 drafts
     always use the model compute dtype. Does NOT touch the parallel state.
     """
-    if server_args_kv_cache_dtype == "auto" or server_args_kv_cache_dtype.startswith(
-        "kvarn_"
-    ):
+    dtype_str = speculative_draft_kv_cache_dtype
+    if dtype_str == "auto":
+        dtype_str = (
+            "auto"
+            if server_args_kv_cache_dtype.startswith("kvarn_")
+            else server_args_kv_cache_dtype
+        )
+
+    if dtype_str == "auto":
         kv_dtype = draft_model_dtype
-    elif server_args_kv_cache_dtype == "fp8_e4m3":
+    elif dtype_str == "fp8_e4m3":
         kv_dtype = torch.float8_e4m3fn
-    elif server_args_kv_cache_dtype == "fp8_e5m2":
+    elif dtype_str == "fp8_e5m2":
         kv_dtype = torch.float8_e5m2
-    elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):
+    elif dtype_str in ("bf16", "bfloat16"):
         kv_dtype = torch.bfloat16
     else:
         # Unknown/exotic dtype: reserve at model dtype (safe over-estimate).

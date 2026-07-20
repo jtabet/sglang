@@ -208,6 +208,9 @@ def _populate_dflash_draft_kv_shape(
             speculative_draft_attention_backend=(
                 server_args.speculative_draft_attention_backend
             ),
+            speculative_draft_kv_cache_dtype=(
+                server_args.speculative_draft_kv_cache_dtype
+            ),
         )
     except Exception:
         logger.warning(

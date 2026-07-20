@@ -1787,6 +1787,21 @@ class ServerArgs:
         Optional[int],
         "Sliding window size for the draft model. Honored by Llama EAGLE-3 (`LlamaForCausalLMEagle3`) and DFLASH only; other EAGLE-3 backends (e.g. MLA-based drafters) silently ignore it. For Llama EAGLE-3, the drafter only attends to the most recent N keys (verifier hidden states + its own outputs); the verifier is unaffected. For DFLASH, the draft worker keeps a recent target-token window in its local KV cache (paged backends may retain up to one extra page on the left for alignment). Default is full attention/context.",
     ] = None
+    speculative_draft_kv_cache_dtype: A[
+        str,
+        Arg(
+            help=(
+                'KV cache dtype for the draft model in speculative decoding. '
+                '"auto" inherits the target\'s --kv-cache-dtype (KVarN targets '
+                'fall back to the draft model dtype: KVarN has no real KV '
+                'pool for the draft to reuse). An explicit value quantizes '
+                'the draft KV cache — e.g. "fp8_e4m3" halves the DFLASH '
+                'draft pool, which spans the full token-index space — at the '
+                'cost of a possible drop in speculative acceptance length.'
+            ),
+            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16"],
+        ),
+    ] = "auto"
     speculative_moe_runner_backend: A[
         Optional[str],
         Arg(

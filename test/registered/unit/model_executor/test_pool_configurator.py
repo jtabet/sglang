@@ -619,7 +619,8 @@ class TestDflashDraftCellSize(unittest.TestCase):
     """Draft KV cell-size helpers: dtype mirroring and the tp-aware formula."""
 
     def test_resolve_element_size_kvarn_target(self):
-        # KVarN targets reset the draft to "auto" -> model dtype (bf16 = 2 bytes).
+        # KVarN targets fall back to the draft model dtype (bf16 = 2 bytes)
+        # when no explicit draft KV dtype is requested.
         import torch
 
         from sglang.srt.speculative.dflash_utils import (
@@ -633,6 +634,25 @@ class TestDflashDraftCellSize(unittest.TestCase):
                 speculative_draft_attention_backend=None,
             ),
             2,
+        )
+
+    def test_resolve_element_size_explicit_draft_dtype_wins(self):
+        # --speculative-draft-kv-cache-dtype fp8_e4m3 overrides the KVarN
+        # fallback: 1 byte/element.
+        import torch
+
+        from sglang.srt.speculative.dflash_utils import (
+            resolve_dflash_draft_kv_element_size,
+        )
+
+        self.assertEqual(
+            resolve_dflash_draft_kv_element_size(
+                draft_model_dtype=torch.bfloat16,
+                server_args_kv_cache_dtype="kvarn_k4v2_g128",
+                speculative_draft_attention_backend=None,
+                speculative_draft_kv_cache_dtype="fp8_e4m3",
+            ),
+            1,
         )
 
     def test_resolve_element_size_fp8(self):
