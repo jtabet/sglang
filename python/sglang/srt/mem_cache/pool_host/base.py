@@ -23,8 +23,16 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 
+
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
-HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
+# Tunable via SGLANG_HICACHE_HOST_MEMORY_RESERVE_GB; default 10 GB is
+# conservative for shared hosts. On a dedicated/managed box with known
+# memory headroom, operators can lower it to reclaim otherwise-wasted RAM.
+def hicache_host_memory_reserve_bytes() -> int:
+    from sglang.srt.environ import envs
+
+    return int(envs.SGLANG_HICACHE_HOST_MEMORY_RESERVE_GB.get() * (1024**3))
+
 
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
 
@@ -55,7 +63,7 @@ def host_memory_budget_bytes() -> int:
     memory; without the split every rank sizes its pool against all of it and
     the host is oversubscribed by the number of ranks it holds.
     """
-    free = psutil.virtual_memory().available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+    free = psutil.virtual_memory().available - hicache_host_memory_reserve_bytes()
     return free // ranks_per_host()
 
 

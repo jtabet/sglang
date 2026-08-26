@@ -102,6 +102,7 @@ class DraftBackendFactory:
             "ascend": self._create_ascend_decode_backend,
             "fa4": self._create_fa4_decode_backend,
             "dsv4": self._create_dsv4_decode_backend,
+            "kvarn": self._create_kvarn_decode_backend,
         }
 
         return self._create_backend(
@@ -130,6 +131,7 @@ class DraftBackendFactory:
             "ascend": self._create_ascend_prefill_backend,
             "fa4": self._create_fa4_prefill_backend,
             "dsv4": self._create_dsv4_prefill_backend,
+            "kvarn": self._create_kvarn_prefill_backend,
         }
         backend_name = (
             "decode_attention_backend"
@@ -537,3 +539,28 @@ class DraftBackendFactory:
             "dsv4",
             DeepseekV4AttnBackend(self.draft_model_runner, skip_prefill=False),
         )
+
+    def _create_kvarn_decode_backend(self):
+        from sglang.srt.layers.attention.kvarn_backend import (
+            KVarNMultiStepDraftBackend,
+        )
+
+        return (
+            "kvarn",
+            KVarNMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            ),
+        )
+
+    def _create_kvarn_prefill_backend(self):
+        from sglang.srt.layers.attention.attention_registry import (
+            create_kvarn_backend,
+        )
+
+        backend = create_kvarn_backend(self.draft_model_runner)
+        # Override layer mapping for MTP draft (same as decode backend).
+        if getattr(backend, "full_attn_layer_ids", None) is not None:
+            backend.full_attn_layer_ids = [0]
+            backend.num_layers = 1
+            backend._layer_id_to_idx = {0: 0}
+        return ("kvarn", backend)
