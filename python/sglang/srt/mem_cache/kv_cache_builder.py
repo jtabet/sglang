@@ -48,6 +48,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
+from sglang.srt.utils.tensor_bridge import use_mlx
 
 if TYPE_CHECKING:
 
