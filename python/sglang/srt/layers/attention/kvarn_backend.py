@@ -704,8 +704,9 @@ class KVarNAttnBackend(AttentionBackend):
         batch_sizes = list(range(1, min(max_batch_size, 8) + 1))
 
         # Common max_blocks values across the full context range.
-        # The kernel specializes on MAX_BLOCKS_PER_REQ as a tl.constexpr, so
-        # we sweep powers of two plus a few intermediate points.
+        # max_blocks_per_req is now a runtime arg (no longer a tl.constexpr),
+        # so a single warmup call suffices. We still sweep a few values to
+        # warm the autotuner and Triton's internal kernel cache.
         max_blocks_values = set([1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048])
         # Also cover the actual max_blocks_per_req if it is not already included
         max_blocks_values.add(max_blocks_per_req)
@@ -760,7 +761,7 @@ class KVarNAttnBackend(AttentionBackend):
                         self._tail_K_stride2,
                         K_packed.stride(0),
                         K_packed.stride(1),
-                        MAX_BLOCKS_PER_REQ=max_blocks,
+                        max_blocks,
                         D=D,
                         GROUP=self.group,
                         K_BITS=self.cfg.key_bits,
@@ -1034,7 +1035,7 @@ class KVarNAttnBackend(AttentionBackend):
                 self._tail_K_stride2,
                 K_packed.stride(0),
                 K_packed.stride(1),
-                MAX_BLOCKS_PER_REQ=max_blocks,
+                max_blocks,
                 D=self.head_dim,
                 GROUP=self.group,
                 K_BITS=self.cfg.key_bits,

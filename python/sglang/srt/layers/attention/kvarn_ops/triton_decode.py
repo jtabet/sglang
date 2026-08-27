@@ -151,8 +151,9 @@ def _kvarn_build_packed_kv_kernel(
     stride_pool_h,
     stride_out_t,
     stride_out_h,
+    # runtime value (was tl.constexpr — caused per-batch recompilation)
+    max_blocks_per_req,
     # constexprs
-    MAX_BLOCKS_PER_REQ: tl.constexpr,
     D: tl.constexpr,
     GROUP: tl.constexpr,
     K_BITS: tl.constexpr,
@@ -167,11 +168,11 @@ def _kvarn_build_packed_kv_kernel(
     V_S_ROW_OFFSET: tl.constexpr,
     V_ZP_OFFSET: tl.constexpr,
 ):
-    """Grid: (B * MAX_BLOCKS_PER_REQ, Hk). One (request-block, head) per program."""
+    """Grid: (B * max_blocks_per_req, Hk). One (request-block, head) per program."""
     bk = tl.program_id(0)
     hk = tl.program_id(1)
-    b = bk // MAX_BLOCKS_PER_REQ
-    k = bk % MAX_BLOCKS_PER_REQ
+    b = bk // max_blocks_per_req
+    k = bk % max_blocks_per_req
 
     seq_len = tl.load(Seq_lens_ptr + b)
     rem = seq_len - k * GROUP
@@ -313,7 +314,6 @@ def _kvarn_fused_decode_kernel(
     stride_o_b,
     stride_o_h,
     # constexprs
-    MAX_BLOCKS_PER_REQ: tl.constexpr,
     D: tl.constexpr,
     GROUP: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -516,7 +516,6 @@ def _kvarn_fused_decode_stage1(
     stride_mo_n,
     stride_mo_s,
     stride_ml_n,
-    MAX_BLOCKS_PER_REQ: tl.constexpr,
     D: tl.constexpr,
     GROUP: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -770,7 +769,6 @@ def kvarn_decode_attention(
     use_fused = True
 
     common = dict(
-        MAX_BLOCKS_PER_REQ=max_blocks_per_req,
         D=D,
         GROUP=group,
         Q_PER_KV=_qpk,
@@ -838,7 +836,6 @@ def kvarn_decode_attention(
                 mid_O.stride(0),
                 mid_O.stride(1),
                 mid_lse.stride(0),
-                MAX_BLOCKS_PER_REQ=max_blocks_per_req,
                 D=D,
                 GROUP=group,
                 BLOCK_N=_bn,
@@ -925,7 +922,7 @@ def kvarn_decode_attention(
             impl._tail_K_stride2,
             K_packed.stride(0),
             K_packed.stride(1),
-            MAX_BLOCKS_PER_REQ=max_blocks_per_req,
+            max_blocks_per_req,
             D=D,
             GROUP=group,
             K_BITS=cfg.key_bits,
@@ -1055,7 +1052,6 @@ def kvarn_verify_attention(
     _qpk_pad = 1 << (_qpk - 1).bit_length() if _qpk > 1 else 1
 
     common = dict(
-        MAX_BLOCKS_PER_REQ=max_ctx_blocks,
         D=D,
         GROUP=group,
         Q_PER_KV=_qpk,
@@ -1136,7 +1132,6 @@ def _kvarn_fused_verify_stage1(
     stride_mo_n,
     stride_mo_s,
     stride_ml_n,
-    MAX_BLOCKS_PER_REQ: tl.constexpr,
     D: tl.constexpr,
     GROUP: tl.constexpr,
     BLOCK_N: tl.constexpr,
