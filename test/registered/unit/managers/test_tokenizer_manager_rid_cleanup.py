@@ -14,7 +14,7 @@ Covers:
 
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
 
@@ -137,6 +137,10 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     tm.dump_requests_folder = ""
     tm.crash_dump_folder = ""
     tm.send_to_scheduler = MagicMock()
+    # _dispatch_to_scheduler stamps IPC metadata when tokenizer_ipc_name is
+    # set; the mock bypasses __init__ so provide the attribute. None skips
+    # the stamping branch entirely.
+    tm.tokenizer_ipc_name = None
     return tm
 
 
@@ -488,6 +492,153 @@ class TestDiscardPendingReqStates(CustomTestCase):
         obj.rid = ["p1", "already_gone"]
         tm._discard_pending_req_states(obj)  # must not raise
         self.assertNotIn("p1", tm.rid_to_state)
+
+
+def _sent_scheduler_objects(tm) -> list:
+    """Objects dispatched to the scheduler mock.
+
+    _dispatch_to_scheduler -> sock_send -> socket.send_pyobj/socket.send, so
+    the payload lands on a child mock of send_to_scheduler. Check both.
+    """
+    sent = []
+    for call in tm.send_to_scheduler.send_pyobj.call_args_list:
+        sent.append(call.args[0])
+    for call in tm.send_to_scheduler.send.call_args_list:
+        sent.append(call.args[0])
+    return sent
+
+
+class TestAbortAndDiscardPendingReqStates(CustomTestCase):
+    """Tests for _abort_and_discard_pending_req_states.
+
+    Regression coverage: a client disconnect mid-stream cancels the streaming
+    generator and lands in generate_request's `except BaseException` teardown.
+    If the request was already dispatched to the scheduler, the cleanup must
+    arm an abort BEFORE popping rid_to_state -- otherwise abort_request()'s
+    rid-missing guard swallows the abort and the scheduler generates to
+    completion for a dead client (orphaned decode).
+    """
+
+    def test_abort_dispatched_before_state_pop_single(self):
+        tm = _make_tokenizer_manager(self)
+        rid = "a_single"
+        tm.rid_to_state[rid] = _make_req_state(rid)
+        obj = Mock(spec=GenerateReqInput)
+        obj.is_single = True
+        obj.rid = rid
+        tm._abort_and_discard_pending_req_states(obj)
+
+        # State popped...
+        self.assertNotIn(rid, tm.rid_to_state)
+        # ...and an AbortReq dispatched to the scheduler for the rid.
+        sent = _sent_scheduler_objects(tm)
+        self.assertEqual(len(sent), 1)
+        abort = sent[0]
+        self.assertIsInstance(abort, AbortReq)
+        self.assertEqual(abort.rid, rid)
+        self.assertFalse(abort.abort_all)
+
+    def test_abort_dispatched_before_state_pop_batch(self):
+        tm = _make_tokenizer_manager(self)
+        rids = ["a0", "a1", "a2"]
+        for r in rids:
+            tm.rid_to_state[r] = _make_req_state(r)
+        obj = Mock(spec=GenerateReqInput)
+        obj.is_single = False
+        obj.rid = list(rids)
+        tm._abort_and_discard_pending_req_states(obj)
+
+        for r in rids:
+            self.assertNotIn(r, tm.rid_to_state)
+        sent_rids = [
+            o.rid for o in _sent_scheduler_objects(tm) if isinstance(o, AbortReq)
+        ]
+        self.assertEqual(sorted(sent_rids), sorted(rids))
+
+    def test_abort_skips_already_removed_rids(self):
+        """Rids with no state (never dispatched / already finished) are skipped
+        and must not raise."""
+        tm = _make_tokenizer_manager(self)
+        tm.rid_to_state["a1"] = _make_req_state("a1")
+        obj = Mock(spec=GenerateReqInput)
+        obj.is_single = False
+        obj.rid = ["a1", "never_existed"]
+        tm._abort_and_discard_pending_req_states(obj)  # must not raise
+
+        self.assertNotIn("a1", tm.rid_to_state)
+        sent_rids = [o.rid for o in _sent_scheduler_objects(tm)]
+        self.assertEqual(sent_rids, ["a1"])
+
+    def test_no_abort_when_no_state(self):
+        """Nothing dispatched when there is nothing to clean up."""
+        tm = _make_tokenizer_manager(self)
+        obj = Mock(spec=GenerateReqInput)
+        obj.is_single = True
+        obj.rid = "ghost"
+        tm._abort_and_discard_pending_req_states(obj)
+        self.assertEqual(_sent_scheduler_objects(tm), [])
+
+    def test_generate_request_teardown_aborts_dispatched_request(self):
+        """End-to-end: generate_request cancelled mid-stream (client disconnect)
+        must dispatch an AbortReq for the in-flight rid."""
+        tm = _make_tm_for_generate(self)
+        rid = "cancel_mid_stream"
+        obj = _make_generate_obj(rid, is_single=True)
+        # Simulate a request that was tokenized+dispatched and is now waiting:
+        # state exists, and _wait_one_response would block until cancelled.
+        obj.normalize_batch_and_arguments = Mock()
+
+        async def drive():
+            async def never_yields():
+                # Stand-in for the post-dispatch wait: block until cancelled.
+                await asyncio.Event().wait()
+                yield  # pragma: no cover
+
+            # _send_one_request mutates the tokenized obj (time_stats, pickle
+            # wrapping) on objects this harness cannot fully construct, so
+            # stub it and record the dispatch the same way sock_send would.
+            # Note: do NOT pre-populate rid_to_state here -- generate_request
+            # calls _init_req_state itself and would reject a duplicate rid.
+            dispatches: list = []
+            with patch.object(
+                TokenizerManager,
+                "_tokenize_one_request",
+                new=AsyncMock(return_value=MagicMock()),
+            ), patch.object(
+                TokenizerManager,
+                "_send_one_request",
+                new=lambda self, tok: dispatches.append(tok),
+            ), patch.object(
+                TokenizerManager,
+                "_wait_one_response",
+                new=lambda self, o, r: never_yields(),
+            ):
+                gen = tm.generate_request(obj, None)
+                task = asyncio.create_task(gen.__anext__())
+                # Let the generator reach the blocked wait.
+                await asyncio.sleep(0.05)
+                self.assertTrue(dispatches)  # dispatched to the scheduler
+                # Client disconnect == cancel the consuming task.
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                # Give the except-handler a chance to run.
+                await asyncio.sleep(0)
+                # The orphan-prevention contract: abort went to the scheduler.
+                aborts = [
+                    o
+                    for o in _sent_scheduler_objects(tm)
+                    if isinstance(o, AbortReq)
+                ]
+                self.assertEqual(
+                    len(aborts),
+                    1,
+                    "mid-flight cancellation must dispatch an AbortReq",
+                )
+                self.assertEqual(aborts[0].rid, rid)
+                self.assertNotIn(rid, tm.rid_to_state)
+
+        asyncio.run(drive())
 
 
 class TestParallelStreamTaskCleanup(CustomTestCase):

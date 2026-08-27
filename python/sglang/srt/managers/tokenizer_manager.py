@@ -829,7 +829,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # request -- would otherwise leak those entries forever. Drop any that
             # are still pending; entries already removed on the normal completion
             # path are left untouched (pop is a no-op).
-            self._discard_pending_req_states(obj)
+            #
+            # CRITICAL: if the request was already dispatched to the scheduler
+            # (e.g. the streaming consumer task is cancelled by a client
+            # disconnect after headers/first token, or any mid-flight
+            # CancelledError), the scheduler is still actively generating for a
+            # request nobody is waiting on. The create_abort_task() background
+            # task cannot save it: it fires ~2s later, sees the rid already
+            # removed from rid_to_state, and abort_request() early-returns --
+            # so the abort never reaches the scheduler and the request runs to
+            # completion as an orphan (wasted decode, blocked TTFT for the next
+            # request, "state was deleted in TokenizerManager" log spam).
+            # Dispatch an explicit abort for every rid that still has state
+            # BEFORE discarding, so the scheduler stops generating and releases
+            # KV/mamba resources. abort_request() is a no-op for rids that were
+            # never dispatched or already completed.
+            self._abort_and_discard_pending_req_states(obj)
             raise
 
     def _detect_input_format(
@@ -3418,9 +3433,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _discard_pending_req_states(self, obj):
         """Drop rid_to_state entries created by _init_req_state for *obj*.
 
-        Safe to call after a partial/failed dispatch: only entries still present
-        are removed, and the scheduler-response path looks up state with
-        ``.get(...)`` so a later output for a discarded rid is ignored, not fatal.
+        Retained for callers that only need state cleanup (never dispatched to
+        the scheduler). The generate_request exception path must use
+        _abort_and_discard_pending_req_states instead: a request that already
+        reached the scheduler keeps generating until it receives an abort.
         """
         if not hasattr(obj, "is_single") or obj.is_single:
             rids = [obj.rid]
@@ -3428,6 +3444,32 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             rids = obj.rid
         for rid in rids:
             self.rid_to_state.pop(rid, None)
+
+    def _abort_and_discard_pending_req_states(self, obj):
+        """Abort in-flight scheduler work, then drop rid_to_state for *obj*.
+
+        Called from generate_request's exception path, which fires both for
+        failures before dispatch AND for mid-flight generator teardown (client
+        disconnect cancels the streaming response task; CancelledError
+        propagates here). For an already-dispatched request the scheduler keeps
+        generating until an abort arrives, so pop the state only after arming
+        the abort: abort_request() checks rid_to_state to suppress duplicate
+        aborts for unknown rids, therefore the state entry must still exist
+        when it is called. The abort is fire-and-forget on the ZMQ control
+        path -- it cannot fail the in-progress teardown. Requests that were
+        never dispatched, already finished, or already removed by the normal
+        completion path are no-ops by construction.
+        """
+        if not hasattr(obj, "is_single") or obj.is_single:
+            rids = [obj.rid]
+        else:
+            rids = obj.rid
+        for rid in rids:
+            if rid in self.rid_to_state:
+                # Abort while the state entry still exists so the guard in
+                # abort_request() does not silently drop the abort message.
+                self.abort_request(rid)
+                self.rid_to_state.pop(rid, None)
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
