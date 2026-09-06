@@ -1132,6 +1132,11 @@ class Envs:
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
+    # Enable custom all-reduce (v1 and v2) on PCIe-only P2P GPUs, bypassing
+    # the NVLink requirement. Requires a driver with working BAR1 P2P
+    # (e.g. aikitoria RMForceP2PType=1). v2 additionally swaps
+    # _SymmetricMemory for cudaIpc handles and uses a store-based barrier.
+    SGLANG_FORCE_PCIE_P2P_ALLREDUCE = EnvBool(False)
 
     # ===================================================================
     # RoPE cache

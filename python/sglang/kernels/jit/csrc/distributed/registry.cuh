@@ -27,8 +27,10 @@ PushPlaneObj::PushPlaneObj(
       workspaces{},
       mc_workspace() {
   CHECK_HOST(workspaces.size() == world_size) << "Bad push workspace count";
-  // Shared symbolic sizes and device enforce consistency across ranks; the
+  // Shared symbolic sizes enforce consistency across ranks; the
   // matchers also require contiguity (no strides given) and uint8 dtype.
+  // Device check is skipped for workspaces: on PCIe P2P, IPC handles
+  // from peer ranks report a different CUDA device than the local rank.
   auto N = SymbolicSize{"slot_bytes"};
   auto M = SymbolicSize{"num_blocks"};
   auto device_sym = SymbolicDevice{};
@@ -36,7 +38,6 @@ PushPlaneObj::PushPlaneObj(
   for (uint32_t i = 0; i < world_size; ++i) {
     TensorMatcher({2 * world_size, N})  //
         .with_dtype<uint8_t>()
-        .with_device(device_sym)
         .verify(workspaces[i]);
   }
   TensorMatcher({M, static_cast<int64_t>(sizeof(Counter))})  //
@@ -72,19 +73,17 @@ PullPlaneObj::PullPlaneObj(
   CHECK_HOST(workspaces.size() == world_size) << "Bad pull workspace count";
   CHECK_HOST(semaphores.size() == world_size) << "Bad pull semaphore count";
   // Either half may be empty (a 0-element tensor); the halves a caller does
-  // own still have to agree on size and device across ranks.
+  // own still have to agree on size across ranks.
+  // Device check is skipped for workspaces and semaphores: on PCIe P2P,
+  // IPC handles from peer ranks report a different CUDA device.
   auto N = SymbolicSize{"num_bytes"};
   auto M = SymbolicSize{"num_blocks"};
-  auto device_sym = SymbolicDevice{};
-  device_sym.set_options<kDLCUDA>();
   for (uint32_t i = 0; i < world_size; ++i) {
     TensorMatcher({N})  //
         .with_dtype<uint8_t>()
-        .with_device(device_sym)
         .verify(workspaces[i]);
     TensorMatcher({M, static_cast<int64_t>(sizeof(Semaphore))})  //
         .with_dtype<uint8_t>()
-        .with_device(device_sym)
         .verify(semaphores[i]);
   }
   CHECK_HOST(N.unwrap() > 0 || M.unwrap() > 0) << "A pull plane with neither workspaces nor semaphores is useless";

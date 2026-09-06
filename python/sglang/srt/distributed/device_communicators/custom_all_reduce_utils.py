@@ -486,10 +486,14 @@ def can_use_custom_all_reduce_with_nvlink(
     physical_device_ids = [int(t) for t in gather_list]
     full_nvlink = is_full_nvlink(physical_device_ids, world_size)
 
+    # SGLANG_FORCE_PCIE_P2P_ALLREDUCE: allow custom all-reduce on PCIe-only GPUs
+    # when P2P is verified to work (e.g. aikitoria driver + large BAR1).
+    force_pcie_p2p = sglang_envs.SGLANG_FORCE_PCIE_P2P_ALLREDUCE.get()
+
     # test nvlink first, this will filter out most of the cases
     # where custom allreduce is not supported
     # this checks hardware and driver support for NVLink
-    if world_size > 2 and not full_nvlink:
+    if world_size > 2 and not full_nvlink and not force_pcie_p2p:
         logger.warning(
             f"{cls_name} is disabled because it's not supported on"
             " more than two PCIe-only GPUs. To silence this warning, "
@@ -508,6 +512,16 @@ def can_use_custom_all_reduce_with_nvlink(
             "warning, specify disable_custom_all_reduce=True explicitly."
         )
         return
+
+    # When force_pcie_p2p is set and P2P works, return True so the kernel
+    # uses 1-stage reduce (same as full_nvlink path) which is the correct
+    # behavior for direct P2P loads via BAR1.
+    if force_pcie_p2p and not full_nvlink:
+        logger.info(
+            f"{cls_name}: PCIe P2P forced on (SGLANG_FORCE_PCIE_P2P_ALLREDUCE=1). "
+            "Custom all-reduce will use 1-stage kernel for direct P2P."
+        )
+        return True
 
     return full_nvlink
 

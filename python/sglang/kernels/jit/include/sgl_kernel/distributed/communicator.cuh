@@ -41,35 +41,71 @@ struct Counter {
   uint32_t m_counter;
 };
 
-/// One block's arrival slot: a flag peers increment plus a phase counter.
-/// Padded to a cache line so neighbouring blocks never share one.
+/// One block's arrival slot, PCIe-P2P edition: per-writer signal words plus a
+/// local window counter. Padded to a cache line so neighbouring blocks never
+/// share one.
+///
+/// The original NVLink design incremented the peer's flag with a remote
+/// `red.add` (atomic RMW). On PCIe BAR1 P2P mappings (aikitoria RMForceP2PType
+/// driver) a remote RMW may never complete, deadlocking the barrier. This
+/// version uses the v1 `CustomAllreduce` protocol instead: each writer stores
+/// a monotonically increasing wave number into its own slot with a plain
+/// `st.release.sys`, and the poller checks every slot with `ld.acquire.sys`.
+/// All ranks' window counters advance in lockstep (each kernel launch
+/// reserves `num_arrives * kWorldSize` on every rank), so the wave number is
+/// globally consistent and monotonicity makes the poll ABA-free without
+/// double buffering.
 struct alignas(128) Semaphore {
  public:
   Semaphore(const Semaphore&) = delete;
   SGL_DEVICE Counter* counter_ptr() {
     return &m_counter;
   }
-  SGL_DEVICE uint32_t get_relaxed() const {
-    return ptx::load_relaxed_sys(&m_flag);
+
+  /// Writer side: publish `wave` into this semaphore's slot owned by `src`.
+  /// Plain store; no remote RMW.
+  SGL_DEVICE void put_relaxed(uint32_t src, uint32_t wave) {
+    ptx::store_relaxed_sys(&m_slot[src], wave);
   }
-  SGL_DEVICE void put_relaxed() {
-    ptx::red_add_relaxed_sys(&m_flag, 1);
+  SGL_DEVICE void put_release(uint32_t src, uint32_t wave) {
+    ptx::store_release_sys(&m_slot[src], wave);
   }
+
+  /// Poller side: true once every rank's slot has reached `wave`.
+  /// `world_size` is runtime (McBarrier callers pass a variable).
+  /// The comparison is modular ("slot is not behind wave") so a 32-bit wave
+  /// number that wraps after ~4B barriers degrades no differently than the
+  /// original subtraction-based `red.add` protocol.
+  SGL_DEVICE bool all_relaxed(uint32_t world_size, uint32_t wave) const {
+    for (uint32_t r = 0; r < world_size; ++r) {
+      if ((uint32_t)(ptx::load_relaxed_sys(&m_slot[r]) - wave) >= 0x80000000u) return false;
+    }
+    return true;
+  }
+  SGL_DEVICE void wait_all_acquire(uint32_t world_size, uint32_t wave) const {
+    for (uint32_t r = 0; r < world_size; ++r) {
+      while ((uint32_t)(ptx::load_acquire_sys(&m_slot[r]) - wave) >= 0x80000000u) {
+      }
+    }
+  }
+
+  // ---- multicast variants: unchanged protocol, NVLS only ----------------
   SGL_DEVICE void put_relaxed_multicast() {
     ptx::multimem_red_add_relaxed(&m_flag, 1);
-  }
-  SGL_DEVICE uint32_t get_acquire() const {
-    return ptx::load_acquire_sys(&m_flag);
-  }
-  SGL_DEVICE void put_release() {
-    ptx::red_add_release_sys(&m_flag, 1);
   }
   SGL_DEVICE void put_release_multicast() {
     ptx::multimem_red_add_release(&m_flag, 1);
   }
+  SGL_DEVICE uint32_t get_relaxed_multicast() const {
+    return ptx::load_relaxed_sys(&m_flag);
+  }
+  SGL_DEVICE uint32_t get_acquire_multicast() const {
+    return ptx::load_acquire_sys(&m_flag);
+  }
 
  private:
-  uint32_t m_flag;
+  uint32_t m_flag;  // multicast-mode accumulated flag (NVLS only)
+  uint32_t m_slot[kMaxWorldSize];
   Counter m_counter;
 };
 static_assert(sizeof(Semaphore) == 128, "must match _SEMAPHORE_BYTES in custom_all_reduce_v2.py");
@@ -159,29 +195,44 @@ template <uint32_t kWorldSize>
 struct Barrier {
  public:
   SGL_DEVICE Barrier(Semaphore* const* semaphores, uint32_t rank, uint32_t num_arrives)
-      : m_counter(0), m_rank(rank), m_semaphores(semaphores) {
+      : m_rank(rank), m_semaphores(semaphores) {
+    // Reserve the window for this kernel launch. Every rank advances its own
+    // counter by `num_arrives * kWorldSize` per launch, so counters are in
+    // lockstep across ranks and `base / kWorldSize` is a globally consistent
+    // wave index. The single-thread value is broadcast through shared memory
+    // because every writer thread needs it, not just the poller.
+    __shared__ uint32_t s_base;
     const auto counter = semaphores[rank][blockIdx.x].counter_ptr();
     const auto signal = num_arrives * kWorldSize;
-    m_counter = threadIdx.x == rank ? counter->inc(signal) : 0;
+    if (threadIdx.x == rank) {
+      s_base = counter->inc(signal);
+    }
+    __syncthreads();
+    m_counter = s_base;
   }
 
+  /// PCIe-P2P-safe arrival. Each writer stores `wave + 1` (a monotonically
+  /// increasing wave number) into every peer's per-writer slot with a plain
+  /// store — no remote RMW, which may never complete over BAR1 P2P — and the
+  /// poller waits until every slot has reached `wave + 1`. Monotonic values
+  /// make the poll late-exit-safe (no ABA), so no double-buffering is needed.
   template <bool kNeedFence>
   SGL_DEVICE void arrive(uint32_t n) const {
     if (const auto tx = threadIdx.x; tx < kWorldSize) {
       const auto bx = blockIdx.x;
       const auto semaphore = &m_semaphores[tx][bx];
-      const auto current = m_counter + n * kWorldSize;
+      const uint32_t wave = m_counter / kWorldSize + n + 1;
       if constexpr (kNeedFence) {
-        semaphore->put_release();
-        if (tx == m_rank) {
-          while (semaphore->get_acquire() - current < kWorldSize)
-            ;
-        }
+        semaphore->put_release(m_rank, wave);
       } else {
-        semaphore->put_relaxed();
-        if (tx == m_rank) {
-          while (semaphore->get_relaxed() - current < kWorldSize)
-            ;
+        semaphore->put_relaxed(m_rank, wave);
+      }
+      if (tx == m_rank) {
+        if constexpr (kNeedFence) {
+          semaphore->wait_all_acquire(kWorldSize, wave);
+        } else {
+          while (!semaphore->all_relaxed(kWorldSize, wave)) {
+          }
         }
       }
     }
@@ -293,11 +344,11 @@ struct McBarrier {
     const auto mc_semaphore = &mc[bx];
     if constexpr (kNeedFence) {
       mc_semaphore->put_release_multicast();
-      while (semaphore->get_acquire() - window < world_size)
+      while (semaphore->get_acquire_multicast() - window < world_size)
         ;
     } else {
       mc_semaphore->put_relaxed_multicast();
-      while (semaphore->get_relaxed() - window < world_size)
+      while (semaphore->get_relaxed_multicast() - window < world_size)
         ;
     }
   }

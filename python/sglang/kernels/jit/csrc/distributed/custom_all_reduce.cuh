@@ -159,7 +159,10 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllR
     Lamport::clear_pos_zero(vec.data());
 #pragma unroll
     for (uint32_t i = 0; i < kWorldSize; ++i) {
-      ptx::st_relaxed_16B(vec, push_ptrs[i], vid);
+      // release: payload (with markers cleared) must be visible to the
+      // peer's poll loop before the marker word itself, on links without
+      // hardware cache coherence (PCIe BAR1 P2P)
+      ptx::st_release_16B(vec, push_ptrs[i], vid);
     }
   }
 
@@ -178,7 +181,9 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_push_kernel(const __grid_constant__ AllR
       bool has_zero = false;
 #pragma unroll
       for (uint32_t i = 0; i < kWorldSize; ++i) {
-        ptx::ld_relaxed_16B(vec[i], poll_ptrs[i], vid);
+        // acquire: the peer's payload is ordered with the marker word on
+        // links without hardware cache coherence (PCIe BAR1 P2P)
+        ptx::ld_acquire_16B(vec[i], poll_ptrs[i], vid);
       }
 #pragma unroll
       for (uint32_t i = 0; i < kWorldSize; ++i) {
@@ -212,7 +217,7 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_pull_kernel(const __grid_constant__ AllR
       params.rank,
       /*num_arrives=*/2,
   };
-  barrier.arrive_relaxed(/*n=*/0);
+  barrier.arrive_rel_acq(/*n=*/0);
   __syncthreads();
 
   const auto num_threads = blockDim.x * gridDim.x;
@@ -225,7 +230,7 @@ ALL_REDUCE_KERNEL void all_reduce_1shot_pull_kernel(const __grid_constant__ AllR
 
   PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
-  barrier.arrive_relaxed(/*n=*/1);
+  barrier.arrive_rel_acq(/*n=*/1);
 }
 
 template <typename Impl, typename T, uint32_t kWorldSize, bool kUsePDL>
@@ -245,7 +250,7 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_pull_kernel(const __grid_constant__ AllR
       params.rank,
       /*num_arrives=*/2,
   };
-  barrier.arrive_relaxed(/*n=*/0);
+  barrier.arrive_rel_acq(/*n=*/0);
   __syncthreads();
 
   const auto num_threads = blockDim.x * gridDim.x;

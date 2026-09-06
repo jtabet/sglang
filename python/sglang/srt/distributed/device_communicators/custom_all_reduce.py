@@ -33,6 +33,9 @@ from sglang.srt.utils import (
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_musa = is_musa()
+# PCIe-only P2P gate: resolved once at import; the env var does not change
+# at runtime and this file sits on the per-layer hot path.
+_FORCE_PCIE_P2P = envs.SGLANG_FORCE_PCIE_P2P_ALLREDUCE.get()
 
 logger = logging.getLogger(__name__)
 
@@ -270,6 +273,8 @@ class CustomAllreduce:
         # little performance improvement over NCCL.
         if not _is_hip:
             if self.world_size == 2 or self.full_nvlink:
+                return inp_size <= self.max_size
+            if _FORCE_PCIE_P2P:
                 return inp_size <= self.max_size
             return False
 

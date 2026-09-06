@@ -81,6 +81,12 @@ def _ceil_align(nbytes: int, align: int) -> int:
 
 
 def _allocate_symmetric_memory(nbytes: int, device: torch.device, group: ProcessGroup):
+    """Allocate symmetric memory via _SymmetricMemory (NVLink/VMM path).
+
+    This is the original path used when NVLink fabric or CUDA VMM
+    expandable-segments are available. On PCIe-only P2P systems the
+    rendezvous hangs, so callers should use _allocate_ipc_memory instead.
+    """
     from torch._C._distributed_c10d import _SymmetricMemory
 
     if torch.__version__ < "2.11.0":
@@ -96,6 +102,102 @@ def _allocate_symmetric_memory(nbytes: int, device: torch.device, group: Process
     )
     symm_mem = _SymmetricMemory.rendezvous(tensor)
     return tensor, symm_mem
+
+
+class _IPCSymmetricMemory:
+    """Drop-in replacement for _SymmetricMemory using cudaIpc handles.
+
+    Allocates one buffer per rank via cudaMalloc, exchanges IPC handles
+    across ranks, and opens peer handles to obtain raw device pointers.
+    Provides the same get_buffer(i, ...) and multicast_ptr interface that
+    _init_workspace expects, but without requiring CUDA VMM or NVLink.
+    """
+
+    def __init__(self, local_tensor, peer_tensors, rank, world_size):
+        self._local_tensor = local_tensor
+        self._peer_tensors = peer_tensors  # list of torch.uint8 tensors, one per rank
+        self.rank = rank
+        self.world_size = world_size
+        self.multicast_ptr = 0  # no NVLink multicast on PCIe P2P
+
+    def get_buffer(self, rank, shape, dtype):
+        nbytes = 1
+        for s in shape:
+            nbytes *= s
+        return self._peer_tensors[rank][:nbytes].view(shape)
+
+
+def _allocate_ipc_memory(nbytes: int, device: torch.device, group: ProcessGroup):
+    """Allocate per-rank buffers and exchange via cudaIpc handles.
+
+    Replacement for _allocate_symmetric_memory on systems where the CUDA
+    VMM / _SymmetricMemory.rendezvous() path is unavailable (e.g. PCIe P2P
+    with the aikitoria driver). Uses the same cudaIpcGetMemHandle /
+    cudaIpcOpenMemHandle mechanism as the v1 CustomAllreduce.
+    """
+    import ctypes
+    from sglang.srt.distributed.device_communicators.cuda_wrapper import (
+        CudaRTLibrary,
+        cudaIpcMemHandle_t,
+    )
+
+    rank = dist.get_rank(group=group)
+    world_size = dist.get_world_size(group=group)
+
+    lib = CudaRTLibrary()
+    # Allocate the local slab with a raw cudaMalloc on our device — the
+    # same pattern as v1's create_shared_buffer. A raw allocation (not a
+    # caching-allocator tensor) is what cudaIpcGetMemHandle requires: the
+    # exported handle must name the exact base of a cudaMalloc'd block, and
+    # caching-allocator blocks can be shared by many live tensors.
+    device_idx = device.index if device.index is not None else torch.cuda.current_device()
+    lib.cudaSetDevice(device_idx)
+    local_ptr = lib.cudaMalloc(nbytes)
+    local_tensor = torch._from_blob(
+        ctypes.cast(local_ptr, ctypes.c_void_p).value,
+        (nbytes,),
+        dtype=torch.uint8,
+        device=device,
+    )
+    # Keep the allocation alive as long as the tensor: _from_blob does not
+    # own the memory, and the IPC mapping is freed via cudaIpcCloseMemHandle
+    # only when the owning context drops it.
+    local_tensor._cuda_malloc_lib = lib  # type: ignore[attr-defined]
+
+    # Get IPC handle for our buffer
+    handle = lib.cudaIpcGetMemHandle(local_ptr)
+
+    # Exchange handles across all ranks — same pattern as v1's
+    # create_shared_buffer: dist.all_gather_object can pickle the ctypes
+    # cudaIpcMemHandle_t struct.
+    handles: list = [None] * world_size
+    dist.all_gather_object(handles, handle, group=group)
+
+    # Open peer handles and build per-rank tensor views.
+    # Each rank i allocated on cuda:i (no CUDA_VISIBLE_DEVICES remapping).
+    # cudaIpcOpenMemHandle maps the peer's allocation into our address
+    # space, but the pointer's device attribute reports the *original*
+    # device (cuda:i). We pass the peer's device to torch._from_blob so
+    # it passes its device check; the workspace tensors are consumed as
+    # raw pointers by the planes, which no longer enforce a single device
+    # (registry.cuh skips the device check for IPC workspaces).
+    peer_tensors: List[torch.Tensor] = []
+    for i in range(world_size):
+        if i == rank:
+            peer_tensors.append(local_tensor)
+        else:
+            peer_handle = handles[i]
+            peer_ptr = lib.cudaIpcOpenMemHandle(peer_handle)
+            ptr_val = ctypes.cast(peer_ptr, ctypes.c_void_p).value
+            peer_device = torch.device(f"cuda:{i}")
+            peer_tensor = torch._from_blob(
+                ptr_val, (nbytes,), dtype=torch.uint8, device=peer_device,
+            )
+            peer_tensor._cuda_malloc_lib = lib  # type: ignore[attr-defined]
+            peer_tensors.append(peer_tensor)
+
+    symm_mem = _IPCSymmetricMemory(local_tensor, peer_tensors, rank, world_size)
+    return local_tensor, symm_mem
 
 
 class AllReduceConfig(NamedTuple):
@@ -231,9 +333,16 @@ class CustomAllReduceV2:
         pull_offset = push_bytes
         sem_offset = push_bytes + pull_bytes
 
-        self._symm_tensor, symm_mem = _allocate_symmetric_memory(
-            total_bytes, device=self.device, group=self.group
-        )
+        # PCIe-only P2P systems use cudaIpc handles instead of
+        # _SymmetricMemory/VMM, whose rendezvous may hang on such drivers.
+        if envs.SGLANG_FORCE_PCIE_P2P_ALLREDUCE.get():
+            self._symm_tensor, symm_mem = _allocate_ipc_memory(
+                total_bytes, device=self.device, group=self.group
+            )
+        else:
+            self._symm_tensor, symm_mem = _allocate_symmetric_memory(
+                total_bytes, device=self.device, group=self.group
+            )
         slabs = [
             symm_mem.get_buffer(i, [total_bytes], torch.uint8)
             for i in range(self.world_size)
@@ -486,6 +595,15 @@ def can_use_custom_all_reduce_v2(
     supported = get_supported_world_sizes()
     if dist.get_world_size(group=group) not in supported:
         return False
+    # When forcing PCIe P2P all-reduce, bypass the NVLink/VMM capability check
+    # and trust that the driver supports P2P (verified at startup).
+    if envs.SGLANG_FORCE_PCIE_P2P_ALLREDUCE.get():
+        logger.info(
+            "CustomAllReduceV2: PCIe P2P forced on "
+            "(SGLANG_FORCE_PCIE_P2P_ALLREDUCE=1). Using IPC handle-based "
+            "symmetric memory instead of _SymmetricMemory/VMM."
+        )
+        return True
     if not all(in_the_same_node_as(group, source_rank=0)):
         return is_one_nvlink_clique(group, device) and _is_vmm_backed_allocator(device)
     full_nvlink = can_use_custom_all_reduce_with_nvlink(

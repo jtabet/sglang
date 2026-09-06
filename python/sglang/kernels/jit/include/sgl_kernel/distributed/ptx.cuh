@@ -88,6 +88,34 @@ SGL_DEVICE void st_relaxed_16B(const V& x, void* addr, int64_t vec_offset) {
                : "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w), "l"(addr));
 }
 
+/// Acquire/release 16B pair for the Lamport push protocol on links without
+/// hardware cache coherence (PCIe BAR1 P2P). The payload carries the
+/// synchronization (pos-zero markers), but the poll loop needs the acquire
+/// load to order the marker observation with the peer's payload, and the
+/// producer needs the release store to publish payload before marker. On
+/// NVLink these are equivalent to the relaxed pair; on PCIe P2P the relaxed
+/// pair can spin forever on a marker that is observed before its payload.
+template <typename V>
+SGL_DEVICE void ld_acquire_16B(V& x, const void* addr, int64_t vec_offset) {
+  static_assert(alignof(V) == 16 && sizeof(V) == 16);
+  addr = static_cast<const uint8_t*>(addr) + vec_offset * sizeof(V);
+  uint4 val;
+  asm volatile("ld.acquire.sys.global.v4.b32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
+               : "l"(addr));
+  x = *reinterpret_cast<const V*>(&val);
+}
+
+template <typename V>
+SGL_DEVICE void st_release_16B(const V& x, void* addr, int64_t vec_offset) {
+  static_assert(alignof(V) == 16 && sizeof(V) == 16);
+  const uint4 val = *reinterpret_cast<const uint4*>(&x);
+  addr = static_cast<uint8_t*>(addr) + vec_offset * sizeof(V);
+  asm volatile("st.release.sys.global.v4.b32 [%4], {%0, %1, %2, %3};"
+               :  //
+               : "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w), "l"(addr));
+}
+
 /// One load that sums the corresponding vector across every rank in the
 /// multicast team (NVLS). `mc_addr` must be a multicast VA.
 template <typename V>
@@ -178,6 +206,19 @@ SGL_DEVICE uint32_t load_acquire_sys(const uint32_t* ptr) {
   uint32_t val;
   asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(val) : "l"(ptr) : "memory");
   return val;
+}
+
+/// Plain relaxed store of a peer-visible flag. Unlike `red`, a plain store
+/// requires no read-modify-write at the peer: it works on PCIe BAR1 P2P
+/// mappings where remote atomics may not complete.
+SGL_DEVICE void store_relaxed_sys(uint32_t* ptr, uint32_t val) {
+  asm volatile("st.relaxed.sys.global.u32 [%0], %1;" : : "l"(ptr), "r"(val) : "memory");
+}
+
+/// Plain store of a peer-visible flag that also publishes every prior write
+/// to system scope (v1 `st_flag_release` equivalent).
+SGL_DEVICE void store_release_sys(uint32_t* ptr, uint32_t val) {
+  asm volatile("st.release.sys.global.u32 [%0], %1;" : : "l"(ptr), "r"(val) : "memory");
 }
 
 /// Peer-visible flag increment. Relaxed: ordering is established by the
