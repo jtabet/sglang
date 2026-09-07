@@ -1,0 +1,5 @@
+FROM jtabet/sglang:kvarn-latest
+
+# Update Python source in-place (editable install — no recompile needed)
+COPY python/ /sgl-workspace/sglang/python/
+COPY test/ /sgl-workspace/sglang/test/

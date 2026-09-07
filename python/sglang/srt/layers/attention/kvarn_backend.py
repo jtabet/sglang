@@ -47,8 +47,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Number of sink blocks (first pages) kept in fp16 tail pool, never flushed.
-# Default: 1 sink block = first page.
-KVaRN_SINK_BLOCKS = 1
+# Default: 4 sink blocks = first 4 pages (256 tokens at group=64).
+# Keeping the first 256 tokens in fp16 prevents the model from losing track
+# of the system prompt and tool schemas at high context lengths (220k+),
+# which was the root cause of reasoning loops (repeating the same word).
+# The fp16 sink preserves full-precision attention to early context that
+# the model attends to most frequently ("sink attention" effect).
+KVaRN_SINK_BLOCKS = 4
 
 
 class KVarNAttnBackend(AttentionBackend):

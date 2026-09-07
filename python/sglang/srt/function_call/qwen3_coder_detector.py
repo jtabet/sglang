@@ -57,8 +57,40 @@ class Qwen3CoderDetector(BaseFormatDetector):
         # Initialize attributes that were missing in the original PR
         self.current_func_name: Optional[str] = None
 
+    # Known closing-token variants that models emit instead of the
+    # canonical </parameter> / </function> / </invoke>. When the
+    # model omits a closing tag or uses a variant, the regex-based parser
+    # pulls the variant text into the parameter value. We strip these
+    # so type conversion (especially boolean) doesn't see garbage.
+    _LEAKED_CLOSING_TAGS = (
+        "</invoke>",
+        "</result>",
+        "</parameter>",
+        "</function>",
+        "</tool_call>",
+    )
+
     def has_tool_call(self, text: str) -> bool:
-        return self.tool_call_start_token in text
+        return self.tool_call_start_token in text or self.tool_call_prefix in text
+
+    def _strip_leaked_closing_tags(self, value: str) -> str:
+        """Remove closing-tag variants that leak into parameter values when
+        the model omits </parameter> or uses a non-standard closing token.
+
+        Also strips a trailing newline left after removing the tag.
+        """
+        stripped = value
+        changed = True
+        while changed:
+            changed = False
+            for tag in self._LEAKED_CLOSING_TAGS:
+                if stripped.endswith(tag):
+                    stripped = stripped[: -len(tag)]
+                    changed = True
+        # Clean up trailing whitespace/newlines left behind
+        while stripped.endswith("\n") or stripped.endswith("\r"):
+            stripped = stripped[:-1]
+        return stripped
 
     def _get_arguments_config(
         self, func_name: str, tools: Optional[list[Tool]]
@@ -145,7 +177,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 )
             return param_value
         elif param_type in ["boolean", "bool", "binary"]:
-            param_value = param_value.lower()
+            param_value = param_value.strip().lower()
             if param_value not in ["true", "false"]:
                 logger.warning(
                     f"Parsed value '{param_value}' of parameter '{param_name}' is not a boolean (`true` of `false`) in tool '{func_name}', degenerating to false."
@@ -175,7 +207,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """One-shot parsing for non-streaming scenarios."""
-        if self.tool_call_start_token not in text:
+        if self.tool_call_start_token not in text and self.tool_call_prefix not in text:
             return StreamingParseResult(normal_text=text)
 
         calls = []
@@ -215,6 +247,11 @@ class Qwen3CoderDetector(BaseFormatDetector):
                             p_val = p_val[1:]
                         if p_val.endswith("\n"):
                             p_val = p_val[:-1]
+
+                        # Strip closing-tag variants that leaked into the
+                        # parameter value when the model omits </parameter>
+                        # or uses a non-standard closing token.
+                        p_val = self._strip_leaked_closing_tags(p_val)
 
                         parsed_params[p_name] = self._convert_param_value(
                             p_val, p_name, param_config, func_name
@@ -356,6 +393,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         param_config = self._get_arguments_config(
                             self.current_func_name, tools
                         )
+                        # Strip closing-tag variants that may have leaked
+                        # into the raw value (same fix as detect_and_parse).
+                        raw_value = self._strip_leaked_closing_tags(raw_value)
                         converted_val = self._convert_param_value(
                             raw_value, param_name, param_config, self.current_func_name
                         )
