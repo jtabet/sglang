@@ -399,6 +399,44 @@ class Qwen3Detector(BaseReasoningFormatDetector):
         )
 
 
+class Qwen3_8Detector(Qwen3Detector):
+    """Detector for Qwen3.8 models (e.g., Qwen/Qwen3.8-27B).
+
+    Identical to Qwen3Detector except it does NOT set tool_start_token.
+    Qwen3.8 properly closes its think tag before making tool calls, so
+    the tool_start_token interruption (added for Qwen3.5 models that
+    sometimes open tool calls without closing think) is unnecessary
+    and harmful: when the model writes about tool calls in its
+    reasoning, the sentinel triggers a false reasoning-to-content
+    switch, cutting the reasoning short and leaking the think-close
+    tag into content.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        think_excluded_tokens = [
+            "<|im_end|>",
+            "",
+        ]
+        super().__init__(
+            stream_reasoning=stream_reasoning,
+            force_reasoning=force_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
+        )
+        # Override: no tool_start_token. The parent constructor set it
+        # to the sentinel; we clear it so the streaming parser stays in
+        # reasoning mode even when the model writes about tool calls.
+        self.tool_start_token = None
+
+
 class KimiDetector(BaseReasoningFormatDetector):
     """
     Detector for Kimi Thinking model.
@@ -1896,6 +1934,7 @@ class ReasoningParser:
         "poolside_v1": _PoolsideV1Detector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
+        "qwen3_8": Qwen3_8Detector,
         "minimax": Qwen3Detector,
         "minimax-append-think": MiniMaxAppendThinkDetector,
         "minimax-m3": MiniMaxM3Detector,

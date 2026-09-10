@@ -1496,10 +1496,14 @@ class KVarNHostKVCache(HostKVCache):
             dtype=torch.long,
             device=device_indices.device,
         )
+        # kv_buffer lives on CPU (host memory pool). Index tensors for
+        # kv_buffer must be on CPU — using device_indices.device (GPU)
+        # causes "indices should be on the same device as the indexed
+        # tensor (cpu)" when saving tiles to host during eviction.
         host_page_ids = torch.tensor(
             [block_to_host_page[b] for b in unique_block_ids.tolist()],
             dtype=torch.long,
-            device=device_indices.device,
+            device=self.kv_buffer.device,
         )
 
         # Flush any blocks still in the tail pool to int4 so we copy compact tiles
@@ -1549,10 +1553,14 @@ class KVarNHostKVCache(HostKVCache):
             dtype=torch.long,
             device=device_indices.device,
         )
+        # kv_buffer lives on CPU (host memory pool). Index tensors for
+        # kv_buffer must be on CPU — using device_indices.device (GPU)
+        # causes "indices should be on the same device as the indexed
+        # tensor (cpu)" when loading tiles from host to GPU.
         host_page_ids = torch.tensor(
             [block_to_host_page[b] for b in unique_block_ids.tolist()],
             dtype=torch.long,
-            device=device_indices.device,
+            device=self.kv_buffer.device,
         )
 
         # Copy tiles from host to GPU

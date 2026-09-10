@@ -62,11 +62,20 @@ class Qwen3CoderDetector(BaseFormatDetector):
     # model omits a closing tag or uses a variant, the regex-based parser
     # pulls the variant text into the parameter value. We strip these
     # so type conversion (especially boolean) doesn't see garbage.
+    #
+    # The "</" prefix variants handle the full tag. The bare "parameter>"
+    # and "function>" variants handle the case where "</" is consumed by
+    # the regex as the start of the closing delimiter, but the remaining
+    # "parameter>" stays in the captured value — this happens when
+    # </parameter> is tokenized as 3 tokens ("</", "parameter", ">") and
+    # the parser's delimiter match consumes "</" but leaves "parameter>".
     _LEAKED_CLOSING_TAGS = (
         "</invoke>",
         "</result>",
         "</parameter>",
         "</function>",
+        "parameter>",
+        "function>",
         "</tool_call>",
     )
 
@@ -77,19 +86,25 @@ class Qwen3CoderDetector(BaseFormatDetector):
         """Remove closing-tag variants that leak into parameter values when
         the model omits </parameter> or uses a non-standard closing token.
 
-        Also strips a trailing newline left after removing the tag.
+        Also strips trailing whitespace/newlines left behind after removing
+        a tag. Strips whitespace before each tag check too, so that a
+        newline between the value and the leaked tag (e.g. "280\nparameter>")
+        doesn't prevent the tag from being matched.
         """
         stripped = value
         changed = True
         while changed:
             changed = False
+            # Strip trailing whitespace before checking for tags — a
+            # newline between the value and a leaked closing tag remnant
+            # (e.g. "280\nparameter>\n") would prevent the tag match.
+            while stripped.endswith("\n") or stripped.endswith("\r"):
+                stripped = stripped[:-1]
+                changed = True
             for tag in self._LEAKED_CLOSING_TAGS:
                 if stripped.endswith(tag):
                     stripped = stripped[: -len(tag)]
                     changed = True
-        # Clean up trailing whitespace/newlines left behind
-        while stripped.endswith("\n") or stripped.endswith("\r"):
-            stripped = stripped[:-1]
         return stripped
 
     def _get_arguments_config(
