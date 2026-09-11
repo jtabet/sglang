@@ -372,11 +372,44 @@ class KVarNAttnBackend(AttentionBackend):
             device=device,
         )
 
+        # Report real GPU memory usage through the NoOp pool so the metrics
+        # collector (kv_cache_memory_usage_gb) and load inquirer see the
+        # actual tail pool + int4 compressed cache footprint.  Without this,
+        # the NoOp pool reports 0.0 GB and ~9.65 GB of VRAM is invisible to
+        # monitoring.
+        GB = 1.0 / (1024**3)
+        tail_pool_bytes = (
+            self.pool_slots
+            * self.group
+            * self.num_kv_heads
+            * (self.head_dim + self.v_head_dim)
+            * 2  # fp16 = 2 bytes per element
+            * self.num_layers
+        )
+        int4_cache_bytes = (
+            self.num_blocks * tile_bytes * self.num_kv_heads * self.num_layers
+        )
+        # Also account for the pre-allocated rotation/attention scratch buffers.
+        scratch_bytes = (
+            self._k_rot_scratch.numel() * self._k_rot_scratch.element_size()
+            + self._v_rot_scratch.numel() * self._v_rot_scratch.element_size()
+            + self._q_rot_fp16_buf.numel() * self._q_rot_fp16_buf.element_size()
+            + self._fused_out_buf.numel() * self._fused_out_buf.element_size()
+            + self._mid_o_buf.numel() * self._mid_o_buf.element_size()
+            + self._mid_lse_buf.numel() * self._mid_lse_buf.element_size()
+            + self._H_fp16.numel() * self._H_fp16.element_size()
+        )
+        total_bytes = tail_pool_bytes + int4_cache_bytes + scratch_bytes
+        if hasattr(self.token_to_kv_pool, "mem_usage"):
+            self.token_to_kv_pool.mem_usage = total_bytes * GB
+
         logger.info(
             f"KVarN pools allocated: tail_pool_slots={self.pool_slots}, "
             f"compressed_blocks={self.num_blocks}, "
-            f"tail_pool_bytes={self.pool_slots * self.group * self.num_kv_heads * self.head_dim * 4 * self.num_layers / 1e9:.2f} GB, "
-            f"compressed_cache_bytes={self.num_blocks * tile_bytes * self.num_kv_heads * self.num_layers / 1e9:.2f} GB"
+            f"tail_pool_bytes={tail_pool_bytes / 1e9:.2f} GB, "
+            f"compressed_cache_bytes={int4_cache_bytes / 1e9:.2f} GB, "
+            f"scratch_bytes={scratch_bytes / 1e9:.2f} GB, "
+            f"total_mem_usage={total_bytes * GB:.2f} GB"
         )
 
     def _alloc_slot(self, block_id: int) -> int:
