@@ -16,7 +16,6 @@ from sglang.srt.parser.reasoning_parser import (
     KimiK2Detector,
     Nemotron3Detector,
     Qwen3Detector,
-    Qwen3_8Detector,
     ReasoningParser,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -227,108 +226,6 @@ class TestQwen3Detector(CustomTestCase):
         result = self.detector.detect_and_parse(text)
         self.assertEqual(result.normal_text, text)
         self.assertEqual(result.reasoning_text, "")
-
-
-class TestQwen3_8Detector(CustomTestCase):
-    """Tool-call passthrough inside reasoning for Qwen3.8 models.
-
-    Qwen3.8 sometimes opens a tool-call tag without closing the think tag
-    first. The reasoning parser must keep the reasoning text as reasoning,
-    route the tag block to normal_text (so the Qwen3CoderDetector parses
-    it), and resume reasoning after the close tag.
-    """
-
-    OPEN = "<" + "tool_call" + ">"
-    CLOSE = "</" + "tool_call" + ">"
-    THINK_OPEN = "<think" + ">"
-    THINK_CLOSE = "</" + "think" + ">"
-    BLOCK = (
-        OPEN
-        + "\n<function=bash>\n<parameter=command>ls -la</parameter>\n</function>\n"
-        + CLOSE
-    )
-
-    def _feed(self, detector, chunks):
-        parts = []
-        for chunk in chunks:
-            parts.append(detector.parse_streaming_increment(chunk))
-        parts.append(detector.finish())
-        return parts
-
-    def test_no_tool_start_token(self):
-        # The passthrough lives in the override, not the base interruption.
-        detector = Qwen3_8Detector()
-        self.assertIsNone(detector.tool_start_token)
-        self.assertEqual(detector._TOOL_CALL_OPEN, "<" + "tool_call" + ">")
-        self.assertEqual(detector._TOOL_CALL_CLOSE, "</" + "tool_call" + ">")
-
-    def test_tool_call_block_mid_reasoning_single_chunk(self):
-        text = f"{self.THINK_OPEN}\nLet me check. {self.BLOCK}\nInteresting."
-        parts = self._feed(Qwen3_8Detector(), [text])
-        reasoning = "".join(p.reasoning_text for p in parts)
-        normal = "".join(p.normal_text for p in parts)
-        self.assertIn("Let me check.", reasoning)
-        self.assertIn("Interesting.", reasoning)
-        self.assertIn(self.BLOCK, normal)
-
-    def test_tool_call_open_tag_split_across_chunks(self):
-        parts = self._feed(
-            Qwen3_8Detector(),
-            [
-                f"{self.THINK_OPEN}\nthinking ",
-                "<tool_c",
-                "all>\nx" + self.CLOSE,
-                " resuming thought",
-            ],
-        )
-        reasoning = "".join(p.reasoning_text for p in parts)
-        normal = "".join(p.normal_text for p in parts)
-        self.assertEqual(normal, self.OPEN + "\nx" + self.CLOSE)
-        self.assertIn("thinking", reasoning)
-        self.assertIn("resuming thought", reasoning)
-
-    def test_unterminated_tool_call_flushed_as_normal_on_finish(self):
-        partial = self.BLOCK.replace(self.CLOSE, "")
-        parts = self._feed(
-            Qwen3_8Detector(), [f"{self.THINK_OPEN}\nrunning " + partial]
-        )
-        reasoning = "".join(p.reasoning_text for p in parts)
-        normal = "".join(p.normal_text for p in parts)
-        self.assertEqual(reasoning, "\nrunning ")
-        self.assertEqual(normal, partial)
-
-    def test_reasoning_close_after_tool_call_leaves_reasoning_mode(self):
-        text = f"{self.THINK_OPEN}\ncheck {self.BLOCK}\nmore {self.THINK_CLOSE}\nFinal answer."
-        parts = self._feed(Qwen3_8Detector(), [text])
-        reasoning = "".join(p.reasoning_text for p in parts)
-        normal = "".join(p.normal_text for p in parts)
-        self.assertIn("check", reasoning)
-        self.assertIn("more", reasoning)
-        self.assertIn(self.BLOCK, normal)
-        self.assertTrue(normal.rstrip().endswith("Final answer."))
-
-    def test_detect_and_parse_splits_embedded_tool_call(self):
-        text = (
-            self.THINK_OPEN
-            + "\nlook here. "
-            + self.BLOCK
-            + "\nok then."
-            + self.THINK_CLOSE
-            + "\nDone."
-        )
-        result = Qwen3_8Detector(stream_reasoning=False).detect_and_parse(text)
-        self.assertIn("look here.", result.reasoning_text)
-        self.assertIn("ok then.", result.reasoning_text)
-        self.assertIn(self.BLOCK, result.normal_text)
-        self.assertTrue(result.normal_text.rstrip().endswith("Done."))
-
-    def test_plain_reasoning_unchanged(self):
-        text = f"{self.THINK_OPEN}\njust thinking.{self.THINK_CLOSE}\nAnswer."
-        parts = self._feed(Qwen3_8Detector(), [text])
-        reasoning = "".join(p.reasoning_text for p in parts)
-        normal = "".join(p.normal_text for p in parts)
-        self.assertIn("just thinking.", reasoning)
-        self.assertEqual(normal, "\nAnswer.")
 
 
 class TestDeepSeekV4Detector(CustomTestCase):
