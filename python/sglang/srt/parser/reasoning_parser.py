@@ -403,27 +403,28 @@ class Qwen3_8Detector(Qwen3Detector):
     """Detector for Qwen3.8 models (e.g., Qwen/Qwen3.8-27B).
 
     Identical to Qwen3Detector except it does NOT set tool_start_token.
-    Qwen3.8 properly closes its think tag before making tool calls, so
-    the tool_start_token interruption (added for Qwen3.5 models that
-    sometimes open tool calls without closing think) is unnecessary
-    and harmful: when the model writes about tool calls in its
-    reasoning, the sentinel triggers a false reasoning-to-content
-    switch, cutting the reasoning short and leaking the think-close
+    Qwen3.8 sometimes emits real tool-call syntax *inside* the think
+    block without first closing it.  The parent Qwen3Detector handles
+    this via tool_start_token (an abrupt switch to normal text), but
+    that fires whenever the model merely *discusses* tool calls in its
+    reasoning, cutting the reasoning short and leaking the think-close
     tag into content.
+
+    Instead, this detector keeps tool_start_token=None (no abrupt switch)
+    and performs a **passthrough**: when a complete tool-call block
+    appears inside reasoning, the block is routed to normal_text (so the
+    downstream tool-call parser picks it up) while surrounding thought
+    stays in reasoning_text.  A lone open tag without a matching close
+    is treated as prose (stays in reasoning) -- it only routes out when
+    the close tag arrives, confirming it is a real tool call.
     """
 
-    def __init__(
-        self,
-        stream_reasoning: bool = True,
-        force_reasoning: bool = False,
-        continue_final_message: bool = False,
-        previous_content: str = "",
-        force_nonempty_content: bool = False,
-    ):
-        think_excluded_tokens = [
-            "<|im_end|>",
-            "",
-        ]
+    _TOOL_OPEN = '<tool_call>'
+    _TOOL_CLOSE = '</tool_call>'
+
+    def __init__(self, stream_reasoning=True, force_reasoning=False,
+                 continue_final_message=False, previous_content="",
+                 force_nonempty_content=False):
         super().__init__(
             stream_reasoning=stream_reasoning,
             force_reasoning=force_reasoning,
@@ -431,10 +432,137 @@ class Qwen3_8Detector(Qwen3Detector):
             previous_content=previous_content,
             force_nonempty_content=force_nonempty_content,
         )
-        # Override: no tool_start_token. The parent constructor set it
-        # to the sentinel; we clear it so the streaming parser stays in
-        # reasoning mode even when the model writes about tool calls.
         self.tool_start_token = None
+
+    def _detect_and_parse_impl(self, text):
+        in_reasoning = self._in_reasoning or self.think_start_token in text
+        if not in_reasoning:
+            return StreamingParseResult(normal_text=text)
+        think_start_text = self.think_start_token + self.think_start_self_label
+        processed = text
+        while processed.startswith(think_start_text):
+            processed = processed[len(think_start_text):]
+        if self.think_end_token not in processed and self.think_end_token not in self.previous_content:
+            reasoning, normal = self._split_tool_calls(processed)
+            return StreamingParseResult(normal_text=normal, reasoning_text=reasoning)
+        if self.think_end_token in processed:
+            splits = processed.split(self.think_end_token, maxsplit=1)
+            reasoning_part, after_think = splits[0], splits[1]
+            reasoning, tool_normal = self._split_tool_calls(reasoning_part)
+            return StreamingParseResult(normal_text=tool_normal + after_think, reasoning_text=reasoning)
+        return StreamingParseResult(normal_text=processed)
+
+    def _parse_streaming_increment_impl(self, new_text):
+        self._buffer += new_text
+        buf = self._buffer
+        think_start_text = self.think_start_token + self.think_start_self_label
+        tokens_to_check = [self.think_start_token, self.think_end_token,
+                           self._TOOL_OPEN, self._TOOL_CLOSE]
+        if any(tok.startswith(buf) and tok != buf for tok in tokens_to_check):
+            return StreamingParseResult()
+        if not self.stripped_think_start and think_start_text in buf:
+            buf = buf.replace(think_start_text, "", 1)
+            self._buffer = buf
+            self.stripped_think_start = True
+            self._in_reasoning = True
+        if self._in_reasoning and self.think_end_token in buf:
+            end_idx = buf.find(self.think_end_token)
+            reasoning_segment = buf[:end_idx]
+            remainder = buf[end_idx + len(self.think_end_token):]
+            self._buffer = ""
+            self._in_reasoning = False
+            reasoning, tool_normal = self._split_tool_calls(reasoning_segment)
+            return StreamingParseResult(
+                normal_text=tool_normal + remainder, reasoning_text=reasoning)
+        if self._in_reasoning:
+            tool_idx = buf.find(self._TOOL_OPEN)
+            if tool_idx == -1:
+                if self.stream_reasoning:
+                    holdback_tokens = [self.think_end_token, self._TOOL_OPEN]
+                    if not self.stripped_think_start:
+                        holdback_tokens.append(think_start_text)
+                    holdback = max(
+                        self._ends_with_partial_token(buf, tok)
+                        for tok in holdback_tokens)
+                    self._buffer = buf[len(buf) - holdback:]
+                    return StreamingParseResult(
+                        reasoning_text=buf[:len(buf) - holdback])
+                else:
+                    return StreamingParseResult()
+            close_idx = buf.find(self._TOOL_CLOSE, tool_idx)
+            if close_idx == -1:
+                before = buf[:tool_idx]
+                held = buf[tool_idx:]
+                if self.stream_reasoning:
+                    holdback_tokens = [self.think_end_token, self._TOOL_OPEN]
+                    holdback = max(
+                        self._ends_with_partial_token(before, tok)
+                        for tok in holdback_tokens)
+                    emit = before[:len(before) - holdback]
+                    self._buffer = before[len(before) - holdback:] + held
+                    return StreamingParseResult(reasoning_text=emit)
+                else:
+                    self._buffer = before + held
+                    return StreamingParseResult()
+            before = buf[:tool_idx]
+            block = buf[tool_idx:close_idx + len(self._TOOL_CLOSE)]
+            after = buf[close_idx + len(self._TOOL_CLOSE):]
+            if self.stream_reasoning:
+                holdback_tokens = [self.think_end_token, self._TOOL_OPEN]
+                holdback = max(
+                    self._ends_with_partial_token(before, tok)
+                    for tok in holdback_tokens)
+                emit_reasoning = before[:len(before) - holdback]
+                self._buffer = before[len(before) - holdback:] + after
+            else:
+                emit_reasoning = ""
+                self._buffer = after
+            return StreamingParseResult(
+                normal_text=block, reasoning_text=emit_reasoning)
+        self._buffer = ""
+        return StreamingParseResult(normal_text=buf)
+
+    def finish(self):
+        if not self._in_reasoning:
+            leftover = self._buffer
+            self._buffer = ""
+            return StreamingParseResult(normal_text=leftover)
+        buffer = self._strip_leading_think_start(self._buffer)
+        self._buffer = ""
+        if self._force_nonempty_content:
+            normal_text = self._accumulated_reasoning + buffer
+            self._accumulated_reasoning = ""
+            if normal_text:
+                return StreamingParseResult(normal_text=normal_text)
+            return StreamingParseResult()
+        reasoning, tool_normal = self._split_tool_calls(buffer)
+        result = StreamingParseResult()
+        if reasoning:
+            result.reasoning_text = reasoning
+        if tool_normal:
+            result.normal_text = tool_normal
+        return result
+
+    @staticmethod
+    def _split_tool_calls(text):
+        open_tag = Qwen3_8Detector._TOOL_OPEN
+        close_tag = Qwen3_8Detector._TOOL_CLOSE
+        reasoning_parts = []
+        normal_parts = []
+        cursor = 0
+        while True:
+            s = text.find(open_tag, cursor)
+            if s == -1:
+                reasoning_parts.append(text[cursor:])
+                break
+            e = text.find(close_tag, s)
+            if e == -1:
+                reasoning_parts.append(text[cursor:])
+                break
+            reasoning_parts.append(text[cursor:s])
+            normal_parts.append(text[s:e + len(close_tag)])
+            cursor = e + len(close_tag)
+        return "".join(reasoning_parts), "".join(normal_parts)
 
 
 class KimiDetector(BaseReasoningFormatDetector):

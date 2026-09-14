@@ -16,6 +16,7 @@ from sglang.srt.parser.reasoning_parser import (
     KimiK2Detector,
     Nemotron3Detector,
     Qwen3Detector,
+    Qwen3_8Detector,
     ReasoningParser,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -227,6 +228,121 @@ class TestQwen3Detector(CustomTestCase):
         self.assertEqual(result.normal_text, text)
         self.assertEqual(result.reasoning_text, "")
 
+
+class TestQwen3_8Detector(CustomTestCase):
+    """Test mid-thinking tool-call passthrough for Qwen3.8."""
+
+    def setUp(self):
+        self.detector = Qwen3_8Detector(stream_reasoning=True)
+
+    def test_tool_call_inside_reasoning_single_chunk(self):
+        """A complete tool-call block inside think stays split: reasoning +
+        tool call to normal_text."""
+        TO = chr(60) + "think" + chr(62)
+        TC = chr(60) + chr(47) + "think" + chr(62)
+        CO = chr(60) + "tool_call" + chr(62)
+        CC = chr(60) + chr(47) + "tool_call" + chr(62)
+        NL = chr(10)
+        text = (TO + "I need to check config." + CO + NL +
+                "<function=read>" + NL +
+                "<parameter=path>/etc/app.conf</parameter>" + NL +
+                "</function>" + NL + CC + NL + "Got it." + TC +
+                "The config says X.")
+        result = self.detector.detect_and_parse(text)
+        self.assertIn("I need to check config.", result.reasoning_text)
+        self.assertIn("Got it.", result.reasoning_text)
+        self.assertIn(CO, result.normal_text)
+        self.assertIn("<function=read>", result.normal_text)
+        self.assertIn("The config says X.", result.normal_text)
+
+    def test_tool_call_split_across_chunks(self):
+        """Tool-call open tag split across streaming chunks."""
+        TO = chr(60) + "think" + chr(62)
+        TC = chr(60) + chr(47) + "think" + chr(62)
+        CO = chr(60) + "tool_call" + chr(62)
+        CC = chr(60) + chr(47) + "tool_call" + chr(62)
+        NL = chr(10)
+        d = Qwen3_8Detector(stream_reasoning=True)
+        chunks = [
+            TO + "Let me check. " + CO[:5],
+            CO[5:] + NL + "<function=bash>" + NL +
+            "<parameter=command>ls</parameter>" + NL + "</function>" + NL,
+            CC + " Done." + TC + "Result: file.txt",
+        ]
+        all_r, all_n = "", ""
+        for c in chunks:
+            r = d.parse_streaming_increment(c)
+            all_r += r.reasoning_text
+            all_n += r.normal_text
+        r = d.finish()
+        all_r += r.reasoning_text
+        all_n += r.normal_text
+        self.assertIn("Let me check.", all_r)
+        self.assertIn("Done.", all_r)
+        self.assertIn(CO, all_n)
+        self.assertIn("<function=bash>", all_n)
+        self.assertIn("Result: file.txt", all_n)
+
+    def test_unterminated_tool_call_stays_reasoning(self):
+        """Open tag with no close at stream end stays in reasoning (prose)."""
+        TO = chr(60) + "think" + chr(62)
+        CO = chr(60) + "tool_call" + chr(62)
+        NL = chr(10)
+        d = Qwen3_8Detector(stream_reasoning=True)
+        text = TO + "I need to " + CO + NL + "<function=bash>" + NL + "<parameter=command>ls"
+        r1 = d.parse_streaming_increment(text)
+        r2 = d.finish()
+        all_r = r1.reasoning_text + r2.reasoning_text
+        all_n = r1.normal_text + r2.normal_text
+        # No close tag means it's treated as prose, stays in reasoning
+        self.assertIn("I need to", all_r)
+        # normal_text should be empty (no complete tool call)
+        self.assertEqual(all_n, "")
+
+    def test_prose_with_lone_open_tag_stays_reasoning(self):
+        """Model mentions tool-call tag in prose without close: stays reasoning."""
+        TO = chr(60) + "think" + chr(62)
+        TC = chr(60) + chr(47) + "think" + chr(62)
+        CO = chr(60) + "tool_call" + chr(62)
+        d = Qwen3_8Detector(stream_reasoning=True)
+        text = TO + "I should use " + CO + " to call read" + TC + "The answer."
+        r = d.parse_streaming_increment(text)
+        self.assertIn("I should use", r.reasoning_text)
+        self.assertIn("The answer.", r.normal_text)
+
+    def test_normal_close_then_tool_call(self):
+        """Think-close then tool call: clean reasoning to content transition."""
+        TO = chr(60) + "think" + chr(62)
+        TC = chr(60) + chr(47) + "think" + chr(62)
+        CO = chr(60) + "tool_call" + chr(62)
+        CC = chr(60) + chr(47) + "tool_call" + chr(62)
+        NL = chr(10)
+        d = Qwen3_8Detector(stream_reasoning=True)
+        text = (TO + "Thinking..." + TC + CO + NL +
+                "<function=ls" + NL + "</function>" + NL + CC)
+        r = d.parse_streaming_increment(text)
+        self.assertIn("Thinking...", r.reasoning_text)
+        self.assertIn(CO, r.normal_text)
+
+    def test_non_streaming_with_mid_think_tool_call(self):
+        """Non-streaming detect_and_parse with mid-think tool call."""
+        TO = chr(60) + "think" + chr(62)
+        TC = chr(60) + chr(47) + "think" + chr(62)
+        CO = chr(60) + "tool_call" + chr(62)
+        CC = chr(60) + chr(47) + "tool_call" + chr(62)
+        NL = chr(10)
+        d = Qwen3_8Detector(stream_reasoning=False)
+        text = (TO + "I need to check." + CO + NL +
+                "<function=read>" + NL +
+                "<parameter=path>/etc/app.conf</parameter>" + NL +
+                "</function>" + NL + CC + NL + "Got it." + TC +
+                "The answer.")
+        result = d.detect_and_parse(text)
+        self.assertIn("I need to check.", result.reasoning_text)
+        self.assertIn("Got it.", result.reasoning_text)
+        self.assertIn(CO, result.normal_text)
+        self.assertIn("<function=read>", result.normal_text)
+        self.assertIn("The answer.", result.normal_text)
 
 class TestDeepSeekV4Detector(CustomTestCase):
     def test_strict_thinking_excludes_deepseek_control_tokens(self):
