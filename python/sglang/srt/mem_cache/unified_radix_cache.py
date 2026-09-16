@@ -780,6 +780,16 @@ class UnifiedRadixCache(BasePrefixCache):
             ),
             skip_swa=skip_swa,
         )
+        self._release_mamba_cow_lock(req)
+
+    def _release_mamba_cow_lock(self, req: Req) -> None:
+        """Release the COW-source mamba pin taken when the COW source node diverged
+        from last_node (HiCache host-split). Safe here: callers drain the forward
+        stream (copy_done.synchronize) before this runs."""
+        if req.mamba_cow_lock_node is not None:
+            self.dec_lock_ref(req.mamba_cow_lock_node, req.mamba_cow_lock_params)
+            req.mamba_cow_lock_node = None
+            req.mamba_cow_lock_params = None
 
     def dec_swa_lock_only(
         self,

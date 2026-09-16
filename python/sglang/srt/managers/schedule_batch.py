@@ -963,6 +963,13 @@ class Req(ReqDllmMixin):
         self.mamba_cow_src_index: Optional[torch.Tensor] = None
         # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
         self.mamba_needs_clear: bool = False
+        # COW-source pin: when the COW source node differs from last_node (HiCache
+        # host-backed Full + device mamba split), the source node's mamba slot is
+        # unpinned by the request lock and evictable during the deferred copy. We
+        # pin it (mamba-only) from capture until the forward drains, then release
+        # it alongside the request lock. Node id + release params are stored here.
+        self.mamba_cow_lock_node: Any = None
+        self.mamba_cow_lock_params: Any = None
         # Lazy extra buffer: skip radix cache insert when prealloc failed at
         # boundary — the forward overwrites the only slot, corrupting the state.
         self.mamba_lazy_is_insert: bool = True
@@ -1709,6 +1716,8 @@ class Req(ReqDllmMixin):
         self.mamba_branching_seqlen = None
         self.mamba_cow_src_index = None
         self.mamba_needs_clear = False
+        self.mamba_cow_lock_node = None
+        self.mamba_cow_lock_params = None
         self.already_computed = 0
         assert self.kv is None, "expect it is already released"
         self.kv_committed_len = 0

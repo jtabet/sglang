@@ -3444,6 +3444,14 @@ class Scheduler(
                     # metadata before add_one_req() rejects the request.
                     req.mamba_cow_src_index = None
                     req.mamba_needs_clear = False
+                    # Also drop the COW-source mamba pin the match staged, since
+                    # no forward will ever consume it.
+                    if req.mamba_cow_lock_node is not None:
+                        self.tree_cache.dec_lock_ref(
+                            req.mamba_cow_lock_node, req.mamba_cow_lock_params
+                        )
+                        req.mamba_cow_lock_node = None
+                        req.mamba_cow_lock_params = None
                     if req.mamba_pool_idx is not None and not getattr(
                         req, "session", None
                     ):

@@ -212,6 +212,23 @@ class MambaComponent(TreeComponent):
             req.mamba_pool_idx = dst_index[0]
         req.mamba_cow_src_index = src_index
         req.mamba_needs_clear = False
+        # The request lock pins `last_device_node` (best_match_device_node), not
+        # `best_match_node`. With HiCache the two diverge: the deeper node can carry
+        # host-backed Full + device mamba, and its device mamba slot is then
+        # unpinned and evictable while the deferred COW awaits on the forward
+        # stream. Eviction frees and reallocates that slot to another request,
+        # which is exactly the confidentiality leak. Pin the COW source node's
+        # mamba-only from capture until the forward drains; released with the
+        # request lock in `_dec_req_lock` / the streaming-session save path.
+        if result.best_match_node != result.last_device_node:
+            skip = tuple(
+                ct for ct in self.cache.tree_components if ct != self.component_type
+            )
+            lock_result = self.cache.inc_lock_ref(
+                result.best_match_node, skip_lock_components=skip
+            )
+            req.mamba_cow_lock_node = result.best_match_node
+            req.mamba_cow_lock_params = lock_result.to_dec_params()
         return result
 
     def commit_insert_component_data(

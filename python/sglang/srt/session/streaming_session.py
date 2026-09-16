@@ -351,6 +351,8 @@ class StreamingSession(BasePrefixCache):
             self.release_session(session_id)
             req.req_pool_idx = None
             req.kv = None
+            if hasattr(self.inner, "_release_mamba_cow_lock"):
+                self.inner._release_mamba_cow_lock(req)
             req.session.abort_req()
             return True
 
@@ -370,6 +372,12 @@ class StreamingSession(BasePrefixCache):
         # verify by ~1, which would short-change inheritance). Clamp to allocated
         # to keep committed <= allocated for prepare_for_decode.
         slot.kv_committed_len = min(target, slot.kv.kv_allocated_len)
+
+        # The raw-path tree lock is transferred to the slot, but the deferred-COW
+        # mamba pin (best_match_node != last_node on HiCache) is not slot-owned:
+        # release it now that the forward (and its copy) has drained.
+        if hasattr(self.inner, "_release_mamba_cow_lock"):
+            self.inner._release_mamba_cow_lock(req)
 
         # Update req_nodes to this successfully finished request.
         req.session.finish_req(req)
