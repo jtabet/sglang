@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 
+from sglang.srt.runtime_context import get_exec
+
 logger = logging.getLogger(__name__)
 
 from dataclasses import dataclass
@@ -23,7 +25,9 @@ class KVCacheBuildResult:
 
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
+    glm5_next_config,
     hybrid_gdn_config,
     hybrid_lightning_config,
     kimi_linear_config,
@@ -48,9 +52,9 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
+from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
-
     from torch.distributed import ProcessGroup
 
     from sglang.srt.configs.model_config import ModelConfig
@@ -111,11 +115,17 @@ def _device_pool_size_per_token(pool: object) -> float:
 
 
 def _adjust_hicache_size_for_draft(
-    server_args: ServerArgs,
+    *,
+    hicache_size: int,
+    hicache_ratio: float,
     target_device_pool: object,
     draft_device_pools: tuple[object, ...],
 ) -> None:
     """Reduce ``hicache_size`` so target + draft host pools fit the GB budget.
+
+    Takes the resolved memory-bag values rather than the config object:
+    pool sizing reads the bags, and the write below lands on the same bag,
+    so what is read and what is written cannot desync.
 
     The draft host pool must have the same token count as the target (for 1-to-1
     index sharing in L2 transfers).  When ``--hicache-size`` caps the target
@@ -126,7 +136,7 @@ def _adjust_hicache_size_for_draft(
     Only applies in fixed-size (``hicache_size > 0``) mode; ratio mode already
     scales both pools proportionally.
     """
-    if server_args.hicache_size <= 0:
+    if hicache_size <= 0:
         return
     if not draft_device_pools:
         return
@@ -142,43 +152,59 @@ def _adjust_hicache_size_for_draft(
     if draft_spt == 0:
         return
 
-    effective = server_args.hicache_size * target_spt / (target_spt + draft_spt)
-    if effective < server_args.hicache_size:
+    effective = hicache_size * target_spt / (target_spt + draft_spt)
+    if effective < hicache_size:
         logger.info(
             "Adjusting --hicache-size from %d GB to %.2f GB to account for "
             "draft host pool memory (target_spt=%.0f, draft_spt=%.0f).",
-            server_args.hicache_size,
+            hicache_size,
             effective,
             target_spt,
             draft_spt,
         )
-        # Use the resolution-pipeline helper to bypass the strict post-publish
-        # mutation guard on ServerArgs.  This is a one-shot, pre-tree-cache
-        # adjustment: after create_tree_cache() returns, hicache_size is never
-        # read again, so the instance and the memory bag stay in agreement.
-        from sglang.srt.arg_groups.overrides import _apply_fields
-
         # Reduce both hicache_size AND hicache_ratio.  When the device pool is
         # a no-op placeholder (KVarN post-capture allocation), get_kv_size_bytes
         # returns 0, so _split_hicache_size gives the KV pool 0 GB and the host
         # pool falls back to hicache_ratio.  Reducing the ratio too ensures the
         # fallback also respects the draft budget.
+        # Written onto the memory bag (the single source of truth for pool
+        # sizing); the ServerArgs record stays pristine.
         ratio_factor = target_spt / (target_spt + draft_spt)
-        effective_ratio = server_args.hicache_ratio * ratio_factor
-        _apply_fields(
-            server_args,
-            {
-                "hicache_size": int(effective),
-                "hicache_ratio": effective_ratio,
-            },
+        effective_ratio = hicache_ratio * ratio_factor
+        get_context().override(
+            "kvarn.hicache_draft_budget",
+            hicache_size=int(effective),
+            hicache_ratio=effective_ratio,
         )
+
+
+def get_draft_kv_pool(
+    *,
+    draft_worker: BaseTpWorker,
+    spec_algorithm: SpeculativeAlgorithm,
+    server_args: ServerArgs,
+):
+    """Return the draft token-to-KV pool for the current draft worker,
+    or None when no draft KV pool is available."""
+    if draft_worker is None or spec_algorithm.is_ngram():
+        return None
+
+    # V2 draft workers exist only on their hosting PP stage; other ranks own no
+    # nested draft worker or draft KV pool.
+    if draft_worker.draft_worker is None:
+        return None
+
+    if resolving_view(server_args).enable_multi_layer_eagle:
+        draft_runner = draft_worker.draft_worker.draft_runner_list[0]
+    else:
+        draft_runner = draft_worker.draft_worker.draft_runner
+    return draft_runner.token_to_kv_pool
 
 
 def maybe_register_hicache_draft(
     *,
     tree_cache,
     draft_plan: HiCacheDraftPlan,
-    server_args: ServerArgs,
 ) -> None:
     if draft_plan.mode != HiCacheDraftMode.SIDECAR:
         return
@@ -195,7 +221,6 @@ def maybe_register_hicache_draft(
     specs, entries = build_hicache_draft_sidecars(
         draft_device_pools=draft_plan.device_pools,
         tree_cache=tree_cache,
-        server_args=server_args,
     )
     for spec, entry in zip(specs, entries, strict=True):
         tree_cache.register_sidecar_pool(spec, entry)
@@ -215,6 +240,7 @@ def uses_ssm_state(model_config) -> bool:
         or mamba2_config(model_config) is not None
         or (spec.uses_mamba_radix_cache if spec is not None else False)
         or kimi_linear_config(model_config) is not None
+        or glm5_next_config(model_config) is not None
         or hybrid_lightning_config(model_config) is not None
     )
 
@@ -240,11 +266,21 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
         )
         # Host-pool retraction transfers full and sliding-window components
         # only, so a model with recurrent state stays on cpu_tensor.
-        supports_host_pool = not uses_ssm_state(
-            tp_worker.model_runner.model_config
-        ) and (
-            isinstance(kv_cache, MHATokenToKVPool)
-            or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
+        #
+        # The unified pool is excluded for the same reason hierarchical cache is
+        # (see `handle_unified_memory_pool`): the host-transfer path indexes the
+        # device buffers with the ids it is handed, and under the unified pool
+        # those are VIRTUAL. It also cannot be sized from `kv_cache.size`, which
+        # is a KERNEL-FACING row count (`num_pages * 2 * layer_num * page_size`)
+        # rather than a token capacity -- gpt-oss-20b reports 85M "tokens" and
+        # asks for 418 GB of host memory per component.
+        supports_host_pool = (
+            not uses_ssm_state(tp_worker.model_runner.model_config)
+            and not memory.enable_unified_memory
+            and (
+                isinstance(kv_cache, MHATokenToKVPool)
+                or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
+            )
         )
         schedule = get_schedule()
         priority_preemption = (
@@ -254,6 +290,9 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
         backend = (
             "host_pool"
             if disagg.disaggregation_mode == "decode"
+            # Large ROCm retraction restores can fault the GPU process. Keep
+            # host_pool opt-in on HIP until the retraction path is safe at scale.
+            and not is_hip()
             and not get_parallel().dcp_enabled
             and not disagg.disaggregation_decode_enable_radix_cache
             # KV offload already owns a host pool; a second one double-books host memory.
@@ -386,21 +425,22 @@ def build_kv_cache(
         ),
         is_eagle=spec_algorithm.is_eagle(),
         tp_cache_group=(
-            attn_tp_cpu_group
-            if get_parallel().config.enable_dp_attention
-            else tp_cpu_group
+            attn_tp_cpu_group if get_parallel().enable_dp_attention else tp_cpu_group
         ),
         attn_cp_cache_group=attn_cp_cpu_group,
         attn_tp_cache_group=attn_tp_cpu_group,
         pp_cache_group=pp_group.cpu_group,
         eviction_policy=get_memory().radix_eviction_policy,
+        eviction_policy_config=get_memory().radix_eviction_policy_config,
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
-        enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
-        enable_mamba_extra_buffer_lazy=server_args.enable_mamba_extra_buffer_lazy(),
+        enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
+        enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
         pp_rank=ps.pp_rank,
         pp_size=ps.pp_size,
+        attn_cp_rank=ps.attn_cp_rank,
+        attn_cp_size=ps.attn_cp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
@@ -419,9 +459,10 @@ def build_kv_cache(
     ):
         target_device_pool = tp_worker.model_runner.token_to_kv_pool
         _adjust_hicache_size_for_draft(
-            server_args,
-            target_device_pool,
-            hicache_draft_plan.device_pools,
+            hicache_size=get_memory().hicache_size,
+            hicache_ratio=get_memory().hicache_ratio,
+            target_device_pool=target_device_pool,
+            draft_device_pools=hicache_draft_plan.device_pools,
         )
 
     tree_cache = create_tree_cache(
@@ -449,7 +490,6 @@ def build_kv_cache(
         maybe_register_hicache_draft(
             tree_cache=tree_cache,
             draft_plan=hicache_draft_plan,
-            server_args=server_args,
         )
 
     if retraction_backup == "host_pool":

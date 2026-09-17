@@ -22,9 +22,10 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-# The function under test does a local import of _apply_fields, so we patch it
-# at its source module to prevent real ServerArgs mutation.
-_APPLY_FIELDS_PATH = "sglang.srt.arg_groups.overrides._apply_fields"
+# The function under test writes through get_context().override on the memory
+# bag, so we patch get_context at its source module to prevent real config
+# mutation.
+_GET_CONTEXT_PATH = "sglang.srt.mem_cache.kv_cache_builder.get_context"
 
 
 def _make_mha_pool(head_dim, head_num, layer_num, dtype, size=4096):
@@ -50,11 +51,16 @@ def _make_mla_pool(kv_cache_dim, layer_num, dtype, size=4096):
     )
 
 
-def _make_server_args(hicache_size=4, hicache_ratio=2.0):
-    return SimpleNamespace(
-        hicache_size=hicache_size,
-        hicache_ratio=hicache_ratio,
+def _adjust(**overrides):
+    """Call _adjust_hicache_size_for_draft with the standard test inputs."""
+    args = dict(
+        hicache_size=4,
+        hicache_ratio=2.0,
+        target_device_pool=_make_mha_pool(128, 8, 28, torch.bfloat16),
+        draft_device_pools=(_make_mha_pool(128, 8, 28, torch.bfloat16),),
     )
+    args.update(overrides)
+    return _adjust_hicache_size_for_draft(**args)
 
 
 class TestDevicePoolSizePerToken(CustomTestCase):
@@ -96,27 +102,28 @@ class TestDevicePoolSizePerToken(CustomTestCase):
 class TestAdjustHicacheSizeForDraft(CustomTestCase):
     """Tests for _adjust_hicache_size_for_draft budget shrinking."""
 
+    def _run(self, **pool_overrides):
+        """Invoke the function with the standard inputs plus overrides.
+
+        Returns the mock ``override`` handle so the caller can assert on the
+        memory-bag write it performed (or assert it was never called).
+        """
+        with mock.patch(_GET_CONTEXT_PATH) as mock_get_context:
+            mock_override = mock_get_context.return_value.override
+            _adjust(**pool_overrides)
+            return mock_override
+
     def test_no_adjustment_when_hicache_size_zero(self):
         """Ratio mode (hicache_size <= 0) should not be adjusted."""
-        server_args = _make_server_args(hicache_size=0, hicache_ratio=2.0)
-        target = _make_mha_pool(128, 8, 28, torch.bfloat16)
-        draft = _make_mha_pool(128, 8, 28, torch.bfloat16)
-
-        with mock.patch(_APPLY_FIELDS_PATH) as mock_apply:
-            _adjust_hicache_size_for_draft(server_args, target, (draft,))
-            mock_apply.assert_not_called()
+        mock_override = self._run(hicache_size=0, hicache_ratio=2.0)
+        mock_override.assert_not_called()
 
     def test_no_adjustment_when_no_draft_pools(self):
-        server_args = _make_server_args(hicache_size=4, hicache_ratio=2.0)
-        target = _make_mha_pool(128, 8, 28, torch.bfloat16)
-
-        with mock.patch(_APPLY_FIELDS_PATH) as mock_apply:
-            _adjust_hicache_size_for_draft(server_args, target, ())
-            mock_apply.assert_not_called()
+        mock_override = self._run(draft_device_pools=())
+        mock_override.assert_not_called()
 
     def test_no_adjustment_when_target_spt_zero(self):
-        server_args = _make_server_args(hicache_size=4, hicache_ratio=2.0)
-        target = SimpleNamespace(
+        zero_pool = SimpleNamespace(
             head_dim=None,
             head_num=None,
             kv_cache_dim=None,
@@ -126,75 +133,74 @@ class TestAdjustHicacheSizeForDraft(CustomTestCase):
             size=0,
             get_kv_size_bytes=lambda: 0,
         )
-        draft = _make_mha_pool(128, 8, 28, torch.bfloat16)
-
-        with mock.patch(_APPLY_FIELDS_PATH) as mock_apply:
-            _adjust_hicache_size_for_draft(server_args, target, (draft,))
-            mock_apply.assert_not_called()
+        mock_override = self._run(
+            target_device_pool=zero_pool,
+            draft_device_pools=(_make_mha_pool(128, 8, 28, torch.bfloat16),),
+        )
+        mock_override.assert_not_called()
 
     def test_equal_per_token_cost_halves_budget(self):
         """When target and draft have equal per-token cost, each gets half."""
-        server_args = _make_server_args(hicache_size=4, hicache_ratio=2.0)
-        target = _make_mha_pool(128, 8, 28, torch.bfloat16)
-        draft = _make_mha_pool(128, 8, 28, torch.bfloat16)
-
-        with mock.patch(_APPLY_FIELDS_PATH) as mock_apply:
-            _adjust_hicache_size_for_draft(server_args, target, (draft,))
-            mock_apply.assert_called_once()
-            fields = mock_apply.call_args[0][1]
-            # effective = 4 * spt / (spt + spt) = 2
-            self.assertEqual(fields["hicache_size"], 2)
-            self.assertAlmostEqual(fields["hicache_ratio"], 1.0)
+        mock_override = self._run()
+        mock_override.assert_called_once_with(
+            "kvarn.hicache_draft_budget",
+            hicache_size=2,  # 4 * spt / (spt + spt)
+            hicache_ratio=1.0,  # 2.0 * spt / (spt + spt)
+        )
 
     def test_quantized_target_bf16_draft(self):
         """fp8 target + bf16 draft: draft is 2x the per-token cost."""
-        server_args = _make_server_args(hicache_size=4, hicache_ratio=2.0)
-        target = _make_mha_pool(128, 8, 28, torch.float8_e4m3fn)  # spt = 57344
-        draft = _make_mha_pool(128, 8, 28, torch.bfloat16)  # spt = 114688
-
-        with mock.patch(_APPLY_FIELDS_PATH) as mock_apply:
-            _adjust_hicache_size_for_draft(server_args, target, (draft,))
-            mock_apply.assert_called_once()
-            fields = mock_apply.call_args[0][1]
-            # effective = 4 * 57344 / (57344 + 114688) = 4/3
-            expected_size = int(4 * 57344 / (57344 + 114688))
-            self.assertEqual(fields["hicache_size"], expected_size)
-            # ratio_factor = 1/3
-            expected_ratio = 2.0 * 57344 / (57344 + 114688)
-            self.assertAlmostEqual(fields["hicache_ratio"], expected_ratio)
+        mock_override = self._run(
+            target_device_pool=_make_mha_pool(128, 8, 28, torch.float8_e4m3fn),
+            draft_device_pools=(_make_mha_pool(128, 8, 28, torch.bfloat16),),
+        )
+        # target_spt = fp8 itemsize 1: 128*8*28*1*2 = 57344
+        # draft_spt = bf16 itemsize 2: 128*8*28*2*2 = 114688
+        target_spt = 57344
+        draft_spt = 114688
+        expected_size = int(4 * target_spt / (target_spt + draft_spt))
+        expected_ratio = 2.0 * target_spt / (target_spt + draft_spt)
+        mock_override.assert_called_once_with(
+            "kvarn.hicache_draft_budget",
+            hicache_size=expected_size,
+            hicache_ratio=expected_ratio,
+        )
 
     def test_bf16_target_fp8_draft(self):
         """bf16 target + fp8 draft: draft is 0.5x the per-token cost."""
-        server_args = _make_server_args(hicache_size=4, hicache_ratio=2.0)
-        target = _make_mha_pool(128, 8, 28, torch.bfloat16)  # spt = 114688
-        draft = _make_mha_pool(128, 8, 28, torch.float8_e4m3fn)  # spt = 57344
-
-        with mock.patch(_APPLY_FIELDS_PATH) as mock_apply:
-            _adjust_hicache_size_for_draft(server_args, target, (draft,))
-            mock_apply.assert_called_once()
-            fields = mock_apply.call_args[0][1]
-            # effective = 4 * 114688 / (114688 + 57344) = 8/3
-            expected_size = int(4 * 114688 / (114688 + 57344))
-            self.assertEqual(fields["hicache_size"], expected_size)
+        mock_override = self._run(
+            target_device_pool=_make_mha_pool(128, 8, 28, torch.bfloat16),
+            draft_device_pools=(_make_mha_pool(128, 8, 28, torch.float8_e4m3fn),),
+        )
+        target_spt = 114688
+        draft_spt = 57344
+        expected_size = int(4 * target_spt / (target_spt + draft_spt))
+        expected_ratio = 2.0 * target_spt / (target_spt + draft_spt)
+        mock_override.assert_called_once_with(
+            "kvarn.hicache_draft_budget",
+            hicache_size=expected_size,
+            hicache_ratio=expected_ratio,
+        )
 
     def test_mla_target_mha_draft(self):
         """MLA target + MHA draft: different pool types are handled."""
-        server_args = _make_server_args(hicache_size=4, hicache_ratio=2.0)
-        target = _make_mla_pool(kv_cache_dim=512, layer_num=28, dtype=torch.bfloat16)
-        draft = _make_mha_pool(128, 8, 28, torch.bfloat16)
-
-        with mock.patch(_APPLY_FIELDS_PATH) as mock_apply:
-            _adjust_hicache_size_for_draft(server_args, target, (draft,))
-            mock_apply.assert_called_once()
-            fields = mock_apply.call_args[0][1]
-            # target_spt = 512 * 28 * 2 = 28672
-            # draft_spt = 128 * 8 * 28 * 2 * 2 = 114688
-            target_spt = 28672
-            draft_spt = 114688
-            expected_size = int(4 * target_spt / (target_spt + draft_spt))
-            self.assertEqual(fields["hicache_size"], expected_size)
-            expected_ratio = 2.0 * target_spt / (target_spt + draft_spt)
-            self.assertAlmostEqual(fields["hicache_ratio"], expected_ratio)
+        mock_override = self._run(
+            target_device_pool=_make_mla_pool(
+                kv_cache_dim=512, layer_num=28, dtype=torch.bfloat16
+            ),
+            draft_device_pools=(_make_mha_pool(128, 8, 28, torch.bfloat16),),
+        )
+        # target_spt = 512 * 28 * 2 = 28672
+        # draft_spt = 128 * 8 * 28 * 2 * 2 = 114688
+        target_spt = 28672
+        draft_spt = 114688
+        expected_size = int(4 * target_spt / (target_spt + draft_spt))
+        expected_ratio = 2.0 * target_spt / (target_spt + draft_spt)
+        mock_override.assert_called_once_with(
+            "kvarn.hicache_draft_budget",
+            hicache_size=expected_size,
+            hicache_ratio=expected_ratio,
+        )
 
 
 if __name__ == "__main__":

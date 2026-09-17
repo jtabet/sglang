@@ -4,8 +4,8 @@ Pins the sizing invariant behind MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO:
 at the first cache_unfinished_req, a request still holds its admission-locked
 matched-prefix mamba (protected) plus its own COW slot, and then allocates a
 donated slot. With N distinct-prefix requests that peak is N own + N locked +
-1 donated. An effective ratio of 2 (pool = 2N) leaves no evictable victim and
-the donated alloc asserts; ratio 3 (pool = 3N) has headroom. Once decode's
+1 donated. An effective ratio of 2 (pool = 2N) leaves no evictable victim, so
+the donated alloc degrades to None; ratio 3 (pool = 3N) has headroom. Once decode's
 skip_mamba leaves the matched prefix evictable, even ratio 2 recovers via
 eviction -- which is why the peak, not the decode steady state, sets the floor.
 """
@@ -16,16 +16,17 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
     EvictParams,
     IncLockRefResult,
 )
-from sglang.srt.mem_cache.unified_cache.components.mamba_component import MambaComponent
-from sglang.srt.mem_cache.unified_cache.components.tree_component import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 N = 4  # concurrent distinct-prefix requests
 
@@ -52,6 +53,7 @@ class _RatioCache:
         self.root_node = UnifiedTreeNode(self.tree_components)
         self.allocator = _BoundedMambaAllocator(pool_size)
         self.req_to_token_pool = SimpleNamespace(mamba_allocator=self.allocator)
+        self.metrics_collector = None
         self.component_evictable_size_ = {ComponentType.MAMBA: 0}
         self.component_protected_size_ = {ComponentType.MAMBA: 0}
         self.prefix_nodes = []
@@ -117,7 +119,9 @@ class TestMambaRatioEnvGate(unittest.TestCase):
         strategy = (
             "extra_buffer_lazy"
             if lazy
-            else "extra_buffer" if extra_buffer else "no_buffer"
+            else "extra_buffer"
+            if extra_buffer
+            else "no_buffer"
         )
         from sglang.srt import runtime_context as rc
 
@@ -180,12 +184,12 @@ class _RecordingComp:
 
 class TestDecSwaLockSkip(unittest.TestCase):
     """dec_swa_lock_only early-releases SWA plus co-located lower-tier (Mamba)
-    locks. On a full-only-locked node (decode skip) it must thread the skip set
-    into that lower-tier release, else it drops a mamba lock it never took --
-    another request's, on a shared FULL+SWA+MAMBA node (Inkling). Guards the
-    contract without booting a 3-component model."""
+    locks. On a node whose acquire skipped Mamba (decode hold), the release
+    must skip it too, else it drops a mamba lock it never took -- another
+    request's, on a shared FULL+SWA+MAMBA node (Inkling). Guards the contract
+    without booting a 3-component model."""
 
-    def test_threads_skip_ids_into_lower_tier_release(self):
+    def _run(self, skipped_lock_components):
         # internal-node priority: full=2 > swa=1 > mamba=0
         full = _RecordingComp(ComponentType.FULL, 2)
         swa = _RecordingComp(ComponentType.SWA, 1)
@@ -195,21 +199,25 @@ class TestDecSwaLockSkip(unittest.TestCase):
             components=(full, swa, mamba),
             components_by_type={ComponentType.SWA: swa},
             node_by_id=lambda node_id: node,
+            _assert_receipt_anchor=UnifiedTreeCore._assert_receipt_anchor,
         )
-
         UnifiedTreeCore.dec_swa_lock_only(
             tree_core,
             node.id,
-            swa_uuid_for_lock=None,
-            skip_lock_node_ids={ComponentType.MAMBA: {7}},
+            DecLockRefParams(skipped_lock_components=skipped_lock_components),
         )
+        return full, mamba
 
-        # mamba (below swa) is released, honoring the skip set
-        self.assertEqual(len(mamba.released), 1)
-        self.assertEqual(
-            mamba.released[0].skip_lock_node_ids.get(ComponentType.MAMBA), {7}
-        )
+    def test_unlocked_mamba_is_not_released(self):
+        full, mamba = self._run(skipped_lock_components=(ComponentType.MAMBA,))
+        # mamba took no lock at acquire, so the early release skips it too
+        self.assertEqual(mamba.released, [])
         # full (above swa) is never touched
+        self.assertEqual(full.released, [])
+
+    def test_lower_tier_released_when_locked(self):
+        full, mamba = self._run(skipped_lock_components=())
+        self.assertEqual(len(mamba.released), 1)
         self.assertEqual(full.released, [])
 
 
@@ -217,8 +225,9 @@ class TestMambaDonatedAllocRatio(unittest.TestCase):
     def test_prefill_peak_ratio2_exhausts_pool(self):
         # pool = 2N, all N prefixes admission-locked: no evictable victim.
         component, cache, _ = _build_peak(pool_size=2 * N, lock_prefixes=True)
-        with self.assertRaisesRegex(AssertionError, "Can not alloc mamba cache"):
-            component._alloc_mamba_slot()
+        # KVarN graceful degradation: exhaustion returns None (and degrades)
+        # instead of asserting, but the one-shot eviction is still attempted.
+        self.assertIsNone(component._try_alloc_mamba_slot())
         self.assertEqual(
             cache.alloc_evict_params, [EvictParams(num_tokens=0, mamba_num=1)]
         )
@@ -226,7 +235,7 @@ class TestMambaDonatedAllocRatio(unittest.TestCase):
     def test_prefill_peak_ratio3_has_headroom(self):
         # pool = 3N: N free slots remain after own + locked prefix.
         component, cache, _ = _build_peak(pool_size=3 * N, lock_prefixes=True)
-        slot = component._alloc_mamba_slot()
+        slot = component._try_alloc_mamba_slot()
         self.assertIsNotNone(slot)
         self.assertEqual(cache.component_protected_size_[ComponentType.MAMBA], N)
 
@@ -234,7 +243,7 @@ class TestMambaDonatedAllocRatio(unittest.TestCase):
         # pool = 2N but the matched prefixes are evictable (skip_mamba on decode):
         # eviction reclaims a victim, so even ratio 2 serves the donated alloc.
         component, cache, _ = _build_peak(pool_size=2 * N, lock_prefixes=False)
-        slot = component._alloc_mamba_slot()
+        slot = component._try_alloc_mamba_slot()
         self.assertIsNotNone(slot)
         self.assertEqual(len(cache.prefix_nodes), N - 1)
         self.assertEqual(

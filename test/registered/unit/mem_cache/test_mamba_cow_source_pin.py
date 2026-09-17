@@ -30,6 +30,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -39,19 +40,25 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
-    MambaComponent,
-)
-from sglang.srt.mem_cache.unified_cache.components.tree_component import (
+from sglang.srt.mem_cache.unified_cache.component_type import (
     ComponentType,
+)
+from sglang.srt.mem_cache.unified_cache.components.mamba import (
+    MambaComponent,
 )
 
 
 class _FakeReq:
     def __init__(self):
-        self.mamba_pool_idx = torch.tensor([0])
-        self.mamba_cow_src_index = None
-        self.mamba_needs_clear = False
+        # finalize_match_result_in_cache writes the COW bookkeeping onto
+        # req.kv; holds_mamba=True keeps the test on the pin path only
+        # (no destination-slot allocation).
+        self.kv = SimpleNamespace(
+            mamba_pool_idx=torch.tensor([0]),
+            mamba_cow_src_index=None,
+            mamba_needs_clear=False,
+            holds_mamba=True,
+        )
         self.mamba_cow_lock_node = None
         self.mamba_cow_lock_params = None
 
@@ -75,7 +82,8 @@ class _FakeCache:
     def inc_lock_ref(self, node_id, skip_lock_components=()):
         self.inc_lock_calls.append((node_id, skip_lock_components))
         return IncLockRefResult(
-            skip_lock_node_ids={ct: {node_id} for ct in skip_lock_components}
+            node_id=node_id,
+            skipped_lock_components=tuple(skip_lock_components),
         )
 
     def dec_lock_ref(self, node_id, params=None):
@@ -110,7 +118,7 @@ class TestMambaCowSourcePin(unittest.TestCase):
         component.finalize_match_result_in_cache(params, result)
 
         # The COW source was captured from best_match_node.
-        self.assertEqual(req.mamba_cow_src_index.item(), 7)
+        self.assertEqual(req.kv.mamba_cow_src_index.item(), 7)
         # A mamba-only pin was taken on the source node (skip every other comp).
         self.assertEqual(len(cache.inc_lock_calls), 1)
         node_id, skip = cache.inc_lock_calls[0]
@@ -128,7 +136,7 @@ class TestMambaCowSourcePin(unittest.TestCase):
 
         component.finalize_match_result_in_cache(params, result)
 
-        self.assertEqual(req.mamba_cow_src_index.item(), 7)
+        self.assertEqual(req.kv.mamba_cow_src_index.item(), 7)
         # last_node == best_match_node: the request lock already pins the source.
         self.assertEqual(len(cache.inc_lock_calls), 0)
         self.assertIsNone(req.mamba_cow_lock_node)
@@ -143,7 +151,7 @@ class TestMambaCowSourcePin(unittest.TestCase):
 
         component.finalize_match_result_in_cache(params, result)
 
-        self.assertIsNone(req.mamba_cow_src_index)
+        self.assertIsNone(req.kv.mamba_cow_src_index)
         self.assertEqual(len(cache.inc_lock_calls), 0)
         self.assertIsNone(req.mamba_cow_lock_node)
 

@@ -9,7 +9,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
-from sglang.srt.mem_cache.pool_host.base import HICACHE_HOST_MEMORY_RESERVE_BYTES
+from sglang.srt.mem_cache.pool_host.base import hicache_host_memory_reserve_bytes
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     alloc_with_pin_memory,
@@ -102,7 +102,7 @@ class TestMiniMaxSparseHiCacheIntegration(unittest.TestCase):
         self.assertIsNone(pool.index_k_pool.layer_transfer_counter)
 
     def test_k_only_host_pool_layout_contracts(self):
-        if psutil.virtual_memory().available <= HICACHE_HOST_MEMORY_RESERVE_BYTES:
+        if psutil.virtual_memory().available <= hicache_host_memory_reserve_bytes():
             self.skipTest("Not enough spare host memory for HiCache host pool tests.")
 
         for layout in ("layer_first", "page_first", "page_first_direct"):

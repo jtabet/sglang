@@ -22,7 +22,7 @@ class TestMambaPoolExhaustionGracefulDegradation(unittest.TestCase):
 
     def test_try_alloc_mamba_slot_returns_none_on_exhaustion(self):
         """_try_alloc_mamba_slot returns None when alloc fails after eviction."""
-        from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
+        from sglang.srt.mem_cache.unified_cache.components.mamba import (
             MambaComponent,
         )
 
@@ -50,7 +50,7 @@ class TestMambaPoolExhaustionGracefulDegradation(unittest.TestCase):
 
     def test_try_alloc_mamba_slot_succeeds_on_retry(self):
         """_try_alloc_mamba_slot returns the slot when eviction frees one."""
-        from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
+        from sglang.srt.mem_cache.unified_cache.components.mamba import (
             MambaComponent,
         )
 
@@ -79,7 +79,9 @@ class TestMambaPoolExhaustionGracefulDegradation(unittest.TestCase):
 
     def test_census_logging_throttled(self):
         """The WARNING census is throttled to once per _CENSUS_THROTTLE_S."""
-        from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
+        import logging as _logging
+
+        from sglang.srt.mem_cache.unified_cache.components.mamba import (
             MambaComponent,
         )
 
@@ -93,28 +95,41 @@ class TestMambaPoolExhaustionGracefulDegradation(unittest.TestCase):
         component.component_type = mock.MagicMock()
         # Reset throttle so the first call logs
         MambaComponent._last_census_t = 0.0
+        logger_name = "sglang.srt.mem_cache.unified_cache.components.mamba"
+
+        class _Capture(_logging.Handler):
+            def __init__(self):
+                super().__init__(level=_logging.WARNING)
+                self.records = []
+
+            def emit(self, record):
+                self.records.append(record.getMessage())
 
         # First failure: should log census
-        with self.assertLogs(
-            "sglang.srt.mem_cache.unified_cache.components.mamba_component",
-            level="WARNING",
-        ) as logs:
+        cap = _Capture()
+        _logging.getLogger(logger_name).addHandler(cap)
+        try:
             component._try_alloc_mamba_slot()
-        self.assertEqual(len(logs.output), 1)
-        self.assertIn("census", logs.output[0])
+        finally:
+            _logging.getLogger(logger_name).removeHandler(cap)
+        self.assertEqual(len(cap.records), 1)
+        self.assertIn("census", cap.records[0])
 
-        # Second failure within throttle window: should NOT log
-        with self.assertLogs(
-            "sglang.srt.mem_cache.unified_cache.components.mamba_component",
-            level="WARNING",
-        ) as logs:
-            # This will still log because assertLogs requires at least one log
-            # So we check that the census was NOT repeated (only the metric)
+        # Second failure within throttle window: the census must NOT repeat
+        # (the throttled path returns before logging, so zero records is the
+        # expected outcome -- assertLogs can't express that, hence the handler).
+        cap2 = _Capture()
+        _logging.getLogger(logger_name).addHandler(cap2)
+        try:
             component._try_alloc_mamba_slot()
-        # The throttled call should not produce a census log
-        # But assertLogs catches any WARNING, so we verify it's NOT a census
-        for line in logs.output:
+        finally:
+            _logging.getLogger(logger_name).removeHandler(cap2)
+        for line in cap2.records:
             self.assertNotIn("census", line)
+        # The failure itself is still accounted for on every attempt.
+        self.assertEqual(
+            cache.metrics_collector.increment_aux_alloc_failed.call_count, 2
+        )
 
 
 if __name__ == "__main__":
