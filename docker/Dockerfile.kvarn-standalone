@@ -1,5 +1,7 @@
 FROM jtabet/sglang:kvarn-latest
 
-# Update Python source in-place (editable install — no recompile needed)
+# Update Python source in-place (editable install — no recompile needed).
+# Keep the base image's sglang-kernel (0.4.6.post1) and flashinfer (0.6.17)
+# to avoid dependency conflicts — the validation fix is pure Python.
 COPY python/ /sgl-workspace/sglang/python/
 COPY test/ /sgl-workspace/sglang/test/
