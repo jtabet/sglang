@@ -3,7 +3,8 @@ FROM jtabet/sglang:kvarn-latest
 # Upgrade flashinfer to 0.6.18 to satisfy the upstream version check
 # (the base image ships 0.6.17, but the merged upstream requires >= 0.6.18).
 # Also upgrade sglang-kernel to 0.4.7 for the same reason.
-RUN pip install --no-cache-dir 'flashinfer-python[cu13]==0.6.18' sglang-kernel==0.4.7
+# flashinfer-cubin must match flashinfer-python version.
+RUN pip install --no-cache-dir 'flashinfer-python[cu13]==0.6.18' flashinfer-cubin==0.6.18 sglang-kernel==0.4.7
 
 # Update Python source in-place (editable install — no recompile needed)
 COPY python/ /sgl-workspace/sglang/python/
