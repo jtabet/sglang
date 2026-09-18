@@ -216,7 +216,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                     weight_quant = scheme_map.get("weights")
                     if weight_quant is not None:
                         return CompressedTensorsEmbeddingMethod(weight_quant)
-                break
+                    break
 
         from sglang.srt.layers.radix_attention import RadixAttention
 
