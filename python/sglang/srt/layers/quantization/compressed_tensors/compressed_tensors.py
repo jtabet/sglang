@@ -70,7 +70,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
 )
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu, set_weight_attrs
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -1369,36 +1369,40 @@ class CompressedTensorsEmbeddingMethod(QuantizeMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        from sglang.srt.model_loader.weight_utils import default_weight_loader
-
         output_size_per_partition = sum(output_partition_sizes)
-        weight_loader = extra_weight_attrs.get("weight_loader", default_weight_loader)
+        scale_size = input_size_per_partition // self.group_size if self.is_group else 1
 
-        scale_size = input_size // self.group_size if self.is_group else 1
+        # weight_packed: [V_per_partition, H/pack_factor] int32
+        # Sharded on vocab dim (output_dim=0), packed on hidden dim (input_dim=1).
+        weight_packed = torch.nn.Parameter(
+            torch.empty(
+                output_size_per_partition,
+                input_size_per_partition // self.pack_factor,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(weight_packed, {"input_dim": 1, "output_dim": 0})
+        set_weight_attrs(weight_packed, extra_weight_attrs)
+        layer.register_parameter("weight_packed", weight_packed)
 
-        for name, data in [
-            (
-                "weight_packed",
-                torch.empty(
-                    output_size_per_partition,
-                    input_size // self.pack_factor,
-                    dtype=torch.int32,
-                ),
+        # weight_scale: [V_per_partition, G] (or [V_per_partition, 1] for channel)
+        weight_scale = torch.nn.Parameter(
+            torch.empty(output_size_per_partition, scale_size, dtype=params_dtype),
+            requires_grad=False,
+        )
+        set_weight_attrs(weight_scale, {"input_dim": 1, "output_dim": 0})
+        set_weight_attrs(weight_scale, extra_weight_attrs)
+        layer.register_parameter("weight_scale", weight_scale)
+
+        # weight_shape: metadata tensor, not sharded
+        weight_shape = torch.nn.Parameter(
+            torch.tensor(
+                [output_size_per_partition, input_size], dtype=torch.int64
             ),
-            (
-                "weight_scale",
-                torch.empty(output_size_per_partition, scale_size, dtype=params_dtype),
-            ),
-            (
-                "weight_shape",
-                torch.tensor(
-                    [output_size_per_partition, input_size], dtype=torch.int64
-                ),
-            ),
-        ]:
-            param = torch.nn.Parameter(data, requires_grad=False)
-            setattr(param, "weight_loader", weight_loader)
-            layer.register_parameter(name, param)
+            requires_grad=False,
+        )
+        layer.register_parameter("weight_shape", weight_shape)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         packed = layer.weight_packed  # [V, H/pack_factor] int32
