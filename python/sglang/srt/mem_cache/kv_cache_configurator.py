@@ -456,7 +456,7 @@ class KVCacheConfigurator:
         )
 
     def _validate_kvarn_swa_compat(self) -> None:
-        """Reject KVarN + hybrid SWA with an actionable error.
+        """Reject KVarN + hybrid SWA/Mamba with an actionable error.
 
         KVarN KV-cache quantization packs K/V into a single compressed
         per-token record, which is fundamentally incompatible with the
@@ -464,6 +464,12 @@ class KVCacheConfigurator:
         into separate sub-pools (BaseSWAKVPool). Without this guard the SWA
         allocator's `assert isinstance(kvcache, BaseSWAKVPool)` fails at
         runtime with an opaque AssertionError.
+
+        KVarN is also incompatible with hybrid Mamba2 (mambaish) models:
+        the KVarN paging assumptions do not account for the separate Mamba2
+        recurrent-state pool, and the resulting memory pressure under HiCache
+        can cause Mamba2 COW (copy-on-write) source-slot eviction during
+        deferred copy, leading to cross-request recurrent-state contamination.
         """
         if self.is_hybrid_swa and get_model().kv_cache_dtype.startswith("kvarn_"):
             raise ValueError(
@@ -477,6 +483,18 @@ class KVCacheConfigurator:
                 "--disable-hybrid-swa-memory to treat the model as a single "
                 "full-attention pool (gives up the SWA memory savings but "
                 "enables KVarN)."
+            )
+        if self.mambaish_config is not None and get_model().kv_cache_dtype.startswith("kvarn_"):
+            raise ValueError(
+                "--kv-cache-dtype='kvarn_*' is not supported with hybrid "
+                "Mamba2 (linear-attention) models. KVarN's paging assumptions "
+                "do not account for the separate Mamba2 recurrent-state pool, "
+                "and under hierarchical cache the resulting memory pressure "
+                "can cause COW source-slot eviction during deferred copy, "
+                "leading to cross-request recurrent-state contamination. "
+                "Options: (1) drop --kv-cache-dtype to use the default (bf16) "
+                "cache, or pick a non-KVarN dtype such as 'fp8_e4m3' or "
+                "'nvfp4'."
             )
 
     def _init_pools(
