@@ -1633,7 +1633,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
 
         # Embedding layer
-        self.embed_tokens = self._build_embed_tokens(config)
+        self.embed_tokens = self._build_embed_tokens(config, quant_config)
 
         # Decoder layers
         def get_layer(idx: int, prefix: str):
@@ -1710,7 +1710,7 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         self.layers_to_capture = []
 
-    def _build_embed_tokens(self, config: Qwen3_5TextConfig) -> nn.Module:
+    def _build_embed_tokens(self, config: Qwen3_5TextConfig, quant_config: Optional[QuantizationConfig] = None) -> nn.Module:
         """Embedding sharding hook for models reusing this backbone."""
         if not self.pp_group.is_first_rank:
             return PPMissingLayer()
@@ -1718,6 +1718,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             config.vocab_size,
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
+            quant_config=quant_config,
             enable_tp=not is_dp_attention_enabled(),
         )
 
