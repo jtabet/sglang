@@ -218,23 +218,35 @@ class MambaComponent(TreeComponent):
             req.kv.mamba_pool_idx = dst_index[0]
         req.kv.mamba_cow_src_index = src_index
         req.kv.mamba_needs_clear = False
-        # The request lock pins `last_device_node` (best_match_device_node), not
-        # `best_match_node`. With HiCache the two diverge: the deeper node can carry
-        # host-backed Full + device mamba, and its device mamba slot is then
-        # unpinned and evictable while the deferred COW awaits on the forward
-        # stream. Eviction frees and reallocates that slot to another request,
-        # which is exactly the confidentiality leak. Pin the COW source node's
-        # mamba-only from capture until the forward drains; released with the
-        # request lock in `_dec_req_lock` / the streaming-session save path.
-        if result.best_match_node != result.last_device_node:
-            skip = tuple(
-                ct for ct in self.cache.tree_components if ct != self.component_type
-            )
-            lock_result = self.cache.inc_lock_ref(
-                result.best_match_node, skip_lock_components=skip
-            )
-            req.mamba_cow_lock_node = result.best_match_node
-            req.mamba_cow_lock_params = lock_result.to_dec_params()
+        # Pin the COW source node's mamba component unconditionally from
+        # capture until the forward stream drains the deferred copy.
+        #
+        # The request lock pins `last_device_node` (best_match_device_node),
+        # not `best_match_node`. With HiCache the two can diverge: the deeper
+        # node can carry host-backed Full + device mamba, and its device mamba
+        # slot is then unpinned and evictable while the deferred COW awaits on
+        # the forward stream. Even when they are equal, there is a window
+        # between capture (here) and when the request lock is acquired
+        # (schedule_policy._commit_prefill_admission) during which the source
+        # mamba slot has lock_ref == 0 and is evictable. Under kvarn's tight
+        # mamba pool sizing, evict_for_alloc(mamba_num=1) can free and
+        # reallocate that slot to another request before the deferred copy
+        # runs — a cross-request recurrent-state contamination (confidentiality
+        # leak).
+        #
+        # Pinning unconditionally closes the window at the source, independent
+        # of request-lock timing and node divergence. When best_match_node ==
+        # last_device_node, the mamba-only pin is additive to the later request
+        # lock (which also pins mamba on the same node); the extra ref is
+        # harmless and released in _dec_req_lock via _release_mamba_cow_lock.
+        skip = tuple(
+            ct for ct in self.cache.tree_components if ct != self.component_type
+        )
+        lock_result = self.cache.inc_lock_ref(
+            result.best_match_node, skip_lock_components=skip
+        )
+        req.mamba_cow_lock_node = result.best_match_node
+        req.mamba_cow_lock_params = lock_result.to_dec_params()
         return result
 
     def commit_insert_component_data(

@@ -1763,6 +1763,39 @@ class ModelRunner:
             forward_batch.mamba_cow_src_indices is not None
             and len(forward_batch.mamba_cow_src_indices) > 0
         ):
+            # Defensive guard: the unconditional pin in
+            # MambaComponent.finalize_match_result_in_cache should prevent
+            # the source slot from being evicted before this copy runs.
+            # If the pin is released too early or eviction bypasses it,
+            # the source slot would be in the free list and we'd copy
+            # another request's state — a cross-request contamination.
+            # Check on the simple MambaSlotAllocator (static pool); the
+            # unified allocator's free-list is internal and not directly
+            # inspectable, so the pin is the sole guard there.
+            mamba_allocator = getattr(pool, "mamba_allocator", None)
+            free_slots = getattr(mamba_allocator, "free_slots", None)
+            if free_slots is not None:
+                src_indices_cpu = forward_batch.mamba_cow_src_indices.cpu()
+                free_slots_cpu = free_slots.cpu()
+                is_freed = torch.isin(src_indices_cpu, free_slots_cpu).any()
+                if is_freed:
+                    logger.error(
+                        "Mamba COW source slot was evicted before deferred copy — "
+                        "skipping copy to avoid cross-request contamination. "
+                        "This indicates a pin release timing bug. "
+                        "src_indices=%s, free_slots_sample=%s",
+                        src_indices_cpu.tolist(),
+                        free_slots_cpu[:10].tolist(),
+                    )
+                    # Clear the dst slots instead of copying stale state.
+                    pool.mamba_pool.clear_slots(
+                        pool.translate_mamba_indices(
+                            forward_batch.mamba_cow_dst_indices
+                        )
+                    )
+                    forward_batch.mamba_cow_src_indices = None
+                    forward_batch.mamba_cow_dst_indices = None
+                    return
             if pool.mamba_ckpt_pool is not None:
                 # int8 checkpoints: dequantize src int8 ckpt slot into the active bf16 dst.
                 pool.mamba_ckpt_pool.load_to_active(
