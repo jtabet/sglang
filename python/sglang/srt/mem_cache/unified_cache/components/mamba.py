@@ -218,8 +218,8 @@ class MambaComponent(TreeComponent):
             req.kv.mamba_pool_idx = dst_index[0]
         req.kv.mamba_cow_src_index = src_index
         req.kv.mamba_needs_clear = False
-        # Pin the COW source node's mamba component unconditionally from
-        # capture until the forward stream drains the deferred copy.
+        # Pin the COW source node's mamba component from capture until the
+        # forward stream drains the deferred copy.
         #
         # The request lock pins `last_device_node` (best_match_device_node),
         # not `best_match_node`. With HiCache the two can diverge: the deeper
@@ -231,14 +231,14 @@ class MambaComponent(TreeComponent):
         # mamba slot has lock_ref == 0 and is evictable. Under kvarn's tight
         # mamba pool sizing, evict_for_alloc(mamba_num=1) can free and
         # reallocate that slot to another request before the deferred copy
-        # runs — a cross-request recurrent-state contamination (confidentiality
-        # leak).
+        # runs — a cross-request recurrent-state contamination.
         #
-        # Pinning unconditionally closes the window at the source, independent
-        # of request-lock timing and node divergence. When best_match_node ==
-        # last_device_node, the mamba-only pin is additive to the later request
-        # lock (which also pins mamba on the same node); the extra ref is
-        # harmless and released in _dec_req_lock via _release_mamba_cow_lock.
+        # When the nodes diverge, take a mamba-only pin on best_match_node
+        # (the original behavior). When they are equal, take a temporary
+        # mamba-only pin that is released in _release_mamba_cow_lock; the
+        # request lock will later add its own mamba ref on the same node,
+        # and _release_mamba_cow_lock releases the COW pin's ref while
+        # _dec_req_lock releases the request lock's ref.
         skip = tuple(
             ct for ct in self.cache.tree_components if ct != self.component_type
         )

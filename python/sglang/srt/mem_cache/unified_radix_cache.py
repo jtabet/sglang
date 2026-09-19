@@ -935,9 +935,16 @@ class UnifiedRadixCache(BasePrefixCache):
         self._release_mamba_cow_lock(req)
 
     def _release_mamba_cow_lock(self, req: Req) -> None:
-        """Release the COW-source mamba pin taken when the COW source node diverged
-        from last_node (HiCache host-split). Safe here: callers drain the forward
-        stream (copy_done.synchronize) before this runs."""
+        """Release the COW-source mamba pin taken at capture.
+
+        Safe here: callers drain the forward stream (copy_done.synchronize)
+        before this runs. The COW pin is a mamba-only lock; the request lock
+        (released by the preceding ``dec_lock_ref`` in ``_dec_req_lock``) is
+        a separate lock that covers all components. When the COW source node
+        is the same as ``req.last_node``, both locks increment the mamba
+        component's ref on that node — this release handles the COW pin's
+        ref, and the request lock's release handles its own ref.
+        """
         if req.mamba_cow_lock_node is not None:
             self.dec_lock_ref(req.mamba_cow_lock_node, req.mamba_cow_lock_params)
             req.mamba_cow_lock_node = None
