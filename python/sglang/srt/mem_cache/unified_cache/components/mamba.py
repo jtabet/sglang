@@ -218,6 +218,20 @@ class MambaComponent(TreeComponent):
             req.kv.mamba_pool_idx = dst_index[0]
         req.kv.mamba_cow_src_index = src_index
         req.kv.mamba_needs_clear = False
+        # DIAGNOSTIC: log COW capture details for cross-request contamination
+        # investigation. Log rid, src/dst slot indices, matched node id, and
+        # prefix length so we can trace which request's state is being COW'd.
+        logger.info(
+            "MAMBA_COW_CAPTURE rid=%s node=%s kv_hit=%s mamba_branch=%s "
+            "src_slot=%s dst_slot=%s mamba_avail=%s",
+            getattr(req, "rid", "?"),
+            result.best_match_node,
+            result.full_kv_hit_length,
+            result.mamba_branching_seqlen,
+            src_index.tolist() if hasattr(src_index, "tolist") else src_index,
+            req.kv.mamba_pool_idx,
+            self.cache.req_to_token_pool.mamba_allocator.available_size(),
+        )
         # Pin the COW source node's mamba component from capture until the
         # forward stream drains the deferred copy.
         #
@@ -258,6 +272,19 @@ class MambaComponent(TreeComponent):
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         assert params.mamba_value is not None
+        # DIAGNOSTIC: log mamba state insert for contamination investigation.
+        logger.info(
+            "MAMBA_INSERT node=%s is_new_leaf=%s mamba_value=%s session_id=%s "
+            "prefix_len=%s mamba_exist=%s",
+            node.id,
+            is_new_leaf,
+            params.mamba_value.tolist()
+            if hasattr(params.mamba_value, "tolist")
+            else params.mamba_value,
+            getattr(params, "session_id", "?"),
+            result.prefix_len,
+            result.mamba_exist,
+        )
         if is_new_leaf:
             node.component_data[self.component_type].value = params.mamba_value
             self.tree_core.lru_lists[self.component_type].insert_mru(node)

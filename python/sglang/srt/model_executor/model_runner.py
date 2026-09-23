@@ -1763,6 +1763,16 @@ class ModelRunner:
             forward_batch.mamba_cow_src_indices is not None
             and len(forward_batch.mamba_cow_src_indices) > 0
         ):
+            # DIAGNOSTIC: log COW execution for contamination investigation.
+            logger.info(
+                "MAMBA_COW_EXEC src=%s dst=%s batch_size=%s rids=%s",
+                forward_batch.mamba_cow_src_indices.tolist(),
+                forward_batch.mamba_cow_dst_indices.tolist()
+                if forward_batch.mamba_cow_dst_indices is not None
+                else "?",
+                len(forward_batch.mamba_cow_src_indices),
+                forward_batch.rids,
+            )
             # Defensive guard: the unconditional pin in
             # MambaComponent.finalize_match_result_in_cache should prevent
             # the source slot from being evicted before this copy runs.
