@@ -185,14 +185,6 @@ class KVarNAttnBackend(AttentionBackend):
         self._slot_to_block: dict[int, int] = {}  # tail pool slot -> block_id
         self._free_slots: list[int] = []
         self._block_fill: dict[int, int] = {}  # block_id -> token count in tail pool
-        # DIAGNOSTIC: generation counter per block_id, bumped on every free→alloc
-        # reuse. A decode that reads a block from int4 (no tail slot) whose tile
-        # predates the current generation is a cross-request KV contamination.
-        self._block_gen: dict[int, int] = {}
-        self._block_gen_counter = 0
-        # gen at the last time this block's int4 tile was written (flush). A read
-        # from int4 when _block_flush_gen < _block_gen means the tile is stale.
-        self._block_flush_gen: dict[int, int] = {}
 
         # Sink blocks: block_ids that stay in fp16, never flushed
         self._sink_block_ids: set[int] = set()
@@ -440,19 +432,6 @@ class KVarNAttnBackend(AttentionBackend):
         self._block_to_slot[block_id] = slot
         self._slot_to_block[slot] = block_id
         self._block_fill[block_id] = 0
-        # DIAGNOSTIC: detect block_id reuse. If this block_id was freed before
-        # (its int4 tile holds a prior request's KV), a prefix-hit read that
-        # lands on int4 before this block is re-flushed will see stale KV.
-        self._block_gen_counter += 1
-        prev_gen = self._block_gen.get(block_id, 0)
-        if prev_gen > 0:
-            logger.debug(
-                "KVARN_BLOCK_REUSE block_id=%s prev_gen=%s new_gen=%s",
-                block_id,
-                prev_gen,
-                self._block_gen_counter,
-            )
-        self._block_gen[block_id] = self._block_gen_counter
         # Update GPU lookup tensor
         if self._block_to_slot_t is not None and block_id < self._block_lookup_size:
             self._block_to_slot_t[block_id] = slot
@@ -1634,20 +1613,6 @@ class KVarNAttnBackend(AttentionBackend):
         ROTATED frame (as stored in the compressed cache — no un-rotation).
         The caller uses this in the rotated-frame attention computation.
         """
-        # DIAGNOSTIC: a block read from int4 (no tail slot) whose tile was
-        # flushed in an earlier generation than the block's current allocation
-        # is a cross-request KV contamination: the int4 tile holds a prior
-        # request's rotated K/V.
-        flush_gen = self._block_flush_gen.get(block_id, -1)
-        cur_gen = self._block_gen.get(block_id, -1)
-        if cur_gen > flush_gen and flush_gen >= 0:
-            logger.error(
-                "KVARN_STALE_READ block_id=%s flush_gen=%s cur_gen=%s layer=%s",
-                block_id,
-                flush_gen,
-                cur_gen,
-                layer_id,
-            )
         K_blk, V_blk = self.flush_manager.dequant_block(
             block_id,
             self.kv_cache_int4,
@@ -1715,25 +1680,6 @@ class KVarNAttnBackend(AttentionBackend):
             block_table_rows = (slots // self.page_size).cpu().tolist()
         else:
             block_table_rows = []
-
-        # DIAGNOSTIC: stale-int4-read detector on the fused read path. Any
-        # block this batch will read from int4 (absent from _block_to_slot)
-        # whose tile was flushed before the block's current allocation is a
-        # cross-request KV contamination: the kernel will dequant a prior
-        # request's rotated K/V.
-        for row in block_table_rows:
-            for bid in row:
-                if bid < 0 or bid in self._block_to_slot:
-                    continue
-                flush_gen = self._block_flush_gen.get(bid, -1)
-                cur_gen = self._block_gen.get(bid, -1)
-                if flush_gen >= 0 and cur_gen > flush_gen:
-                    logger.error(
-                        "KVARN_STALE_READ block_id=%s flush_gen=%s cur_gen=%s",
-                        bid,
-                        flush_gen,
-                        cur_gen,
-                    )
 
         # --- blocks_needed: blocks written this step ---
         # committed = tokens already in pool before this step = sl - q_len.
@@ -1855,7 +1801,6 @@ class KVarNAttnBackend(AttentionBackend):
             )
             # Free the flushed blocks' slots
             for bid in flush_block_ids:
-                self._block_flush_gen[bid] = self._block_gen.get(bid, 0)
                 self._free_slot(bid)
 
         # Free discarded partial blocks. A partial block's int4 tile is STALE:
@@ -1866,7 +1811,6 @@ class KVarNAttnBackend(AttentionBackend):
         # request's rotated K/V (cross-request KV contamination).
         for bid in discard_ids:
             self._zero_int4_tile(bid)
-            self._block_flush_gen.pop(bid, None)
             self._free_slot(bid)
 
     def _flush_block(self, block_id: int):
@@ -1882,7 +1826,6 @@ class KVarNAttnBackend(AttentionBackend):
             slot=slot,
             compressed_cache=self.kv_cache_int4,
         )
-        self._block_flush_gen[block_id] = self._block_gen.get(block_id, 0)
 
         # Free the tail pool slot
         self._free_slot(block_id)
