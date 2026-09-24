@@ -479,7 +479,7 @@ class KVarNAttnBackend(AttentionBackend):
         content.
         """
         for li in range(self.num_layers):
-            self.kv_cache_int4[self._li(li)][block_id].zero_()
+            self.kv_cache_int4[li][block_id].zero_()
 
     def get_slot_for_block(self, block_id: int) -> Optional[int]:
         """Get the tail pool slot for a block, or None if flushed."""
