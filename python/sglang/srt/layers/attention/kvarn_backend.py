@@ -185,6 +185,11 @@ class KVarNAttnBackend(AttentionBackend):
         self._slot_to_block: dict[int, int] = {}  # tail pool slot -> block_id
         self._free_slots: list[int] = []
         self._block_fill: dict[int, int] = {}  # block_id -> token count in tail pool
+        # DIAGNOSTIC: generation counter per block_id, bumped on every free→alloc
+        # reuse. A decode that reads a block from int4 (no tail slot) whose tile
+        # predates the current generation is a cross-request KV contamination.
+        self._block_gen: dict[int, int] = {}
+        self._block_gen_counter = 0
 
         # Sink blocks: block_ids that stay in fp16, never flushed
         self._sink_block_ids: set[int] = set()
@@ -432,6 +437,19 @@ class KVarNAttnBackend(AttentionBackend):
         self._block_to_slot[block_id] = slot
         self._slot_to_block[slot] = block_id
         self._block_fill[block_id] = 0
+        # DIAGNOSTIC: detect block_id reuse. If this block_id was freed before
+        # (its int4 tile holds a prior request's KV), a prefix-hit read that
+        # lands on int4 before this block is re-flushed will see stale KV.
+        self._block_gen_counter += 1
+        prev_gen = self._block_gen.get(block_id, 0)
+        if prev_gen > 0:
+            logger.warning(
+                "KVARN_BLOCK_REUSE block_id=%s prev_gen=%s new_gen=%s",
+                block_id,
+                prev_gen,
+                self._block_gen_counter,
+            )
+        self._block_gen[block_id] = self._block_gen_counter
         # Update GPU lookup tensor
         if self._block_to_slot_t is not None and block_id < self._block_lookup_size:
             self._block_to_slot_t[block_id] = slot
@@ -1550,7 +1568,6 @@ class KVarNAttnBackend(AttentionBackend):
                 K_blk, V_blk = self._read_block_dequantized(layer_id, block_id)
                 K_parts.append(K_blk)
                 V_parts.append(V_blk)
-
         if tail_len > 0:
             block_id = block_ids[n_full]
             slot = self._block_to_slot.get(block_id)

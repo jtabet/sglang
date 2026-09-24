@@ -1765,11 +1765,7 @@ class ModelRunner:
         ):
             # DIAGNOSTIC: log COW execution for contamination investigation.
             logger.info(
-                "MAMBA_COW_EXEC src=%s dst=%s batch_size=%s rids=%s",
-                forward_batch.mamba_cow_src_indices.tolist(),
-                forward_batch.mamba_cow_dst_indices.tolist()
-                if forward_batch.mamba_cow_dst_indices is not None
-                else "?",
+                "MAMBA_COW_EXEC batch_size=%s rids=%s",
                 len(forward_batch.mamba_cow_src_indices),
                 forward_batch.rids,
             )
