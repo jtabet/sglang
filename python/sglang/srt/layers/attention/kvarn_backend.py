@@ -469,6 +469,18 @@ class KVarNAttnBackend(AttentionBackend):
             if self._block_to_slot_t is not None and block_id < self._block_lookup_size:
                 self._block_to_slot_t[block_id] = -1
 
+    def _zero_int4_tile(self, block_id: int) -> None:
+        """Zero a block's int4 tile across all compressed layers.
+
+        Used when a block is freed WITHOUT being flushed (partial-block
+        discard): the tile may still hold a prior request's rotated K/V from
+        an earlier allocation of this recycled page id. Zeroing guarantees a
+        later prefix-hit read on the recycled id cannot serve that stale
+        content.
+        """
+        for li in range(self.num_layers):
+            self.kv_cache_int4[self._li(li)][block_id].zero_()
+
     def get_slot_for_block(self, block_id: int) -> Optional[int]:
         """Get the tail pool slot for a block, or None if flushed."""
         return self._block_to_slot.get(block_id)
@@ -1846,8 +1858,15 @@ class KVarNAttnBackend(AttentionBackend):
                 self._block_flush_gen[bid] = self._block_gen.get(bid, 0)
                 self._free_slot(bid)
 
-        # Free discarded partial blocks
+        # Free discarded partial blocks. A partial block's int4 tile is STALE:
+        # it may hold a prior request's flushed content (from an earlier
+        # allocation of this recycled page id) that was never overwritten
+        # because the block was never fully written. Zero the tile so a later
+        # prefix-hit read on this recycled page id cannot serve another
+        # request's rotated K/V (cross-request KV contamination).
         for bid in discard_ids:
+            self._zero_int4_tile(bid)
+            self._block_flush_gen.pop(bid, None)
             self._free_slot(bid)
 
     def _flush_block(self, block_id: int):
