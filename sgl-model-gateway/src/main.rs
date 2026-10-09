@@ -353,6 +353,25 @@ struct CliArgs {
     #[arg(long, help_heading = "Rate Limiting")]
     rate_limit_tokens_per_second: Option<i32>,
 
+    // ==================== TTFT Budgeting ====================
+    /// Prefill throughput estimate (tokens/second/worker) used to answer
+    /// `X-TTFT-Budget-Ms` request headers. When a request carries a budget
+    /// and the estimated TTFT from cache-aware match_rate exceeds it, the
+    /// gateway declines with 425 (prefill_budget_exceeded) while running the
+    /// prefill in the background (prefill-then-abort warmup). 0 disables.
+    #[arg(long, default_value_t = 0.0, help_heading = "TTFT Budgeting")]
+    ttft_prefill_rate_tps: f32,
+
+    /// Chars-per-token ratio used to convert routing text length into an
+    /// estimated token count for TTFT budgeting.
+    #[arg(long, default_value_t = 3.5, help_heading = "TTFT Budgeting")]
+    ttft_chars_per_token: f32,
+
+    /// Maximum concurrently running background warmup prefills spawned by
+    /// TTFT budget declines.
+    #[arg(long, default_value_t = 4, help_heading = "TTFT Budgeting")]
+    ttft_max_warmups: usize,
+
     // ==================== Retry Configuration ====================
     /// Maximum number of retry attempts
     #[arg(long, default_value_t = 5, help_heading = "Retry Configuration")]
@@ -1068,6 +1087,9 @@ impl CliArgs {
             .dp_aware(self.dp_aware)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
+            .ttft_prefill_rate_tps(self.ttft_prefill_rate_tps)
+            .ttft_chars_per_token(self.ttft_chars_per_token)
+            .ttft_max_warmups(self.ttft_max_warmups)
             .enable_wasm(self.enable_wasm)
             .igw(self.enable_igw)
             .maybe_server_cert_and_key(self.tls_cert_path.as_ref(), self.tls_key_path.as_ref());

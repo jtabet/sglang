@@ -36,6 +36,25 @@ pub fn service_unavailable(code: impl Into<String>, message: impl Into<String>) 
     create_error(StatusCode::SERVICE_UNAVAILABLE, code, message)
 }
 
+/// 425 Too Early (RFC 9163 §2 — originally RFC 8470): the server is unwilling
+/// to process the request yet because the state it depends on is not ready.
+///
+/// Used by TTFT budget gating: the prompt cache for this request is cold (the
+/// cache-aware policy's match_rate predicts a first token slower than the
+/// caller's `X-TTFT-Budget-Ms` budget), so the gateway declines immediately
+/// — typically to let a router re-select a warmer worker — while the prefill
+/// itself keeps running in the background so the cache is warm for the next
+/// request. Semantics deliberately differ from 503: the workers are healthy,
+/// nothing is overloaded, and retrying the same request right now would hit
+/// the same estimate; the caller should route elsewhere or wait for the
+/// warmup to land.
+///
+/// `code` should be `prefill_budget_exceeded`; the body may carry the
+/// estimate details for the caller's logs.
+pub fn too_early(code: impl Into<String>, message: impl Into<String>) -> Response {
+    create_error(StatusCode::TOO_EARLY, code, message)
+}
+
 pub fn failed_dependency(code: impl Into<String>, message: impl Into<String>) -> Response {
     create_error(StatusCode::FAILED_DEPENDENCY, code, message)
 }
@@ -84,6 +103,29 @@ fn status_code_to_str(status_code: StatusCode) -> &'static str {
     status_code
         .canonical_reason()
         .unwrap_or("Unknown Status Code")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    #[tokio::test]
+    async fn too_early_response_shape() {
+        let res = too_early("prefill_budget_exceeded", "est ttft 84000ms > budget 10000ms");
+        assert_eq!(res.status(), StatusCode::TOO_EARLY);
+        assert_eq!(
+            res.headers()
+                .get(HEADER_X_SMG_ERROR_CODE)
+                .and_then(|v| v.to_str().ok()),
+            Some("prefill_budget_exceeded")
+        );
+        let (_, body) = res.into_parts();
+        let bytes = to_bytes(body, usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains(r#""type":"Too Early""#), "body: {}", text);
+        assert!(text.contains("prefill_budget_exceeded"), "body: {}", text);
+    }
 }
 
 pub fn extract_error_code_from_response<B>(response: &Response<B>) -> &str {

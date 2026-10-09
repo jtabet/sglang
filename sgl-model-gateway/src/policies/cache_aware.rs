@@ -307,7 +307,7 @@ impl CacheAwarePolicy {
         }
     }
 
-    fn select_worker_min_load(
+    async fn select_worker_min_load(
         &self,
         workers: &[Arc<dyn Worker>],
         request_text: &Option<&str>,
@@ -389,6 +389,16 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
     ) -> Option<usize> {
+        self.select_worker_with_info(workers, info)
+            .await
+            .map(|sel| sel.index)
+    }
+
+    async fn select_worker_with_info(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> Option<super::SelectionInfo> {
         let request_text = info.request_text;
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -413,14 +423,20 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
 
         if is_imbalanced {
-            return self.select_worker_min_load(
-                workers,
-                &request_text,
-                &healthy_indices,
-                &tree_key,
-                max_load,
-                min_load,
-            );
+            // Imbalanced path routes by load, not cache affinity — the tree
+            // does get the request text (inside select_worker_min_load), but
+            // there is no meaningful match_rate to report there.
+            return self
+                .select_worker_min_load(
+                    workers,
+                    &request_text,
+                    &healthy_indices,
+                    &tree_key,
+                    max_load,
+                    min_load,
+                )
+                .await
+                .map(|index| super::SelectionInfo { index, match_rate: 0.0 });
         }
 
         // Use cache-aware routing when balanced
@@ -486,7 +502,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 // Increment processed counter
                 workers[idx].increment_processed();
 
-                return Some(idx);
+                return Some(super::SelectionInfo {
+                    index: idx,
+                    match_rate,
+                });
             }
 
             // Selected worker no longer exists or unhealthy, remove stale tenant from tree
@@ -509,7 +528,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             }
 
             // Fallback to first healthy worker
-            healthy_indices.first().copied()
+            healthy_indices
+                .first()
+                .copied()
+                .map(|index| super::SelectionInfo { index, match_rate })
         } else {
             warn!(
                 "cache_aware: no tree found for key '{}', falling back to random \
@@ -521,7 +543,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             );
             let mut rng = rand::rng();
             let random_idx = rng.random_range(0..healthy_indices.len());
-            Some(healthy_indices[random_idx])
+            Some(super::SelectionInfo {
+                index: healthy_indices[random_idx],
+                match_rate: 0.0,
+            })
         }
     }
 

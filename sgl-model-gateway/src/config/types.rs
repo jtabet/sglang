@@ -99,6 +99,24 @@ pub struct RouterConfig {
     /// Enable WASM support
     #[serde(default)]
     pub enable_wasm: bool,
+    /// TTFT budgeting (orchestrel): when a request carries `X-TTFT-Budget-Ms`,
+    /// the router estimates time-to-first-token for the selected worker from
+    /// the cache-aware policy's match_rate and, when the estimate exceeds the
+    /// budget, declines with `425 prefill_budget_exceeded` while prefilling in
+    /// the background (prefill-then-abort warmup). Requires cache_aware
+    /// traffic signals to be meaningful.
+    /// Prefill throughput estimate in tokens/second per worker. 0 disables
+    /// budget gating entirely (the header is ignored).
+    #[serde(default = "default_ttft_prefill_rate_tps")]
+    pub ttft_prefill_rate_tps: f32,
+    /// Chars-per-token ratio used to convert routing text length (the same
+    /// text the affinity tree prefix-matches) into an estimated token count.
+    #[serde(default = "default_ttft_chars_per_token")]
+    pub ttft_chars_per_token: f32,
+    /// Maximum concurrently running background warmup prefills. A declined
+    /// request above the cap still gets 425, but spawns no warmup.
+    #[serde(default = "default_ttft_max_warmups")]
+    pub ttft_max_warmups: usize,
 }
 
 /// Tokenizer cache configuration
@@ -146,6 +164,18 @@ fn default_pool_max_idle_per_host() -> usize {
 
 fn default_tcp_keepalive_secs() -> u64 {
     DEFAULT_TCP_KEEPALIVE_SECS
+}
+
+fn default_ttft_prefill_rate_tps() -> f32 {
+    0.0 // disabled unless the operator opts in
+}
+
+fn default_ttft_chars_per_token() -> f32 {
+    3.5
+}
+
+fn default_ttft_max_warmups() -> usize {
+    4
 }
 
 impl TokenizerCacheConfig {
@@ -553,6 +583,9 @@ impl Default for RouterConfig {
             enable_wasm: false,
             server_cert: None,
             server_key: None,
+            ttft_prefill_rate_tps: default_ttft_prefill_rate_tps(),
+            ttft_chars_per_token: default_ttft_chars_per_token(),
+            ttft_max_warmups: default_ttft_max_warmups(),
         }
     }
 }

@@ -54,6 +54,23 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         info: &SelectWorkerInfo<'_>,
     ) -> Option<usize>;
 
+    /// Select a worker and also report selection metadata (see
+    /// [`SelectionInfo`]).
+    ///
+    /// Default: delegates to [`Self::select_worker`] and reports
+    /// `match_rate: 0.0`. Cache-aware policies override this to surface the
+    /// ratio their affinity tree already computed, so the router can estimate
+    /// TTFT without re-walking the tree.
+    async fn select_worker_with_info(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> Option<SelectionInfo> {
+        self.select_worker(workers, info)
+            .await
+            .map(|index| SelectionInfo { index, match_rate: 0.0 })
+    }
+
     /// Update policy state after request completion
     ///
     /// This is called when a request completes (successfully or not) to allow
@@ -171,6 +188,20 @@ pub struct SelectWorkerInfo<'a> {
     /// Pre-computed hash ring for O(log n) consistent hashing
     /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
     pub hash_ring: Option<Arc<HashRing>>,
+}
+
+/// Extra data produced by worker selection, for callers that need more than
+/// the chosen index.
+///
+/// `match_rate` is the raw prefix-match ratio (0.0..=1.0) computed by
+/// cache-aware policies against the per-worker affinity tree. Policies that
+/// don't track cache affinity report 0.0. The HTTP router consumes this for
+/// time-to-first-token estimation when a request carries an
+/// `X-TTFT-Budget-Ms` header (see `route_typed_request_once`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SelectionInfo {
+    pub index: usize,
+    pub match_rate: f32,
 }
 
 #[cfg(test)]

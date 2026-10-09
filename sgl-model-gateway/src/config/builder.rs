@@ -378,6 +378,27 @@ impl RouterConfigBuilder {
         self
     }
 
+    // ==================== TTFT budgeting ====================
+
+    /// Prefill throughput estimate (tokens/second/worker) for TTFT budget
+    /// gating via `X-TTFT-Budget-Ms`. 0 disables the gate.
+    pub fn ttft_prefill_rate_tps(mut self, tps: f32) -> Self {
+        self.config.ttft_prefill_rate_tps = tps;
+        self
+    }
+
+    /// Chars-per-token ratio for TTFT estimation.
+    pub fn ttft_chars_per_token(mut self, ratio: f32) -> Self {
+        self.config.ttft_chars_per_token = ratio;
+        self
+    }
+
+    /// Max concurrent background warmup prefills.
+    pub fn ttft_max_warmups(mut self, cap: usize) -> Self {
+        self.config.ttft_max_warmups = cap;
+        self
+    }
+
     pub fn model_path<S: Into<String>>(mut self, path: S) -> Self {
         self.config.model_path = Some(path.into());
         self

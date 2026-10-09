@@ -9,7 +9,7 @@ use axum::{
 };
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::{
     app_context::AppContext,
@@ -51,6 +51,78 @@ pub struct Router {
     dp_aware: bool,
     enable_igw: bool,
     retry_config: RetryConfig,
+    /// Prefill throughput estimate (tokens/second/worker) for TTFT budget
+    /// gating. 0 disables the gate (X-TTFT-Budget-Ms ignored).
+    ttft_prefill_rate_tps: f32,
+    /// Chars-per-token used to convert routing text into estimated tokens.
+    ttft_chars_per_token: f32,
+    /// Max concurrent background warmups (config).
+    /// Worker URLs with a background warmup prefill currently running. A
+    /// budget-bearing request routed to one of these is declined until the
+    /// warmup lands — the affinity tree was already updated at decline time,
+    /// so the estimate alone would wrongly claim the cache is warm.
+    ttft_warming: Arc<TtftWarmingRegistry>,
+    /// Max concurrent background warmups (from RouterConfig).
+    ttft_max_warmups: usize,
+}
+
+/// Tracks background warmup prefills per worker URL. Not clone-safe state —
+/// the Router holds one Arc; both the request path and spawned warmup tasks
+/// share it.
+#[derive(Debug, Default)]
+struct TtftWarmingRegistry {
+    in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl TtftWarmingRegistry {
+    fn is_warming(&self, url: &str) -> bool {
+        self.in_flight.lock().unwrap().contains(url)
+    }
+
+    /// Register a warmup for `url`. Fails when one is already running for the
+    /// worker or the global cap is reached — the caller then declines without
+    /// spawning.
+    fn register(&self, url: &str, max_warmups: usize) -> bool {
+        let mut guard = self.in_flight.lock().unwrap();
+        if guard.contains(url) || guard.len() >= max_warmups {
+            return false;
+        }
+        guard.insert(url.to_string());
+        true
+    }
+
+    fn release(&self, url: &str) {
+        self.in_flight.lock().unwrap().remove(url);
+    }
+
+    fn len(&self) -> usize {
+        self.in_flight.lock().unwrap().len()
+    }
+}
+
+/// Estimated milliseconds to the first token for a request routed with the
+/// given cache `match_rate` (0.0..=1.0). Uncached characters are converted
+/// to tokens with `chars_per_token` and divided by `prefill_tps`.
+pub(crate) fn estimate_ttft_ms(
+    text: &str,
+    match_rate: f32,
+    chars_per_token: f32,
+    prefill_tps: f32,
+) -> u64 {
+    let input_chars = text.chars().count();
+    if input_chars == 0 || prefill_tps <= 0.0 {
+        return 0;
+    }
+    let uncached_chars = input_chars as f32 * (1.0 - match_rate.clamp(0.0, 1.0));
+    let est_tokens = uncached_chars / chars_per_token.max(0.1);
+    (est_tokens / prefill_tps.max(0.1) * 1000.0) as u64
+}
+
+/// Parse the caller's time-to-first-token budget (`X-TTFT-Budget-Ms`).
+/// Absent or malformed header → None (no budgeting for this request).
+fn ttft_budget_ms(headers: Option<&HeaderMap>) -> Option<u64> {
+    let value = headers?.get("x-ttft-budget-ms")?.to_str().ok()?;
+    value.trim().parse::<u64>().ok()
 }
 
 impl std::fmt::Debug for Router {
@@ -76,6 +148,10 @@ impl Router {
             dp_aware: ctx.router_config.dp_aware,
             enable_igw: ctx.router_config.enable_igw,
             retry_config: ctx.router_config.effective_retry_config(),
+            ttft_prefill_rate_tps: ctx.router_config.ttft_prefill_rate_tps,
+            ttft_chars_per_token: ctx.router_config.ttft_chars_per_token,
+            ttft_max_warmups: ctx.router_config.ttft_max_warmups,
+            ttft_warming: Arc::new(TtftWarmingRegistry::default()),
         })
     }
 
@@ -130,13 +206,14 @@ impl Router {
         }
     }
 
-    /// Select worker for a specific model considering circuit breaker state
+    /// Select worker for a specific model considering circuit breaker state.
+    /// Also reports the policy's match_rate for TTFT estimation.
     async fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Option<(Arc<dyn Worker>, f32)> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
         // Get workers for the specified model O(1), filtered by connection mode
@@ -168,8 +245,8 @@ impl Router {
             .worker_registry
             .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
 
-        let idx = policy
-            .select_worker(
+        let selection = policy
+            .select_worker_with_info(
                 &available,
                 &SelectWorkerInfo {
                     request_text: text,
@@ -188,7 +265,7 @@ impl Router {
             policy.name(),
         );
 
-        Some(available[idx].clone())
+        Some((available[selection.index].clone(), selection.match_rate))
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -279,11 +356,11 @@ impl Router {
         is_stream: bool,
         text: &str,
     ) -> Response {
-        let worker = match self
+        let (worker, match_rate) = match self
             .select_worker_for_model(model_id, Some(text), headers)
             .await
         {
-            Some(w) => w,
+            Some((w, mr)) => (w, mr),
             None => {
                 return error::service_unavailable(
                     "no_available_workers",
@@ -291,6 +368,58 @@ impl Router {
                 );
             }
         };
+
+        // ── TTFT budget gate (orchestrel) ─────────────────────────────────
+        // When the caller declares a time-to-first-token budget and the
+        // cache-aware estimate says this worker cannot meet it, decline
+        // immediately with 425 while keeping the prefill running in the
+        // background (prefill-then-abort warmup). The affinity tree was
+        // already updated by select_worker_with_info, so the NEXT request
+        // with the same prefix sees a high match_rate — and the real engine
+        // cache becomes warm as the warmup lands. While a warmup is in
+        // flight for the selected worker, budgeted requests keep declining:
+        // the tree already claims affinity but the engine cache is not
+        // populated yet.
+        if self.ttft_prefill_rate_tps > 0.0 {
+            if let Some(budget_ms) = ttft_budget_ms(headers) {
+                let est_ms = estimate_ttft_ms(
+                    text,
+                    match_rate,
+                    self.ttft_chars_per_token,
+                    self.ttft_prefill_rate_tps,
+                );
+                let warming = self.ttft_warming.is_warming(worker.url());
+                if est_ms > budget_ms || warming {
+                    let reason = if warming {
+                        "warmup in flight for selected worker".to_string()
+                    } else {
+                        format!(
+                            "estimated ttft {}ms exceeds budget {}ms (match_rate {:.2})",
+                            est_ms, budget_ms, match_rate
+                        )
+                    };
+                    debug!(
+                        "TTFT budget gate: declining {} → {} ({})",
+                        model_id.unwrap_or(UNKNOWN_MODEL_ID),
+                        worker.url(),
+                        reason
+                    );
+                    self.maybe_spawn_warmup(
+                        headers, typed_req, route, &worker, is_stream,
+                        est_ms, budget_ms,
+                    );
+                    return error::too_early(
+                        "prefill_budget_exceeded",
+                        format!(
+                            "Prompt cache cold for this request: {} — skipping this request; \
+                             the prefill continues in the background and the cache will be \
+                             warm for your next calls.",
+                            reason
+                        ),
+                    );
+                }
+            }
+        }
 
         let policy = match model_id {
             Some(model) => self.policy_registry.get_policy_or_default(model),
@@ -336,7 +465,123 @@ impl Router {
         response
     }
 
-    // Helper: return base worker URL (strips DP suffix when enabled)
+    /// Spawn a background warmup prefill for a TTFT-budget decline.
+    ///
+    /// Re-issues the request against the selected worker with
+    /// `max_tokens: 1` and `stream: true` so the engine pays the prefill and
+    /// the first streamed token tells us the prompt cache is populated, then
+    /// aborts — no decode tokens are generated (the real answer for the
+    /// declined request came from another route; these tokens would be
+    /// discarded anyway).
+    ///
+    /// No-op when another warmup is already running for this worker or the
+    /// global warmup cap is reached (decline without warming).
+    ///
+    /// The warming registry entry is released once the first body byte
+    /// Arrives (prefill done) or on any error — either way the next budgeted
+    /// request re-evaluates the (now accurate) match_rate estimate.
+    fn maybe_spawn_warmup<T: GenerationRequest + serde::Serialize + Clone>(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        route: &'static str,
+        worker: &Arc<dyn Worker>,
+        _is_stream: bool,
+        _est_ms: u64,
+        _budget_ms: u64,
+    ) {
+        if !self
+            .ttft_warming
+            .register(worker.url(), self.ttft_warming_capacity())
+        {
+            debug!(
+                "TTFT warmup cap reached or warmup already running for {} — declining without warmup",
+                worker.url()
+            );
+            return;
+        }
+
+        // Mutate a copy of the request: force single-token streamed output so
+        // the drain sees a first byte exactly when prefill completes and the
+        // request ends naturally almost immediately after.
+        let mut warm_value = match serde_json::to_value(typed_req) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("TTFT warmup: failed to serialize request: {}", e);
+                self.ttft_warming.release(worker.url());
+                return;
+            }
+        };
+        if let Some(map) = warm_value.as_object_mut() {
+            map.insert("max_tokens".to_string(), serde_json::json!(1));
+            map.insert("stream".to_string(), serde_json::json!(true));
+            map.insert("ignore_eos".to_string(), serde_json::json!(false));
+        }
+
+        let worker_url = self.worker_base_url(worker.url());
+        let endpoint = format!("{}{}", worker_url, route);
+        let api_key = worker.api_key().clone();
+        let mut request = self.client.post(endpoint).json(&warm_value);
+        if let Some(key) = api_key {
+            request = request.header("Authorization", format!("Bearer {}", key));
+        }
+        if let Some(headers) = headers {
+            for (name, value) in headers.iter() {
+                if name.as_str() == "authorization" || name.as_str() == "content-length" {
+                    continue;
+                }
+                if let Ok(v) = value.to_str() {
+                    request = request.header(name.as_str(), v);
+                }
+            }
+        }
+
+        let warming = self.ttft_warming.clone();
+        let worker_url_str = worker.url().to_string();
+        tokio::spawn(async move {
+            let started = Instant::now();
+            match request.send().await {
+                Ok(resp) => {
+                    // Drain until the first body byte = prefill complete
+                    // (engine begins streaming decode of the 1 forced token).
+                    let mut body = resp.bytes_stream();
+                    let mut got_first = false;
+                    while let Some(chunk) = body.next().await {
+                        if chunk.is_err() {
+                            break;
+                        }
+                        if !got_first {
+                            got_first = true;
+                            tracing::info!(
+                                "TTFT warmup: prefill completed in {:?} for {}",
+                                started.elapsed(),
+                                worker_url_str
+                            );
+                            break;
+                        }
+                    }
+                    // Dropping `body` closes the upstream connection — sglang
+                    // aborts the remaining generation. Cache stays populated.
+                    drop(body);
+                }
+                Err(e) => {
+                    warn!(
+                        "TTFT warmup failed for {} after {:?}: {}",
+                        worker_url_str,
+                        started.elapsed(),
+                        e
+                    );
+                }
+            }
+            warming.release(&worker_url_str);
+        });
+    }
+
+    /// Warmup cap from config (kept as a method so the registry stays the
+    /// only shared mutable state).
+    fn ttft_warming_capacity(&self) -> usize {
+        self.ttft_max_warmups
+    }
     fn worker_base_url(&self, worker_url: &str) -> String {
         if self.dp_aware {
             if let Ok((prefix, _)) = Self::extract_dp_rank(worker_url) {
@@ -880,6 +1125,10 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             enable_igw: false,
+            ttft_prefill_rate_tps: 0.0,
+            ttft_chars_per_token: 3.5,
+            ttft_max_warmups: 4,
+            ttft_warming: Arc::new(TtftWarmingRegistry::default()),
         }
     }
 
@@ -922,5 +1171,53 @@ mod tests {
 
         let worker = router.worker_registry.get_by_url(&url).unwrap();
         assert!(worker.is_healthy());
+    }
+
+    #[test]
+    fn test_estimate_ttft_ms_shapes() {
+        // zero text -> 0
+        assert_eq!(estimate_ttft_ms("", 0.0, 3.5, 460.0), 0);
+        // disabled prefill rate -> 0
+        assert_eq!(estimate_ttft_ms("hello world", 0.0, 3.5, 0.0), 0);
+        // fully cached -> 0
+        assert_eq!(estimate_ttft_ms("some prompt", 1.0, 3.5, 460.0), 0);
+        // 142k text: 97% matched ~2.6s; fully cold ~88s (matches the
+        // observed 71s cold TTFT order of magnitude on crimson)
+        let text = "x".repeat(142_000);
+        let warmish = estimate_ttft_ms(&text, 0.97, 3.5, 460.0);
+        assert!(warmish > 2000 && warmish < 3500, "warmish={}", warmish);
+        let cold = estimate_ttft_ms(&text, 0.0, 3.5, 460.0);
+        assert!(cold > 80_000 && cold < 95_000, "cold={}", cold);
+    }
+
+    #[test]
+    fn test_ttft_budget_header_parsing() {
+        let mut hm = HeaderMap::new();
+        assert_eq!(ttft_budget_ms(None), None);
+        assert_eq!(ttft_budget_ms(Some(&hm)), None);
+        hm.insert(
+            "x-ttft-budget-ms",
+            HeaderValue::from_static("10000"),
+        );
+        assert_eq!(ttft_budget_ms(Some(&hm)), Some(10000));
+        let mut bad = HeaderMap::new();
+        bad.insert("x-ttft-budget-ms", HeaderValue::from_static("soon"));
+        assert_eq!(ttft_budget_ms(Some(&bad)), None);
+    }
+
+    #[test]
+    fn test_warming_registry() {
+        let reg = TtftWarmingRegistry::default();
+        assert!(reg.register("w1", 4));
+        assert!(reg.is_warming("w1"));
+        assert!(!reg.register("w1", 4), "same worker double-warmup rejected");
+        assert!(reg.register("w2", 4));
+        assert!(reg.register("w3", 4));
+        assert!(reg.register("w4", 4));
+        assert_eq!(reg.len(), 4);
+        assert!(!reg.register("w5", 4), "cap enforced");
+        reg.release("w1");
+        assert!(!reg.is_warming("w1"));
+        assert!(reg.register("w5", 4), "slot freed after release");
     }
 }
