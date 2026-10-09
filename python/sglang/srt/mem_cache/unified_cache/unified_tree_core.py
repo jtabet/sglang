@@ -444,7 +444,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.is_host_memory_buffer_only = False
         self.enable_storage = False
         self.enable_external_cache_linker = False
-        self.write_through_threshold = 256
+        self.write_through_threshold = 1
         self.is_write_back = False
         self.has_swa_host_pool = False
         self.enable_session_radix_cache = params.enable_session_radix_cache
