@@ -12,3 +12,11 @@ ENV FLASHINFER_DISABLE_VERSION_CHECK=1
 # Update Python source in-place (editable install — no recompile needed)
 COPY python/ /sgl-workspace/sglang/python/
 COPY test/ /sgl-workspace/sglang/test/
+
+# Build the Rust gateway binary from source (the base image's binary
+# may not have the TTFT budget gate features we need).
+COPY sgl-model-gateway/ /sgl-workspace/sglang/sgl-model-gateway/
+RUN cd /sgl-workspace/sglang/sgl-model-gateway && \
+    cargo build --release --bin sgl-model-gateway && \
+    cp target/release/sgl-model-gateway /usr/local/bin/sgl-model-gateway && \
+    rm -rf target
