@@ -386,10 +386,22 @@ class UnifiedCacheLinkerWrapper:
             # Allocate a fresh mamba slot so the tree insert succeeds —
             # the SSM state will be computed during prefill of the loaded tail.
             mamba_alloc = cache.req_to_token_pool.mamba_allocator.alloc(1)
-            assert mamba_alloc is not None, (
-                "Not enough mamba slots for linker load_back. "
-                "Try increasing --mamba-full-memory-ratio."
-            )
+            if mamba_alloc is None:
+                # Not enough mamba slots. Abort the load-back gracefully:
+                # free the KV device indices we allocated, then return the
+                # "no hit" result so the request falls back to normal prefill.
+                logger.warning(
+                    "linker.load_back: rid=%s — mamba allocator exhausted, "
+                    "aborting load-back (prefill will recompute the prefix)",
+                    req.rid,
+                )
+                self._update_load(
+                    ExternalLinkerLoadPhase.ABORT,
+                    req,
+                    component_transfers,
+                    prefix_len,
+                )
+                return empty_indices, req.last_node
             mamba_value = torch.tensor(
                 [mamba_alloc[0]], dtype=torch.int64, device=cache.device
             )
