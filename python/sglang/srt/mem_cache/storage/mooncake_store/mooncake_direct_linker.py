@@ -204,16 +204,25 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
-        expanded = self.pool_group.resolve_transfers(transfers)
+        expanded = self.pool_group.resolve_transfers(
+            transfers, allow_partial=True, allow_missing_kv=True
+        )
         if not expanded:
+            logger.info("mooncake.lookup: rid=%s — no expanded transfers", rid)
             return []
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         page_keys = list(kv.keys)
         if not page_keys:
+            logger.info("mooncake.lookup: rid=%s — no page keys", rid)
             return []
         result = self.storage.batch_exists_v2(page_keys, expanded)
         restorable = result.restorable_prefix_pages or []
         self.stats["lookup"] += 1
+        logger.info(
+            "mooncake.lookup: rid=%s keys=%d first_key=%s restorable=%s",
+            rid, len(page_keys), page_keys[0][:16] if page_keys else "none",
+            restorable[:5] if restorable else "[]",
+        )
         if restorable:
             logger.info(
                 "Mooncake direct linker lookup hit: rid=%s pages=%d candidates=%d",

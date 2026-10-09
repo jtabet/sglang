@@ -19,6 +19,8 @@ The tree only needs a handful of guarded hooks:
 
 from __future__ import annotations
 
+import logging
+
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, NamedTuple
@@ -26,6 +28,8 @@ from typing import TYPE_CHECKING, NamedTuple
 import torch
 
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
+
+logger = logging.getLogger(__name__)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     InsertParams,
@@ -54,6 +58,7 @@ _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
     {
         ComponentType.FULL,
         ComponentType.SWA,
+        ComponentType.MAMBA,
     }
 )
 
@@ -190,6 +195,7 @@ class UnifiedCacheLinkerWrapper:
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
+        logger.info("linker.match ENTERED: rid=%s key_len=%d device_hit=%d", req.rid, len(key), int(result.device_indices.numel()))
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
@@ -199,6 +205,10 @@ class UnifiedCacheLinkerWrapper:
 
         tail_hashes = self._tail_hashes(key, result, device_hit_len)
         if not tail_hashes:
+            logger.info(
+                "linker.match: rid=%s device_hit=%d key_len=%d — no tail_hashes (last_hash missing?)",
+                req.rid, device_hit_len, len(key),
+            )
             return result
 
         lookup_transfers = []
@@ -207,13 +217,30 @@ class UnifiedCacheLinkerWrapper:
                 LinkerTransferPhase.LOOKUP, None, tail_hashes
             )
             if transfer is None:
-                return result
+                # Component declines external-linker participation (e.g.
+                # Mamba SSM state is per-request, not page-based). Skip it
+                # and continue with the remaining components — the KV/Full
+                # component is the one that matters for cache lookups.
+                logger.debug(
+                    "linker.match: rid=%s — component %s returned None transfer for LOOKUP, skipping",
+                    req.rid, component,
+                )
+                continue
             lookup_transfers.append(transfer)
+        if not lookup_transfers:
+            return result
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
+        restorable = self.cache_linker.lookup(req.rid, lookup_transfers)
+        logger.info(
+            "linker.match: rid=%s device_hit=%d key_len=%d tail_pages=%d restorable=%s stats=%s",
+            req.rid, device_hit_len, len(key), len(tail_hashes),
+            restorable[:5] if restorable else "[]",
+            self.cache_linker.stats,
+        )
         hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
+            restorable,
             num_pages=len(tail_hashes),
             device_hit_pages=0,
         )
