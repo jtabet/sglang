@@ -64,6 +64,9 @@ pub struct Router {
     ttft_warming: Arc<TtftWarmingRegistry>,
     /// Max concurrent background warmups (from RouterConfig).
     ttft_max_warmups: usize,
+    /// Per-worker EWMA of measured prefill throughput. Seeded from
+    /// `ttft_prefill_rate_tps` and updated on each warmup completion.
+    ttft_prefill_rates: Arc<TtftPrefillRateRegistry>,
 }
 
 /// Tracks background warmup prefills per worker URL. Not clone-safe state —
@@ -97,6 +100,41 @@ impl TtftWarmingRegistry {
 
     fn len(&self) -> usize {
         self.in_flight.lock().unwrap().len()
+    }
+}
+
+/// Per-worker EWMA of measured prefill throughput (tokens/second). Each warmup
+/// completion feeds `tokens / elapsed_secs` into the EWMA; the budget gate
+/// reads the per-worker rate so a slow worker (thermal throttle, narrow PCIe)
+/// gets a realistic estimate instead of the global seed.
+///
+/// Entries are seeded lazily with `initial_tps` on first access, so the first
+/// request for a worker uses the configured fallback before any measurement.
+#[derive(Debug, Default)]
+struct TtftPrefillRateRegistry {
+    rates: std::sync::Mutex<std::collections::HashMap<String, f32>>,
+}
+
+impl TtftPrefillRateRegistry {
+    /// EWMA smoothing factor — 0.3 gives ~3-sample response time. Higher
+    /// reacts faster but is noisier; lower is smoother but slower to adapt
+    /// to a thermal throttle event.
+    const ALPHA: f32 = 0.3;
+
+    /// Returns the current rate for `url`, seeding with `fallback` on first
+    /// access.
+    fn get(&self, url: &str, fallback: f32) -> f32 {
+        let mut guard = self.rates.lock().unwrap();
+        *guard.entry(url.to_string()).or_insert(fallback)
+    }
+
+    /// Update the EWMA for `url` with a new measurement. Seeded with
+    /// `fallback` if this is the first sample (so the EWMA starts from the
+    /// configured baseline rather than jumping straight to the measurement).
+    fn record(&self, url: &str, measured_tps: f32, fallback: f32) {
+        let mut guard = self.rates.lock().unwrap();
+        let entry = guard.entry(url.to_string()).or_insert(fallback);
+        *entry = Self::ALPHA * measured_tps + (1.0 - Self::ALPHA) * *entry;
     }
 }
 
@@ -152,6 +190,7 @@ impl Router {
             ttft_chars_per_token: ctx.router_config.ttft_chars_per_token,
             ttft_max_warmups: ctx.router_config.ttft_max_warmups,
             ttft_warming: Arc::new(TtftWarmingRegistry::default()),
+            ttft_prefill_rates: Arc::new(TtftPrefillRateRegistry::default()),
         })
     }
 
@@ -382,22 +421,29 @@ impl Router {
         // populated yet.
         if self.ttft_prefill_rate_tps > 0.0 {
             if let Some(budget_ms) = ttft_budget_ms(headers) {
+                // Use per-worker measured rate when available (EWMA seeded
+                // with the global config fallback on first access).
+                let prefill_tps = self
+                    .ttft_prefill_rates
+                    .get(worker.url(), self.ttft_prefill_rate_tps);
                 let est_ms = estimate_ttft_ms(
                     text,
                     match_rate,
                     self.ttft_chars_per_token,
-                    self.ttft_prefill_rate_tps,
+                    prefill_tps,
                 );
-                let warming = self.ttft_warming.is_warming(worker.url());
-                if est_ms > budget_ms || warming {
-                    let reason = if warming {
-                        "warmup in flight for selected worker".to_string()
-                    } else {
-                        format!(
-                            "estimated ttft {}ms exceeds budget {}ms (match_rate {:.2})",
-                            est_ms, budget_ms, match_rate
-                        )
-                    };
+                // Safety margin: only forward if the estimate is comfortably
+                // under budget. Requests near the boundary have estimation
+                // error (match_rate approximation, EWMA lag) that can push
+                // actual prefill over the fetch timeout — which escalates the
+                // worker into cooldown and sends everything to cloud. 0.7
+                // keeps a 30% margin (7s est for a 10s budget).
+                let gated_budget_ms = (budget_ms as f32 * 0.7) as u64;
+                if est_ms > gated_budget_ms {
+                    let reason = format!(
+                        "estimated ttft {}ms exceeds budget {}ms (gated {}ms, match_rate {:.2})",
+                        est_ms, budget_ms, gated_budget_ms, match_rate
+                    );
                     debug!(
                         "TTFT budget gate: declining {} → {} ({})",
                         model_id.unwrap_or(UNKNOWN_MODEL_ID),
@@ -406,7 +452,7 @@ impl Router {
                     );
                     self.maybe_spawn_warmup(
                         headers, typed_req, route, &worker, is_stream,
-                        est_ms, budget_ms,
+                        est_ms, budget_ms, &text,
                     );
                     return error::too_early(
                         "prefill_budget_exceeded",
@@ -489,6 +535,7 @@ impl Router {
         _is_stream: bool,
         _est_ms: u64,
         _budget_ms: u64,
+        text: &str,
     ) {
         if !self
             .ttft_warming
@@ -537,7 +584,18 @@ impl Router {
         }
 
         let warming = self.ttft_warming.clone();
+        let prefill_rates = self.ttft_prefill_rates.clone();
         let worker_url_str = worker.url().to_string();
+        let chars_per_token = self.ttft_chars_per_token;
+        let seed_tps = self.ttft_prefill_rate_tps;
+        // Estimate the token count the engine will prefill. We use the same
+        // chars_per_token conversion as the budget gate — the match_rate is
+        // not known here (the tree was updated but we don't have it), so we
+        // use the full text length. This slightly overestimates tokens for
+        // partially-cached requests, which makes the recorded tps slightly
+        // conservative — safe for the budget gate.
+        let est_tokens =
+            (text.chars().count() as f32 / chars_per_token.max(0.1)).max(1.0) as u64;
         tokio::spawn(async move {
             let started = Instant::now();
             match request.send().await {
@@ -552,11 +610,35 @@ impl Router {
                         }
                         if !got_first {
                             got_first = true;
+                            let elapsed = started.elapsed();
                             tracing::info!(
                                 "TTFT warmup: prefill completed in {:?} for {}",
-                                started.elapsed(),
+                                elapsed,
                                 worker_url_str
                             );
+                            // Feed the per-worker EWMA. Skip degenerate
+                            // cases (< 50ms = cache hit, > 600s = something
+                            // went wrong with timing).
+                            let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+                            if elapsed_secs > 0.05 && elapsed_secs < 600.0 {
+                                let measured_tps =
+                                    est_tokens as f32 / elapsed_secs as f32;
+                                if measured_tps > 0.0 && measured_tps.is_finite() {
+                                    prefill_rates.record(
+                                        &worker_url_str,
+                                        measured_tps,
+                                        seed_tps,
+                                    );
+                                    tracing::debug!(
+                                        "TTFT prefill rate update: {} = {:.0} tps \
+                                         ({} tokens / {:.1}s, EWMA applied)",
+                                        worker_url_str,
+                                        prefill_rates.get(&worker_url_str, seed_tps),
+                                        est_tokens,
+                                        elapsed_secs,
+                                    );
+                                }
+                            }
                             break;
                         }
                     }
@@ -1129,6 +1211,7 @@ mod tests {
             ttft_chars_per_token: 3.5,
             ttft_max_warmups: 4,
             ttft_warming: Arc::new(TtftWarmingRegistry::default()),
+            ttft_prefill_rates: Arc::new(TtftPrefillRateRegistry::default()),
         }
     }
 
@@ -1219,5 +1302,32 @@ mod tests {
         reg.release("w1");
         assert!(!reg.is_warming("w1"));
         assert!(reg.register("w5", 4), "slot freed after release");
+    }
+
+    #[test]
+    fn test_prefill_rate_ewma() {
+        let reg = TtftPrefillRateRegistry::default();
+        let seed = 2600.0;
+
+        // First access seeds with the fallback
+        let r = reg.get("w1", seed);
+        assert_eq!(r, seed);
+
+        // Record a measurement of 2000 tps — EWMA should move toward it
+        // but not jump all the way (alpha=0.3)
+        reg.record("w1", 2000.0, seed);
+        let r1 = reg.get("w1", seed);
+        // alpha=0.3: 0.3*2000 + 0.7*2600 = 2420
+        assert!((r1 - 2420.0).abs() < 1.0, "r1={}", r1);
+
+        // Another measurement of 2000 — moves further toward 2000
+        reg.record("w1", 2000.0, seed);
+        let r2 = reg.get("w1", seed);
+        // 0.3*2000 + 0.7*2420 = 2294
+        assert!((r2 - 2294.0).abs() < 1.0, "r2={}", r2);
+
+        // Different worker is independent
+        let r3 = reg.get("w2", seed);
+        assert_eq!(r3, seed, "w2 should still be at seed");
     }
 }
