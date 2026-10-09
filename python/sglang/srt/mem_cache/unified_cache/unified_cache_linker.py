@@ -195,7 +195,6 @@ class UnifiedCacheLinkerWrapper:
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
-        logger.info("linker.match ENTERED: rid=%s key_len=%d device_hit=%d", req.rid, len(key), int(result.device_indices.numel()))
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
@@ -233,10 +232,11 @@ class UnifiedCacheLinkerWrapper:
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
         restorable = self.cache_linker.lookup(req.rid, lookup_transfers)
-        logger.info(
-            "linker.match: rid=%s device_hit=%d key_len=%d tail_pages=%d restorable=%s stats=%s",
+        logger.debug(
+            "linker.match: rid=%s device_hit=%d key_len=%d tail_pages=%d "
+            "restorable_count=%d restorable_first10=%s stats=%s",
             req.rid, device_hit_len, len(key), len(tail_hashes),
-            restorable[:5] if restorable else "[]",
+            len(restorable), restorable[:10] if restorable else "[]",
             self.cache_linker.stats,
         )
         hit_pages = self._sync_restorable_prefix(
@@ -332,14 +332,17 @@ class UnifiedCacheLinkerWrapper:
                 LinkerTransferPhase.LOAD, None, tail_hashes
             )
             if transfer is None:
-                self._update_load(
-                    ExternalLinkerLoadPhase.ABORT,
-                    req,
-                    component_transfers,
-                    prefix_len,
+                # Component declines external-linker participation (e.g.
+                # Mamba SSM state is per-request). Skip it — the KV/Full
+                # component is the one that matters for load-back.
+                logger.debug(
+                    "linker.load_back: rid=%s — component %s returned None for LOAD, skipping",
+                    req.rid, component,
                 )
-                return empty_indices, req.last_node
+                continue
             component_transfers.append((component, transfer))
+        if not component_transfers:
+            return empty_indices, req.last_node
 
         full_transfer = component_transfers[0][1]
         assert full_transfer.name == PoolName.KV
@@ -376,15 +379,25 @@ class UnifiedCacheLinkerWrapper:
             ),
             None,
         )
+        if mamba_transfer is not None:
+            mamba_value = mamba_transfer.device_indices[:1]
+        else:
+            # Mamba component declined external-linker participation.
+            # Allocate a fresh mamba slot so the tree insert succeeds —
+            # the SSM state will be computed during prefill of the loaded tail.
+            mamba_alloc = cache.req_to_token_pool.mamba_allocator.alloc(1)
+            assert mamba_alloc is not None, (
+                "Not enough mamba slots for linker load_back. "
+                "Try increasing --mamba-full-memory-ratio."
+            )
+            mamba_value = torch.tensor(
+                [mamba_alloc[0]], dtype=torch.int64, device=cache.device
+            )
         insert_result = cache.insert(
             InsertParams(
                 key=hit.prefix_key,
                 value=prefix_indices,
-                mamba_value=(
-                    mamba_transfer.device_indices[:1]
-                    if mamba_transfer is not None
-                    else None
-                ),
+                mamba_value=mamba_value,
                 prev_prefix_len=device_hit_len,
                 swa_evicted_seqlen=(
                     req.kv.swa_evicted_seqlen if req.kv is not None else 0
@@ -394,10 +407,15 @@ class UnifiedCacheLinkerWrapper:
                 track_adopted_ranges=True,
             )
         )
-        if mamba_transfer is not None and insert_result.mamba_exist:
-            cache.req_to_token_pool.mamba_allocator.free(
-                mamba_transfer.device_indices[:1]
-            )
+        if insert_result.mamba_exist:
+            # The insert found an existing mamba value on the node.
+            # Free whichever slot we won't be using.
+            if mamba_transfer is not None:
+                cache.req_to_token_pool.mamba_allocator.free(
+                    mamba_transfer.device_indices[:1]
+                )
+            else:
+                cache.req_to_token_pool.mamba_allocator.free(mamba_value)
 
         canonical_tail = cache.tree_core.collect_full_device_indices(
             insert_result.last_device_node, req.last_node

@@ -218,11 +218,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         result = self.storage.batch_exists_v2(page_keys, expanded)
         restorable = result.restorable_prefix_pages or []
         self.stats["lookup"] += 1
-        logger.info(
-            "mooncake.lookup: rid=%s keys=%d first_key=%s restorable=%s",
-            rid, len(page_keys), page_keys[0][:16] if page_keys else "none",
-            restorable[:5] if restorable else "[]",
-        )
         if restorable:
             logger.info(
                 "Mooncake direct linker lookup hit: rid=%s pages=%d candidates=%d",
@@ -299,23 +294,76 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def load_layer_wise(
         self, counter_index: int, request_transfers: list[list[PoolTransfer]]
     ) -> None:
+        # Check if the raw mooncake store supports the layer-wise session API.
+        store = self.storage.store
+        has_session_api = hasattr(store, "batch_get_session_start")
+
+        batches: dict[PoolName, tuple[list[str], list[int]]] = {}
+        # For the non-layer-wise fallback we also need the original device indices
+        # to compute full buffer ptrs/sizes via get_page_buffer_meta.
+        pool_indices: dict[PoolName, list[torch.Tensor]] = {}
+        for transfers in request_transfers:
+            for transfer in transfers:
+                keys, locations = batches.setdefault(transfer.name, ([], []))
+                component_keys, _ = self.storage._get_hybrid_page_component_keys(
+                    list(transfer.keys), transfer
+                )
+                keys.extend(self.storage._tag_keys(component_keys))
+                locations.extend(
+                    self.pools[transfer.name].prepare_locations(
+                        transfer.host_indices
+                    )
+                )
+                idx_list = pool_indices.setdefault(transfer.name, [])
+                idx_list.append(transfer.host_indices)
+
+        if not has_session_api:
+            # Fallback: load all layers at once using batch_get_into_multi_buffers.
+            try:
+                for name, (keys, locations) in batches.items():
+                    if len(keys) == 0:
+                        continue
+                    # Gather all host_indices for this pool and compute
+                    # full buffer ptrs/sizes across all layers at once.
+                    all_indices = torch.cat(pool_indices[name])
+                    ptrs, sizes = self.pools[name].get_page_buffer_meta(
+                        all_indices
+                    )
+                    # Pack flat ptrs/sizes into nested lists (one list per key)
+                    # as expected by batch_get_into_multi_buffers.
+                    if len(ptrs) != len(keys):
+                        assert len(ptrs) % len(keys) == 0
+                        nbuf = len(ptrs) // len(keys)
+                        ptrs = [ptrs[i : i + nbuf] for i in range(0, len(ptrs), nbuf)]
+                        sizes = [sizes[i : i + nbuf] for i in range(0, len(sizes), nbuf)]
+                    result = store.batch_get_into_multi_buffers(keys, ptrs, sizes)
+                    if result is None or isinstance(result, int):
+                        logger.warning(
+                            "Mooncake batch get returned no result for pool=%s: "
+                            "result=%s — continuing with partial load",
+                            name, result,
+                        )
+                    else:
+                        for i, r in enumerate(result):
+                            if r < 0:
+                                logger.debug(
+                                    "Mooncake batch get: key %d (pool=%s) "
+                                    "not found (result=%d) — will recompute",
+                                    i, name, r,
+                                )
+                # Signal all layers complete at once.
+                for layer in range(self.num_layers):
+                    self.layer_done_counter.complete(counter_index, layer)
+            except BaseException as error:
+                self.layer_done_counter.fail(counter_index, error)
+                logger.exception("Mooncake batch load failed")
+            return
+
+        # Layer-wise path: session-based, per-layer transfer with overlap.
         started = []
         try:
-            batches: dict[PoolName, tuple[list[str], list[int]]] = {}
-            for transfers in request_transfers:
-                for transfer in transfers:
-                    keys, locations = batches.setdefault(transfer.name, ([], []))
-                    component_keys, _ = self.storage._get_hybrid_page_component_keys(
-                        list(transfer.keys), transfer
-                    )
-                    keys.extend(self.storage._tag_keys(component_keys))
-                    locations.extend(
-                        self.pools[transfer.name].prepare_locations(
-                            transfer.host_indices
-                        )
-                    )
             for keys, _ in batches.values():
-                result = self.storage.store.batch_get_session_start(keys)
+                result = store.batch_get_session_start(keys)
                 if list(result) != [0] * len(keys):
                     raise RuntimeError(
                         f"Mooncake get session start failed: keys={len(keys)}, "
@@ -331,7 +379,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     if meta is None:
                         continue
                     ptrs, sizes, offsets = meta
-                    result = self.storage.store.batch_get_into_multi_buffer_ranges(
+                    result = store.batch_get_into_multi_buffer_ranges(
                         keys,
                         ptrs,
                         sizes,
@@ -355,7 +403,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         finally:
             for keys in started:
                 try:
-                    self.storage.store.batch_get_session_end(keys)
+                    store.batch_get_session_end(keys)
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")

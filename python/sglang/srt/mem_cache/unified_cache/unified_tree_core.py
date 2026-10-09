@@ -1040,17 +1040,25 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node: UnifiedTreeNode, chunked: bool = False
     ) -> bool:
         """Increment hit count; check whether a write backup should be fired."""
-        if node.evicted or chunked:
+        if node.evicted:
             return False
         if self.is_write_back:
             return False
         node.hit_count += 1
 
         if self.enable_external_cache_linker:
+            # Write-through offload should fire regardless of chunked flag —
+            # chunked suppresses hit-count inflation for re-inserts, but the
+            # external linker needs the data in mooncake regardless.
             return (
                 self._needs_external_linker_offload(node)
                 and node.hit_count >= self.write_through_threshold
             )
+
+        # HiCache path: chunked suppresses backup to avoid self-referencing
+        # hit-count inflation during chunked-prefill re-inserts.
+        if chunked:
+            return False
 
         return (
             self.enable_hicache

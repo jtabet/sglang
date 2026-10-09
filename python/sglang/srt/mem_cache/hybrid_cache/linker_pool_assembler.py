@@ -419,6 +419,104 @@ def _build_dsa_device_pool_group(
     return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
 
 
+def _build_kvarn_device_pool_group(
+    kvcache: Any,
+    page_size: int,
+    params: Any,
+) -> DevicePoolGroup:
+    """Build a direct-linker DevicePoolGroup for KVarN hybrid Mamba models.
+
+    KVarN stores full-attention KV as compressed int4 tiles in
+    ``backend.kv_cache_int4`` (one ``[num_blocks, Hk, tile_bytes]`` uint8
+    tensor per compressed layer).  Each row is one block = one page, so
+    ``rows_are_pages=True``.
+
+    Mamba / linear-attention layers use the standard ``MambaPool`` whose
+    ``mamba_cache`` exposes ``temporal`` (``[num_layers, num_slots, ...]``)
+    and ``conv`` (list of ``[num_layers, num_slots, ...]``).  Mamba slots
+    are per-request, not per-page, so ``rows_are_pages=False``.
+    """
+    kvarn_backend = getattr(kvcache, "_kvarn_backend", None)
+    assert kvarn_backend is not None, (
+        "KVarN direct linker requires the NoOp pool to have a KVarN backend "
+        "reference. Call set_kvarn_backend() first."
+    )
+
+    # ── KV (full attention) ────────────────────────────────────────────
+    # kv_cache_int4 is a list of [num_blocks, Hk, tile_bytes] uint8 tensors,
+    # one per compressed attention layer.  Each row is a page/block.
+    kv_buffers = list(kvarn_backend.kv_cache_int4)
+    full_attn_ids = kvarn_backend.full_attn_layer_ids
+    # Map model layer ID → 0-based compressed layer index
+    full_layer_mapping = {
+        model_id: pool_id for pool_id, model_id in enumerate(full_attn_ids)
+    }
+
+    # ── Mamba (linear attention) ───────────────────────────────────────
+    mamba_pool = params.req_to_token_pool.mamba_pool
+    mamba_cache = mamba_pool.mamba_cache
+    num_mamba_layers = mamba_pool.num_mamba_layers
+    # temporal: [num_mamba_layers, num_slots, *temporal_shape]
+    # conv: list of [num_mamba_layers, num_slots, *conv_shape]
+    mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
+
+    # Build one component group per tensor type (temporal, conv_0, conv_1, ...).
+    # Each group contains one slice per mamba layer, indexed by the same
+    # layer_mapping value.  This aligns with the Mooncake key scheme:
+    #   _temporal + _conv_{i}  →  1 + conv_num keys per page,
+    # and with get_page_buffer_meta which returns all component buffers.
+    temporal_component = [
+        mamba_cache.temporal[i] for i in range(num_mamba_layers)
+    ]
+    conv_components = [
+        [conv[i] for i in range(num_mamba_layers)]
+        for conv in mamba_cache.conv
+    ]
+
+    mamba_entry = DevicePoolEntry(
+        name=PoolName.MAMBA,
+        indices_from_pool=PoolName.MAMBA,
+        device_pool=mamba_pool,
+        components=[temporal_component, *conv_components],
+        layer_mapping=mamba_layer_mapping,
+        page_size=page_size,
+        rows_are_pages=False,
+    )
+    # Expose attributes that MooncakeStore._get_hybrid_page_component_keys
+    # reads to generate the correct per-page key suffixes for MAMBA pools.
+    import numpy as np
+
+    mamba_entry.conv_buffer = list(mamba_cache.conv)
+    mamba_entry.temporal_state_elem_size = int(
+        np.prod(mamba_cache.temporal.shape[2:])
+    )
+
+    entries = [
+        DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=kvcache,
+            components=[kv_buffers],
+            layer_mapping=full_layer_mapping,
+            page_size=page_size,
+            rows_are_pages=True,
+        ),
+        mamba_entry,
+    ]
+
+    transfer_layer_num = max(
+        max(full_layer_mapping) if full_layer_mapping else 0,
+        max(mamba_layer_mapping) if mamba_layer_mapping else 0,
+    ) + 1
+
+    return DevicePoolGroup(
+        entries,
+        transfer_layer_num,
+        page_size,
+        rank_replicated=False,
+    )
+
+
 def resolve_hybrid_device_pool_group(
     *,
     kvcache: Any,

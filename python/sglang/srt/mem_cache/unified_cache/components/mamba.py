@@ -758,9 +758,11 @@ class MambaComponent(TreeComponent):
         node: Optional[UnifiedTreeNode],
         keys: Optional[Sequence[str]],
     ) -> Optional[PoolTransfer]:
-        raise AssertionError(
-            "MambaComponent does not support external linker mode, will support soon"
-        )
+        # Mamba SSM state is per-request (one slot per node), not page-based.
+        # It doesn't benefit from cross-request sharing via external storage.
+        # Return None to skip Mamba offload/load; the Full (KV) component
+        # still offloads/loads through the external linker.
+        return None
 
     # ---- HiCache Hooks ----
 

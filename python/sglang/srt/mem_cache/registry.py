@@ -218,7 +218,6 @@ def _create_unified_radix_cache(
         cache.init_cache_linker(
             linker_cls(server_args, params, components=set(cache.components))
         )
-        logger.info("Unified cache external linker initialized: backend=%s, linker=%s, cache.linker=%s", backend, type(cache.linker).__name__, cache.linker is not None)
         counter = cache.linker.layer_done_counter
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         kvcache.register_layer_transfer_counter(counter)

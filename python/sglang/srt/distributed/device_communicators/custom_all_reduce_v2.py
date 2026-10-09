@@ -153,6 +153,14 @@ def _allocate_ipc_memory(nbytes: int, device: torch.device, group: ProcessGroup)
     device_idx = device.index if device.index is not None else torch.cuda.current_device()
     lib.cudaSetDevice(device_idx)
     local_ptr = lib.cudaMalloc(nbytes)
+    ptr_val = ctypes.cast(local_ptr, ctypes.c_void_p).value
+    # Debug: log the workspace address for BAR1 P2P diagnosis
+    import logging as _logging
+    _logging.info(
+        f"CustomAllReduceV2: IPC workspace allocated on cuda:{device_idx} "
+        f"ptr=0x{ptr_val:x} size={nbytes} bytes ({nbytes/(1024*1024):.1f} MB) "
+        f"offset_in_vram={ptr_val/(1024**3):.3f} GB"
+    )
     local_tensor = torch._from_blob(
         ctypes.cast(local_ptr, ctypes.c_void_p).value,
         (nbytes,),
@@ -304,6 +312,9 @@ class CustomAllReduceV2:
             device=self.device,
         )
         self._init_workspace()
+        self._test_p2p_connectivity()
+        if self.disabled:
+            return
         self._ipc_manager = IPCManager()
         self._vmm_graph_input_manager = VmmGraphInputManager(
             obj=self,
@@ -315,6 +326,102 @@ class CustomAllReduceV2:
         self._graph_counter = 0
         self._graph_mode_allowed = False
         self.disabled = False
+
+
+    def _test_p2p_connectivity(self, timeout_s: float = 10.0) -> None:
+        """Test that P2P writes between ranks are actually visible.
+
+        On some PCIe topologies (e.g. GPUs with very small BAR1 windows),
+        the NVIDIA driver may fail to set up P2P mapping, causing custom
+        all-reduce kernels to hang indefinitely. This test detects such
+        failures by writing a known value to the peer's workspace and
+        checking for visibility within a timeout.
+
+        If the test fails, ``self.disabled`` is set to ``True`` so that
+        the caller falls back to NCCL for all-reduce.
+        """
+        if self.world_size < 2:
+            return
+
+        import time
+
+        # Each rank writes its rank+1 into slot 0 of its own push workspace.
+        # Then each rank tries to read the peer's slot 0. If P2P is broken,
+        # the read will hang (the GPU will block on a load that never completes).
+        test_val = self.rank + 1  # 1 for rank 0, 2 for rank 1
+
+        # Use a side stream so we can timeout without blocking the default stream.
+        # The key: never call .item() or any blocking sync — if P2P is broken,
+        # the GPU load will hang and any sync call will block forever.
+        # Instead, we do an async copy to a CPU pinned tensor, record an event,
+        # and poll the event from the CPU with a timeout.
+        side_stream = torch.cuda.Stream(device=self.device)
+        event = torch.cuda.Event(blocking=False)
+
+        # Pinned CPU tensor to receive the peer's value (async D2H copy)
+        result_buf = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+
+        peer_rank = 1 - self.rank  # for tp2, peer is the other rank
+
+        with torch.cuda.stream(side_stream):
+            # Write test value to our own push slot 0, first 4 bytes.
+            # slabs[rank] is a [total_bytes] uint8 view of symmetric memory;
+            # the push region starts at offset 0 with shape [push_num_slots, max_push_size].
+            # We write to slot 0, byte 0 of our own workspace.
+            self._slabs[self.rank][0:4].view(torch.int32).fill_(test_val)
+            side_stream.synchronize()
+
+            # Barrier: ensure both ranks have written before we try to read
+            dist.barrier(group=self.group)
+
+            # Async copy peer's value to pinned CPU buffer.
+            # If P2P mapping is broken, this copy will hang on the GPU side
+            # and the event will never be recorded.
+            peer_tensor = self._slabs[peer_rank][0:4].view(torch.int32)
+            result_buf.copy_(peer_tensor, non_blocking=True)
+
+            # Record event after the async copy
+            event.record(side_stream)
+
+        # Poll the event with a timeout (never block — just query)
+        start = time.time()
+        while not event.query():
+            if time.time() - start > timeout_s:
+                logger.warning(
+                    "CustomAllReduceV2: P2P connectivity test timed out after "
+                    f"{timeout_s}s. Peer writes are not visible between rank "
+                    f"{self.rank} and rank {peer_rank}. Disabling custom "
+                    "all-reduce — falling back to NCCL."
+                )
+                self.disabled = True
+                # Clean up workspace
+                del self.obj
+                del self._symm_tensor
+                return
+            time.sleep(0.1)
+
+        # Event completed — the async copy succeeded. Now safe to read CPU buffer.
+        side_stream.synchronize()
+        peer_val = result_buf.item()
+
+        # Check the value is correct
+        expected = peer_rank + 1
+        if peer_val != expected:
+            logger.warning(
+                f"CustomAllReduceV2: P2P connectivity test failed — read "
+                f"value {peer_val} from rank {peer_rank}, expected {expected}. "
+                "Disabling custom all-reduce — falling back to NCCL."
+            )
+            self.disabled = True
+            del self.obj
+            del self._symm_tensor
+            return
+
+        if self.rank == 0:
+            logger.warning(
+                "CustomAllReduceV2: P2P connectivity test passed — "
+                "peer writes are visible between ranks."
+            )
 
     def _init_workspace(self) -> None:
         """Slice one symmetric-memory allocation into every shared buffer.
@@ -347,6 +454,9 @@ class CustomAllReduceV2:
             symm_mem.get_buffer(i, [total_bytes], torch.uint8)
             for i in range(self.world_size)
         ]
+        # Store slabs for the P2P connectivity test (PushPlane is a tvm_ffi.Object
+        # that doesn't expose .workspaces as a Python attribute).
+        self._slabs = slabs
         # The push slots (lamport pos-zero markers) and the semaphores must
         # start zeroed; the pull buffer need not, but it rides along in the
         # one-shot memset.
