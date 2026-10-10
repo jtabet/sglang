@@ -395,6 +395,8 @@ impl Router {
         is_stream: bool,
         text: &str,
     ) -> Response {
+        let select_start = std::time::Instant::now();
+        let text_len = text.chars().count();
         let (worker, match_rate) = match self
             .select_worker_for_model(model_id, Some(text), headers)
             .await
@@ -407,6 +409,16 @@ impl Router {
                 );
             }
         };
+
+        let select_elapsed = select_start.elapsed();
+        if select_elapsed.as_millis() > 100 {
+            warn!(
+                "route_typed_request_once: select_worker took {}ms for {}char text (match_rate={:.2})",
+                select_elapsed.as_millis(),
+                text_len,
+                match_rate,
+            );
+        }
 
         // ── TTFT budget gate (orchestrel) ─────────────────────────────────
         // When the caller declares a time-to-first-token budget and the
@@ -455,6 +467,16 @@ impl Router {
                     self.maybe_spawn_warmup(
                         headers, typed_req, route, &worker, is_stream,
                         est_ms, budget_ms, &text,
+                    );
+                    let total_425_latency = select_start.elapsed();
+                    debug!(
+                        "TTFT 425: total latency {}ms (select={}ms, text={}chars, match_rate={:.2}, est={}ms, gated={}ms)",
+                        total_425_latency.as_millis(),
+                        select_elapsed.as_millis(),
+                        text_len,
+                        match_rate,
+                        est_ms,
+                        gated_budget_ms,
                     );
                     return error::too_early(
                         "prefill_budget_exceeded",
@@ -539,6 +561,17 @@ impl Router {
         _budget_ms: u64,
         text: &str,
     ) {
+        // Skip warmup for very large prompts — the JSON serialization
+        // and prefill take too long, and the warmup itself can block
+        // the 425 response.
+        if text.chars().count() > 100_000 {
+            debug!(
+                "TTFT warmup: skipping for large prompt ({} chars) — returning 425 immediately",
+                text.chars().count()
+            );
+            return;
+        }
+
         if !self
             .ttft_warming
             .register(worker.url(), self.ttft_warming_capacity())
