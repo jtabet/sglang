@@ -436,9 +436,11 @@ impl Router {
                 // under budget. Requests near the boundary have estimation
                 // error (match_rate approximation, EWMA lag) that can push
                 // actual prefill over the fetch timeout — which escalates the
-                // worker into cooldown and sends everything to cloud. 0.7
-                // keeps a 30% margin (7s est for a 10s budget).
-                let gated_budget_ms = (budget_ms as f32 * 0.7) as u64;
+                // worker into cooldown and sends everything to cloud. 0.5
+                // keeps a 50% margin (5s est for a 10s budget) — large enough
+                // to absorb estimation error and queue overhead without
+                // hitting the fetch timeout.
+                let gated_budget_ms = (budget_ms as f32 * 0.5) as u64;
                 if est_ms > gated_budget_ms {
                     let reason = format!(
                         "estimated ttft {}ms exceeds budget {}ms (gated {}ms, match_rate {:.2})",
