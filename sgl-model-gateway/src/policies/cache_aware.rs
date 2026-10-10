@@ -527,11 +527,21 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 }
             }
 
-            // Fallback to first healthy worker
+            // Fallback to first healthy worker. The tree's tenant
+            // (result.tenant) was filtered out of `workers` (it is warming or
+            // otherwise unavailable), so this fallback worker has NO cache
+            // affinity for the prefix — report match_rate 0.0 so the TTFT
+            // budget gate treats it as cold. Keeping the stale high match_rate
+            // here forwards a cold request on a false prediction, which stalls
+            // the fetch, escalates the worker into cooldown, and sends the
+            // route to cloud.
             healthy_indices
                 .first()
                 .copied()
-                .map(|index| super::SelectionInfo { index, match_rate })
+                .map(|index| super::SelectionInfo {
+                    index,
+                    match_rate: 0.0,
+                })
         } else {
             warn!(
                 "cache_aware: no tree found for key '{}', falling back to random \

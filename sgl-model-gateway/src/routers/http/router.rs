@@ -264,6 +264,11 @@ impl Router {
             false, // get all workers, we'll filter by is_available() next
         );
 
+        // Filter out workers that have a TTFT warmup in flight — they are
+        // busy doing a background prefill and won't be able to serve a new
+        // request within the fetch timeout. If ALL workers are warming,
+        // fall back to the full set (the request will likely time out, but
+        // at least we don't return 503 when workers are technically alive).
         let available: Vec<Arc<dyn Worker>> = workers
             .iter()
             .filter(|w| w.is_available())
@@ -272,6 +277,21 @@ impl Router {
         if available.is_empty() {
             return None;
         }
+        let available: Vec<Arc<dyn Worker>> = available
+            .iter()
+            .filter(|w| !self.ttft_warming.is_warming(w.url()))
+            .cloned()
+            .collect();
+        let available = if available.is_empty() {
+            // All workers warming — fall back to all available workers
+            workers
+                .iter()
+                .filter(|w| w.is_available())
+                .cloned()
+                .collect()
+        } else {
+            available
+        };
 
         // Get the appropriate policy for this model
         let policy = match model_id {
@@ -307,7 +327,7 @@ impl Router {
         Some((available[selection.index].clone(), selection.match_rate))
     }
 
-    pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
+    pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone + 'static>(
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
@@ -386,7 +406,7 @@ impl Router {
         response
     }
 
-    async fn route_typed_request_once<T: GenerationRequest + serde::Serialize + Clone>(
+    async fn route_typed_request_once<T: GenerationRequest + serde::Serialize + Clone + 'static>(
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
@@ -395,6 +415,7 @@ impl Router {
         is_stream: bool,
         text: &str,
     ) -> Response {
+        let req_start = std::time::Instant::now();
         let select_start = std::time::Instant::now();
         let text_len = text.chars().count();
         let (worker, match_rate) = match self
@@ -454,6 +475,7 @@ impl Router {
                 // hitting the fetch timeout.
                 let gated_budget_ms = (budget_ms as f32 * 0.5) as u64;
                 if est_ms > gated_budget_ms {
+                    let warmup_start = std::time::Instant::now();
                     let reason = format!(
                         "estimated ttft {}ms exceeds budget {}ms (gated {}ms, match_rate {:.2})",
                         est_ms, budget_ms, gated_budget_ms, match_rate
@@ -468,11 +490,13 @@ impl Router {
                         headers, typed_req, route, &worker, is_stream,
                         est_ms, budget_ms, &text,
                     );
-                    let total_425_latency = select_start.elapsed();
-                    debug!(
-                        "TTFT 425: total latency {}ms (select={}ms, text={}chars, match_rate={:.2}, est={}ms, gated={}ms)",
+                    let total_425_latency = req_start.elapsed();
+                    let warmup_elapsed = warmup_start.elapsed();
+                    warn!(
+                        "TTFT 425: total={}ms (select={}ms, warmup={}ms, text={}chars, match_rate={:.2}, est={}ms, gated={}ms)",
                         total_425_latency.as_millis(),
                         select_elapsed.as_millis(),
+                        warmup_elapsed.as_millis(),
                         text_len,
                         match_rate,
                         est_ms,
@@ -550,7 +574,7 @@ impl Router {
     /// The warming registry entry is released once the first body byte
     /// Arrives (prefill done) or on any error — either way the next budgeted
     /// request re-evaluates the (now accurate) match_rate estimate.
-    fn maybe_spawn_warmup<T: GenerationRequest + serde::Serialize + Clone>(
+    fn maybe_spawn_warmup<T: GenerationRequest + serde::Serialize + Clone + 'static>(
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
@@ -561,16 +585,11 @@ impl Router {
         _budget_ms: u64,
         text: &str,
     ) {
-        // Skip warmup for very large prompts — the JSON serialization
-        // and prefill take too long, and the warmup itself can block
-        // the 425 response.
-        if text.chars().count() > 100_000 {
-            debug!(
-                "TTFT warmup: skipping for large prompt ({} chars) — returning 425 immediately",
-                text.chars().count()
-            );
-            return;
-        }
+        // Large prompts are exactly the ones that cannot cold-prefill within
+        // a fetch budget, so they are the ones that most need a background
+        // warmup to populate the external cache. Serialization already runs
+        // inside the tokio::spawn below, so a large body never blocks the 425
+        // response. Do not skip them.
 
         if !self
             .ttft_warming
@@ -583,40 +602,26 @@ impl Router {
             return;
         }
 
-        // Mutate a copy of the request: force single-token streamed output so
-        // the drain sees a first byte exactly when prefill completes and the
-        // request ends naturally almost immediately after.
-        let mut warm_value = match serde_json::to_value(typed_req) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("TTFT warmup: failed to serialize request: {}", e);
-                self.ttft_warming.release(worker.url());
-                return;
-            }
-        };
-        if let Some(map) = warm_value.as_object_mut() {
-            map.insert("max_tokens".to_string(), serde_json::json!(1));
-            map.insert("stream".to_string(), serde_json::json!(true));
-            map.insert("ignore_eos".to_string(), serde_json::json!(false));
-        }
-
-        let worker_url = self.worker_base_url(worker.url());
+        // Clone the typed request so we can move it into the spawned task.
+        // The serde_json::to_value + request building happen inside the
+        // spawn so the 425 response is not blocked by serialization.
+        let typed_req_clone = typed_req.clone();
+        let worker_url = self.worker_base_url(worker.url()).to_string();
         let endpoint = format!("{}{}", worker_url, route);
         let api_key = worker.api_key().clone();
-        let mut request = self.client.post(endpoint).json(&warm_value);
-        if let Some(key) = api_key {
-            request = request.header("Authorization", format!("Bearer {}", key));
-        }
-        if let Some(headers) = headers {
-            for (name, value) in headers.iter() {
-                if name.as_str() == "authorization" || name.as_str() == "content-length" {
-                    continue;
-                }
-                if let Ok(v) = value.to_str() {
-                    request = request.header(name.as_str(), v);
-                }
-            }
-        }
+        let client = self.client.clone();
+        let header_pairs: Vec<(String, String)> = headers
+            .map(|h| {
+                h.iter()
+                    .filter(|(name, _)| {
+                        name.as_str() != "authorization" && name.as_str() != "content-length"
+                    })
+                    .filter_map(|(name, value)| {
+                        Some((name.as_str().to_string(), value.to_str().ok()?.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let warming = self.ttft_warming.clone();
         let prefill_rates = self.ttft_prefill_rates.clone();
@@ -632,11 +637,45 @@ impl Router {
         let est_tokens =
             (text.chars().count() as f32 / chars_per_token.max(0.1)).max(1.0) as u64;
         tokio::spawn(async move {
+            // Serialize + build request inside the spawn so it doesn't
+            // block the 425 response.
+            let mut warm_value = match serde_json::to_value(&typed_req_clone) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("TTFT warmup: failed to serialize request: {}", e);
+                    warming.release(&worker_url_str);
+                    return;
+                }
+            };
+            if let Some(map) = warm_value.as_object_mut() {
+                map.insert("max_tokens".to_string(), serde_json::json!(1));
+                map.insert("stream".to_string(), serde_json::json!(true));
+                map.insert("ignore_eos".to_string(), serde_json::json!(false));
+            }
+
+            let mut request = client.post(&endpoint).json(&warm_value);
+            if let Some(key) = &api_key {
+                request = request.header("Authorization", format!("Bearer {}", key));
+            }
+            for (name, value) in &header_pairs {
+                request = request.header(name.as_str(), value.as_str());
+            }
+
             let started = Instant::now();
             match request.send().await {
                 Ok(resp) => {
-                    // Drain until the first body byte = prefill complete
-                    // (engine begins streaming decode of the 1 forced token).
+                    // Drain the whole body. We set `max_tokens: 1` and
+                    // `stream: true`, so the engine prefills the prompt and
+                    // emits exactly one decode token before ending the stream
+                    // itself with FINISH. Crucially we must NOT drop the body
+                    // after the first byte: dropping closes the connection and
+                    // sglang aborts the request, which calls
+                    // `release_kv_cache(..., is_insert=False)` and FREES the KV
+                    // we just spent the prefill building. That made the warmup
+                    // a no-op (verified live: readback was a cold 16s re-prefill
+                    // after an aborted warmup vs 0.27s after a completing one).
+                    // Draining to the natural FINISH persists the cache so the
+                    // next request rides the hit.
                     let mut body = resp.bytes_stream();
                     let mut got_first = false;
                     while let Some(chunk) = body.next().await {
@@ -674,12 +713,12 @@ impl Router {
                                     );
                                 }
                             }
-                            break;
                         }
                     }
-                    // Dropping `body` closes the upstream connection — sglang
-                    // aborts the remaining generation. Cache stays populated.
-                    drop(body);
+                    tracing::debug!(
+                        "TTFT warmup: drained full body for {} (cache persisted)",
+                        worker_url_str
+                    );
                 }
                 Err(e) => {
                     warn!(
