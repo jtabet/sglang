@@ -4872,9 +4872,32 @@ class Scheduler(
                 self.load_publisher.publish_load_stat(
                     self.load_inquirer.get_loads, force=True, snapshot=snapshot
                 )
-            if self.enable_hicache_storage:
+                # STALL-DIAG: dump scheduler + external-linker state while we
+                # spin with GPU idle but the engine not "fully idle".
+                linker = getattr(self.tree_cache, "linker", None)
+                logger.warning(
+                    "STALL-DIAG: queue=%d chunked_req=%s running=%d "
+                    "ongoing_load_back=%d ongoing_prefetch=%d "
+                    "linker_hit_markers=%d linker_pending_loads=%d",
+                    len(self.waiting_queue),
+                    self.chunked_req is not None,
+                    len(self.running_batch.reqs),
+                    len(getattr(self.tree_cache, "ongoing_load_back", {})),
+                    len(getattr(self.tree_cache, "ongoing_prefetch", {})),
+                    len(getattr(linker, "hit_markers", {})),
+                    len(getattr(linker, "pending_loads", {})),
+                )
+            if self.enable_hicache_storage or self.enable_unified_cache_external_linker:
                 # Storage workers need the GIL between I/O calls. Yield while
                 # there is no GPU batch so polling cannot starve their acks.
+                # The external linker path has the same requirement: its
+                # mooncake load/offload threads are Python threads (need the
+                # GIL), and the mooncake C++ client's heartbeat crosses the
+                # Python/C++ interface. Without a yield here, a parked request
+                # (chunked prefill waiting on load-back) spins this loop at
+                # 100% CPU and starves the heartbeat, so the master expires the
+                # client at client_ttl and the worker re-mounts — storage_hit
+                # collapses to 0 and the request stalls forever.
                 time.sleep(0)
             return
         self.metrics_reporter.record_scheduler_idle()
