@@ -765,38 +765,46 @@ impl Router {
                           // belongs to the warm band too, but it is the
                           // *good* tail of it — feeding it keeps the warm
                           // band honest about the load-back-free case).
-                          let elapsed_secs = elapsed.as_secs_f64().max(0.001);
-                          if elapsed_secs > 0.05 && elapsed_secs < 600.0 {
-                              let measured_tps =
-                                  est_tokens as f32 / elapsed_secs as f32;
-                              if measured_tps > 0.0 && measured_tps.is_finite() {
-                                  prefill_rates.record(
-                                      &worker_url_str,
-                                      warmup_match_rate,
-                                      measured_tps,
-                                      warmup_seed_tps,
-                                  );
-                                  tracing::info!(
-                                      "TTFT prefill rate update (warmup, {} band): {} = \
-                                       {:.0} tps ({} tokens / {:.1}s, EWMA applied)",
-                                      if TtftPrefillRateRegistry::band(warmup_match_rate) == 2 {
-                                          "warm"
-                                      } else if TtftPrefillRateRegistry::band(warmup_match_rate) == 1 {
-                                          "partial"
-                                      } else {
-                                          "cold"
-                                      },
-                                      worker_url_str,
-                                      prefill_rates.get(
-                                          &worker_url_str,
-                                          warmup_match_rate,
-                                          warmup_seed_tps,
-                                      ),
-                                      est_tokens,
-                                      elapsed_secs,
-                                  );
-                              }
-                          }
+                           let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+                           if elapsed_secs > 0.05 && elapsed_secs < 600.0 {
+                               // The warmup's time-to-first-token is spent
+                               // prefilling the UNMATCHED portion (the matched
+                               // prefix is already cached), so the honest
+                               // per-uncached-token rate is
+                               // uncached_tokens / warmup_latency — matching
+                               // the gate's uncached-based estimate.
+                               let uncached_tokens =
+                                   ((1.0 - warmup_match_rate).max(0.0) * est_tokens as f32).max(1.0);
+                               let measured_tps = uncached_tokens / elapsed_secs as f32;
+                               if measured_tps > 0.0 && measured_tps.is_finite() {
+                                   prefill_rates.record(
+                                       &worker_url_str,
+                                       warmup_match_rate,
+                                       measured_tps,
+                                       warmup_seed_tps,
+                                   );
+                                   tracing::info!(
+                                       "TTFT prefill rate update (warmup, {} band): {} = \
+                                        {:.0} tps ({:.0} uncached of {} tokens / {:.1}s, EWMA applied)",
+                                       if TtftPrefillRateRegistry::band(warmup_match_rate) == 2 {
+                                           "warm"
+                                       } else if TtftPrefillRateRegistry::band(warmup_match_rate) == 1 {
+                                           "partial"
+                                       } else {
+                                           "cold"
+                                       },
+                                       worker_url_str,
+                                       prefill_rates.get(
+                                           &worker_url_str,
+                                           warmup_match_rate,
+                                           warmup_seed_tps,
+                                       ),
+                                       uncached_tokens,
+                                       est_tokens,
+                                       elapsed_secs,
+                                   );
+                               }
+                           }
                         }
                     }
                     tracing::debug!(
@@ -1130,7 +1138,16 @@ impl Router {
                 let est_tokens = ctx.est_tokens;
                 TtftObserverStream::new(res.bytes_stream(), move |elapsed_secs| {
                     if elapsed_secs > 0.05 && elapsed_secs < 600.0 {
-                        let measured_tps = est_tokens as f32 / elapsed_secs.max(0.001) as f32;
+                        // The engine's time-to-first-token is spent prefilling
+                        // the UNMATCHED portion of the prompt (the matched
+                        // prefix is already cached). So the honest per-uncached-
+                        // token rate is uncached_tokens / first_chunk_latency —
+                        // NOT full_tokens / latency, which overstates the rate
+                        // for warm requests (the L0-hit inflation this banding
+                        // exists to remove).
+                        let uncached_tokens =
+                            ((1.0 - match_rate).max(0.0) * est_tokens as f32).max(1.0);
+                        let measured_tps = uncached_tokens / elapsed_secs.max(0.001) as f32;
                         if measured_tps > 0.0 && measured_tps.is_finite() {
                             prefill_rates.record(
                                 &worker_url_str,
@@ -1140,7 +1157,7 @@ impl Router {
                             );
                             tracing::info!(
                                 "TTFT live prefill rate update ({} band): {} = {:.0} tps \
-                                 ({} tokens / {:.1}s, EWMA applied)",
+                                 ({:.0} uncached of {} tokens / {:.1}s, EWMA applied)",
                                 if TtftPrefillRateRegistry::band(match_rate) == 2 {
                                     "warm"
                                 } else if TtftPrefillRateRegistry::band(match_rate) == 1 {
@@ -1150,6 +1167,7 @@ impl Router {
                                 },
                                 worker_url_str,
                                 prefill_rates.get(&worker_url_str, match_rate, seed_tps),
+                                uncached_tokens,
                                 est_tokens,
                                 elapsed_secs,
                             );
