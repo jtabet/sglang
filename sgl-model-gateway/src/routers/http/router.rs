@@ -67,6 +67,9 @@ pub struct Router {
     /// Per-worker EWMA of measured prefill throughput. Seeded from
     /// `ttft_prefill_rate_tps` and updated on each warmup completion.
     ttft_prefill_rates: Arc<TtftPrefillRateRegistry>,
+    /// Receipts proving (worker, prefix) KV actually resides in the engine's
+    /// L0 right now. The tree is a promise; these are verification.
+    ttft_verified_warm: Arc<TtftVerifiedWarmRegistry>,
 }
 
 /// Tracks background warmup prefills per worker URL. Not clone-safe state —
@@ -121,10 +124,17 @@ impl TtftWarmingRegistry {
 ///   - Partial (0.10..=0.60):      mixed hit; load-back of some pages.
 ///   - Warm    (> 0.60):           KV exists but may live in L1/L2 —
 ///                                 load-back cost dominates when L0-cold.
-/// Warmups (the background prefills spawned on a 425) always run against a
-/// cache the tree claims exists but the engine does not have hot — their
-/// measurements feed the Warm band, teaching the gate what load-back really
-/// costs for this worker.
+/// Every measurement (live first-chunk and warmup) is recorded as
+/// UNMATCHED tokens / latency, the same quantity the gate's estimate
+/// divides by, so the band holds a true per-uncached-token rate.
+///
+/// The tree that supplies match_rate is a shadow model of the engine cache:
+/// it is updated at selection time, but the engine's actual L0 state changes
+/// with every request (notably the background warmups, which populate the
+/// cache the tree already claims). A sample whose implied rate jumps far
+/// above the band's current value is therefore a stale-tree artifact, not a
+/// GPU speedup, and `record_guarded` rejects it (logged with the reason) —
+/// the conservative direction for the gate is always the safe one.
 #[derive(Debug, Default)]
 struct TtftPrefillRateRegistry {
     rates: std::sync::Mutex<std::collections::HashMap<(String, u8), f32>>,
@@ -168,6 +178,83 @@ impl TtftPrefillRateRegistry {
     }
 }
 
+/// Receipts: proof that worker W's engine L0 ACTUALLY holds prefix P right
+/// now (within a TTL).
+///
+/// The cache tree is a promise registered at selection time — including for
+/// 425'd requests. But a promise can be unfulfilled: its warmup may be
+/// rejected (capacity full) or still in flight, in which case every
+/// high-match request routed to that tenant means a full cold prefill of
+/// 60–400s — the exact fetch-timeout→escalation leak. A receipt is only
+/// issued when a forwarded request on (W, P) really did produce its first
+/// chunk fast (or a warmup on (W, P) completed): for a large prompt that is
+/// only possible on an L0 hit (a 48k-token cold prefill takes ~70s at the
+/// measured ~700 tps), so a receipt is trustworthy evidence the KV is
+/// resident. The gate forwards high-match requests only on receipts; without
+/// one it re-estimates as if cold.
+#[derive(Debug, Default)]
+struct TtftVerifiedWarmRegistry {
+    entries: std::sync::Mutex<std::collections::HashMap<(String, u64), Instant>>,
+}
+
+impl TtftVerifiedWarmRegistry {
+    /// Receipt TTL. The engine can evict L0 entries under VRAM pressure and
+    /// reports nothing to the router, so receipts age out conservatively. A
+    /// leak after expiry self-heals: the leaked request's live TTFT sample
+    /// collapses the band's rate → the next matching request 425s → the
+    /// warmup re-warms → a fresh receipt is issued.
+    const TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+    /// First-chunk latency under which a forwarded request proves the KV was
+    /// resident in L0 — 2s is far above a true L0-hit first chunk (≤ ~0.5s
+    /// tail prefill) and far below any cold prefill of a budget-relevant
+    /// prompt (a 6k-token cold prefill is already ~9s at ~700 tps), so a
+    /// small prompt's fast completion can never mint a false large-prompt
+    /// receipt that matters: false receipts only exist for prompts whose
+    /// ENTIRE cold prefill also fits the budget, which is harmless.
+    const PROOF_MAX_SECS: f64 = 2.0;
+
+    /// Length (chars) of the stable prefix hashed for receipt identity. Two
+    /// turns of a conversation share at least this much (system prompt +
+    /// early context); two different conversations do not. Content shared by
+    /// two conversations colliding on this hash is a REAL shared engine
+    /// prefix (the engine's radix keys on prefixes too), so a collision never
+    /// mints a receipt for KV that does not exist.
+    const PREFIX_HASH_CHARS: usize = 16_384;
+
+    /// Stable hash of the request's shared prefix. Uses SipHash via
+    /// std's DefaultHasher — a 64-bit collision on honest content is
+    /// negligible, and content-derived collisions are real shared prefixes.
+    fn hash_prefix(text: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let end = text
+            .char_indices()
+            .nth(Self::PREFIX_HASH_CHARS)
+            .map(|(i, _)| i)
+            .unwrap_or(text.len());
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        text[..end].hash(&mut h);
+        h.finish()
+    }
+
+    /// Mark (worker, prefix) as verified-resident now. Also prunes expired
+    /// receipts (cheap amortization while the lock is held).
+    fn mark(&self, url: &str, prefix_hash: u64) {
+        let mut guard = self.entries.lock().unwrap();
+        guard.insert((url.to_string(), prefix_hash), Instant::now());
+        guard.retain(|_, at| at.elapsed() < Self::TTL);
+    }
+
+    /// True if (worker, prefix) holds an unexpired receipt.
+    fn is_verified(&self, url: &str, prefix_hash: u64) -> bool {
+        let guard = self.entries.lock().unwrap();
+        guard
+            .get(&(url.to_string(), prefix_hash))
+            .map(|at| at.elapsed() < Self::TTL)
+            .unwrap_or(false)
+    }
+}
+
 /// Estimated milliseconds to the first token for a request routed with the
 /// given cache `match_rate` (0.0..=1.0). Uncached characters are converted
 /// to tokens with `chars_per_token` and divided by `prefill_tps`.
@@ -193,6 +280,12 @@ fn ttft_budget_ms(headers: Option<&HeaderMap>) -> Option<u64> {
     value.trim().parse::<u64>().ok()
 }
 
+/// Match-rate boundary above which the selector routes by the tree's tenant
+/// (the worker where the prefix was last registered). Must equal the
+/// deployment's `--cache-threshold`; below it, selection is load-based and
+/// the band estimate is already near-cold, so no receipt is required.
+const RECEIPT_MATCH_THRESHOLD: f32 = 0.3;
+
 /// Context for recording live-request TTFT measurements into the per-worker,
 /// per-band prefill-rate EWMA. Populated by `route_typed_request_once` only
 /// when a TTFT budget header was present (i.e. the caller is patchbay and the
@@ -203,6 +296,7 @@ struct TtftRecordCtx {
     match_rate: f32,
     est_tokens: u64,
     seed_tps: f32,
+    prefix_hash: u64,
 }
 
 impl std::fmt::Debug for Router {
@@ -233,6 +327,7 @@ impl Router {
             ttft_max_warmups: ctx.router_config.ttft_max_warmups,
             ttft_warming: Arc::new(TtftWarmingRegistry::default()),
             ttft_prefill_rates: Arc::new(TtftPrefillRateRegistry::default()),
+            ttft_verified_warm: Arc::new(TtftVerifiedWarmRegistry::default()),
         })
     }
 
@@ -498,17 +593,48 @@ impl Router {
             && ttft_budget_ms(headers).is_some();
         if self.ttft_prefill_rate_tps > 0.0 {
             if let Some(budget_ms) = ttft_budget_ms(headers) {
-                // Use the per-worker, per-band measured rate when available
-                // (EWMA seeded with the global config fallback on first
-                // access). The band comes from this request's match_rate so
-                // L1-warm (load-back-dominated) requests are estimated with
-                // load-back-inclusive rates, not L0-hot ones.
-                let prefill_tps = self
-                    .ttft_prefill_rates
-                    .get(worker.url(), match_rate, self.ttft_prefill_rate_tps);
+                // Receipt check: the tree's tenant claim is only trustworthy
+                // when the engine L0 state for (worker, prefix) is actually
+                // verified. Without a receipt we estimate as cold — a promise
+                // whose warmup was capacity-rejected or is still in flight
+                // would otherwise forward into a 90s+ cold prefill.
+                let prefix_hash = TtftVerifiedWarmRegistry::hash_prefix(text);
+                // Estimate inputs. When the request matches the tree above
+                // the cache threshold but the selected worker holds no
+                // verified L0 receipt for this prefix, the match is an
+                // UNFULFILLED PROMISE (the warmup that would have populated
+                // it was capacity-rejected, is still in flight, or the KV was
+                // evicted) — assume NOTHING is resident and use the cold
+                // band's rate with match_rate 0.0, so every token is charged.
+                let unverified = match_rate > RECEIPT_MATCH_THRESHOLD
+                    && !self
+                        .ttft_verified_warm
+                        .is_verified(worker.url(), prefix_hash);
+                let (est_match_rate, prefill_tps) = if unverified {
+                    tracing::info!(
+                        "TTFT receipt miss: prefix matches {:.0}% in tree but {} has no verified \
+                         L0 receipt for it — estimating cold",
+                        match_rate * 100.0,
+                        worker.url()
+                    );
+                    (
+                        0.0,
+                        self.ttft_prefill_rates
+                            .get(worker.url(), 0.0, self.ttft_prefill_rate_tps),
+                    )
+                } else {
+                    // The band comes from this request's match_rate so
+                    // L1-warm (load-back-dominated) requests are estimated
+                    // with load-back-inclusive rates, not L0-hot ones.
+                    (
+                        match_rate,
+                        self.ttft_prefill_rates
+                            .get(worker.url(), match_rate, self.ttft_prefill_rate_tps),
+                    )
+                };
                 let est_ms = estimate_ttft_ms(
                     text,
-                    match_rate,
+                    est_match_rate,
                     self.ttft_chars_per_token,
                     prefill_tps,
                 );
@@ -586,6 +712,7 @@ impl Router {
                 est_tokens: (text_len as f32 / self.ttft_chars_per_token.max(0.1))
                     .max(1.0) as u64,
                 seed_tps: self.ttft_prefill_rate_tps,
+                prefix_hash: TtftVerifiedWarmRegistry::hash_prefix(text),
             })
         } else {
             None
@@ -689,10 +816,12 @@ impl Router {
 
         let warming = self.ttft_warming.clone();
         let prefill_rates = self.ttft_prefill_rates.clone();
+        let verified_warm = self.ttft_verified_warm.clone();
         let worker_url_str = worker.url().to_string();
         let chars_per_token = self.ttft_chars_per_token;
         let warmup_match_rate = match_rate;
         let warmup_seed_tps = self.ttft_prefill_rate_tps;
+        let warmup_prefix_hash = TtftVerifiedWarmRegistry::hash_prefix(text);
         // Estimate the token count the engine will prefill. We use the same
         // chars_per_token conversion as the budget gate — the match_rate is
         // not known here (the tree was updated but we don't have it), so we
@@ -807,9 +936,17 @@ impl Router {
                            }
                         }
                     }
+                    // Fully drained → the engine PERSISTED this prompt's KV
+                    // into its radix cache (the documented drop-body-midstream
+                    // pitfall is avoided by the drain). The tree promised this
+                    // prefix would be warm once the warmup landed; mint the
+                    // receipt so budgeted requests may now trust that claim.
+                    verified_warm.mark(&worker_url_str, warmup_prefix_hash);
                     tracing::debug!(
-                        "TTFT warmup: drained full body for {} (cache persisted)",
-                        worker_url_str
+                        "TTFT warmup: drained full body for {} (cache persisted, \
+                         receipt minted for prefix {:x})",
+                        worker_url_str,
+                        warmup_prefix_hash
                     );
                 }
                 Err(e) => {
@@ -1136,6 +1273,8 @@ impl Router {
                 let seed_tps = ctx.seed_tps;
                 let match_rate = ctx.match_rate;
                 let est_tokens = ctx.est_tokens;
+                let prefix_hash = ctx.prefix_hash;
+                let verified_warm = self.ttft_verified_warm.clone();
                 TtftObserverStream::new(res.bytes_stream(), move |elapsed_secs| {
                     if elapsed_secs > 0.05 && elapsed_secs < 600.0 {
                         // The engine's time-to-first-token is spent prefilling
@@ -1171,6 +1310,15 @@ impl Router {
                                 est_tokens,
                                 elapsed_secs,
                             );
+                            // A sub-2s first chunk on a high-match request is
+                            // proof the KV was resident in this worker's L0 —
+                            // mint/refresh the receipt so future requests may
+                            // trust the tree's claim for this prefix.
+                            if elapsed_secs < TtftVerifiedWarmRegistry::PROOF_MAX_SECS
+                                && match_rate > RECEIPT_MATCH_THRESHOLD
+                            {
+                                verified_warm.mark(&worker_url_str, prefix_hash);
+                            }
                         }
                     } else if elapsed_secs <= 0.05 {
                         tracing::debug!(
@@ -1442,6 +1590,7 @@ mod tests {
             ttft_max_warmups: 4,
             ttft_warming: Arc::new(TtftWarmingRegistry::default()),
             ttft_prefill_rates: Arc::new(TtftPrefillRateRegistry::default()),
+            ttft_verified_warm: Arc::new(TtftVerifiedWarmRegistry::default()),
         }
     }
 
@@ -1572,5 +1721,24 @@ mod tests {
         assert_eq!(TtftPrefillRateRegistry::band(0.60), 1);
         assert_eq!(TtftPrefillRateRegistry::band(0.61), 2);
         assert_eq!(TtftPrefillRateRegistry::band(0.95), 2);
+    }
+
+    #[test]
+    fn test_verified_warm_registry() {
+        let reg = TtftVerifiedWarmRegistry::default();
+        let prefix_a = "conversation-a system prompt".repeat(200);
+        let prefix_b = "conversation-b system prompt".repeat(200);
+        let hash_a = TtftVerifiedWarmRegistry::hash_prefix(&prefix_a);
+        let hash_b = TtftVerifiedWarmRegistry::hash_prefix(&prefix_b);
+        assert_ne!(hash_a, hash_b, "distinct prefixes must not collide");
+        // Stable across calls (two turns of the same conversation re-hash
+        // identically, so the receipt survives a multi-turn session).
+        assert_eq!(hash_a, TtftVerifiedWarmRegistry::hash_prefix(&prefix_a));
+
+        assert!(!reg.is_verified("w1", hash_a), "fresh registry has no receipts");
+        reg.mark("w1", hash_a);
+        assert!(reg.is_verified("w1", hash_a), "marked receipt is visible");
+        assert!(!reg.is_verified("w1", hash_b), "prefix B has no receipt");
+        assert!(!reg.is_verified("w2", hash_a), "other worker has no receipt");
     }
 }
