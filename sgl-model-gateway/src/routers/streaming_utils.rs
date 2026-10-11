@@ -62,9 +62,29 @@ pub struct TtftObserverStream<E = reqwest::Error> {
     /// either when the first chunk arrives or on stream error/EOF without
     /// any chunk (elapsed from start, so a failed send still records).
     on_first: Option<Box<dyn FnOnce(f64) + Send>>,
+    /// Called ONCE when the body is discarded before any first chunk arrived
+    /// while the request was pending for at least `ABORT_SIGNAL_MIN_SECS`.
+    /// This is the cancelled/aborted case: `poll_next` never delivered a
+    /// first chunk, an error, or EOF, so `on_first` never fires and the abort
+    /// is otherwise invisible. A receipt for a (worker, prefix) whose KV was
+    /// evicted then survives its TTL and every repeat same-prefix request
+    /// re-forwards into the same cold prefill → 90s fetch timeout.
+    ///
+    /// Deliberately SEPARATE from `on_first`: an abort's elapsed time is the
+    /// caller's cancel point, NOT a prefill completion, so it must NOT be fed
+    /// to the prefill-rate EWMA (a 3s cancel of a 60s cold prefill would
+    /// register an absurd 20k tps and inflate the band). Only the receipt
+    /// invalidation happens on abort.
+    on_drop_no_chunk: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl<E> TtftObserverStream<E> {
+    /// Minimum pending time for a no-first-chunk drop to count as a stall.
+    /// Below it the client cancelled a fast request early (or nothing was
+    /// really in flight) — neither the receipt registry nor the rate EWMA
+    /// should care.
+    const ABORT_SIGNAL_MIN_SECS: f64 = 2.0;
+
     pub fn new<S, F>(inner: S, on_first: F) -> Self
     where
         S: Stream<Item = Result<Bytes, E>> + Send + 'static,
@@ -75,6 +95,28 @@ impl<E> TtftObserverStream<E> {
             observed: false,
             started: Instant::now(),
             on_first: Some(Box::new(on_first)),
+            on_drop_no_chunk: None,
+        }
+    }
+
+    /// Register the abort hook (receipt invalidation, no rate sample).
+    pub fn on_drop_no_chunk(mut self, f: impl FnOnce() + Send + 'static) -> Self {
+        self.on_drop_no_chunk = Some(Box::new(f));
+        self
+    }
+}
+
+/// Report a cancellation-without-first-token to the hook registered via
+/// `on_drop_no_chunk`. The elapsed gate keeps a very early cancel from being
+/// treated as a stall signal.
+impl<E> Drop for TtftObserverStream<E> {
+    fn drop(&mut self) {
+        if !self.observed && self.on_first.is_some() {
+            if self.started.elapsed().as_secs_f64() >= Self::ABORT_SIGNAL_MIN_SECS {
+                if let Some(f) = self.on_drop_no_chunk.take() {
+                    f();
+                }
+            }
         }
     }
 }

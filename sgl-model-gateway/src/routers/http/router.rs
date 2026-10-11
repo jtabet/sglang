@@ -1286,6 +1286,10 @@ impl Router {
                 let est_tokens = ctx.est_tokens;
                 let prefix_hash = ctx.prefix_hash;
                 let verified_warm = self.ttft_verified_warm.clone();
+                // Clones for the abort hook (on_first's `move` closure moves
+                // the originals out; these feed the no-chunk-drop invalidation).
+                let verified_warm_drop = verified_warm.clone();
+                let worker_url_drop = worker_url_str.clone();
                 TtftObserverStream::new(res.bytes_stream(), move |elapsed_secs| {
                     if elapsed_secs > 0.05 && elapsed_secs < 600.0 {
                         // The engine's time-to-first-token is spent prefilling
@@ -1360,6 +1364,26 @@ impl Router {
                         tracing::debug!(
                             "TTFT live sample skipped: {}s < 50ms floor (L0-hot?)",
                             elapsed_secs
+                        );
+                    }
+                })
+                .on_drop_no_chunk(move || {
+                    // Cancelled/aborted before any first chunk: the worker was
+                    // still cold-prefilling, so the KV was NOT L0-resident. A
+                    // receipt left in place would forward the next same-prefix
+                    // request into the same prefill → another 90s fetch
+                    // timeout. Drop it so that request re-estimates cold → 425
+                    // → clean cloud fallback while the warmup re-mints one.
+                    // (Deliberately NOT fed to the prefill-rate EWMA — a cancel
+                    // point is not a prefill completion.)
+                    if match_rate > RECEIPT_MATCH_THRESHOLD {
+                        verified_warm_drop.invalidate(&worker_url_drop, prefix_hash);
+                        tracing::info!(
+                            "TTFT receipt invalidation (abort): no first chunk \
+                             before cancel on a {:.0}%-match request to {} — \
+                             dropping (worker, prefix) receipt",
+                            match_rate * 100.0,
+                            worker_url_drop
                         );
                     }
                 })
