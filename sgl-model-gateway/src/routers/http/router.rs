@@ -199,11 +199,20 @@ struct TtftVerifiedWarmRegistry {
 
 impl TtftVerifiedWarmRegistry {
     /// Receipt TTL. The engine can evict L0 entries under VRAM pressure and
-    /// reports nothing to the router, so receipts age out conservatively. A
-    /// leak after expiry self-heals: the leaked request's live TTFT sample
-    /// collapses the band's rate → the next matching request 425s → the
-    /// warmup re-warms → a fresh receipt is issued.
-    const TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+    /// reports nothing to the router (and a pod restart wipes L0 entirely,
+    /// which the router never sees), so receipts age out conservatively.
+    /// Deliberately SHORT (2 min, not 15): a stale receipt is what sends the
+    /// next same-prefix request into a cold prefill → 90s fetch timeout, and a
+    /// worker restart/eviction leaves a burst of them "valid". 2 min bounds
+    /// that blast radius — after a worker goes down or its L0 is evicted, its
+    /// receipts die within 2 min and requests re-estimate cold → clean 425s
+    /// instead of a multi-minute timeout + cooldown storm. Active sessions are
+    /// unaffected: every sub-2s first chunk re-mints a fresh receipt, so the
+    /// TTL never binds for live traffic (only for idle gaps > 2 min, which
+    /// 425-once + warmup-re-mint handles). The prompt path is separately
+    /// covered by the slow-first-chunk and no-chunk-on-drop invalidation,
+    /// which react in a single request.
+    const TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
     /// First-chunk latency under which a forwarded request proves the KV was
     /// resident in L0 — 2s is far above a true L0-hit first chunk (≤ ~0.5s
