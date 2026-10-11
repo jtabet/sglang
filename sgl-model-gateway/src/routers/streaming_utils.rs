@@ -28,6 +28,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Instant,
 };
 
 use bytes::Bytes;
@@ -44,6 +45,73 @@ enum Terminal {
     Completed,
     /// Stream yielded an `Err` item.
     Errored,
+}
+
+/// One-shot TTFT observer for a live streamed response.
+///
+/// Times the first body chunk of the upstream SSE stream (≈ time to first
+/// token, including any cache load-back the engine had to pay) and reports it
+/// through the provided closure exactly once. This is what teaches the
+/// per-worker prefill-rate EWMA the *real* cost of serving a prompt whose KV
+/// was evicted to L1/L2 — warmup measurements alone under-sample that path.
+pub struct TtftObserverStream<E = reqwest::Error> {
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, E>> + Send + 'static>>,
+    observed: bool,
+    started: Instant,
+    /// Called with (elapsed_secs, dropped_after_first_bytes) exactly once,
+    /// either when the first chunk arrives or on stream error/EOF without
+    /// any chunk (elapsed from start, so a failed send still records).
+    on_first: Option<Box<dyn FnOnce(f64) + Send>>,
+}
+
+impl<E> TtftObserverStream<E> {
+    pub fn new<S, F>(inner: S, on_first: F) -> Self
+    where
+        S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+        F: FnOnce(f64) + Send + 'static,
+    {
+        Self {
+            inner: Box::pin(inner),
+            observed: false,
+            started: Instant::now(),
+            on_first: Some(Box::new(on_first)),
+        }
+    }
+}
+
+impl<E: Display> Stream for TtftObserverStream<E> {
+    type Item = Result<Bytes, E>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.observed {
+            return self.inner.as_mut().poll_next(cx);
+        }
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(b))) => {
+                self.observed = true;
+                let elapsed = self.started.elapsed().as_secs_f64();
+                if let Some(f) = self.on_first.take() {
+                    f(elapsed);
+                }
+                Poll::Ready(Some(Ok(b)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                self.observed = true;
+                if let Some(f) = self.on_first.take() {
+                    f(self.started.elapsed().as_secs_f64());
+                }
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(None) => {
+                self.observed = true;
+                if let Some(f) = self.on_first.take() {
+                    f(self.started.elapsed().as_secs_f64());
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 /// Wraps a `Stream<Item = Result<Bytes, E>>` so that the circuit breaker on
@@ -148,7 +216,7 @@ mod tests {
     use bytes::Bytes;
     use futures_util::StreamExt;
 
-    use super::BreakerTrackedStream;
+    use super::{BreakerTrackedStream, TtftObserverStream};
     use crate::core::{BasicWorkerBuilder, Worker};
 
     /// Lightweight error type for tests — keeps the wrapper generic so we
@@ -267,5 +335,47 @@ mod tests {
         assert!(matches!(tracked.next().await, Some(Err(_))));
         drop(tracked);
         assert_eq!(breaker_counters(&w), (0, 1));
+    }
+    // ── TtftObserverStream ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn observer_reports_first_chunk_elapsed() {
+        let (tx, got) = std::sync::mpsc::channel::<f64>();
+        let inner = futures_util::stream::iter(vec![
+            Ok::<_, TestErr>(Bytes::from_static(b"first")),
+            Ok(Bytes::from_static(b"second")),
+            Ok(Bytes::from_static(b"third")),
+        ]);
+        let mut obs = TtftObserverStream::new(inner, move |e| tx.send(e).unwrap());
+        assert!(obs.next().await.is_some(), "first chunk");
+        assert!(obs.next().await.is_some(), "second chunk");
+        assert!(obs.next().await.is_some(), "third chunk");
+        assert!(obs.next().await.is_none(), "eof");
+        // exactly one sample, tiny but ≥ 0
+        let e = got.try_recv().expect("one sample recorded");
+        assert!(e >= 0.0);
+        assert!(got.try_recv().is_err(), "no second sample");
+    }
+
+    #[tokio::test]
+    async fn observer_reports_on_error_without_chunk() {
+        let (tx, got) = std::sync::mpsc::channel::<f64>();
+        let inner = futures_util::stream::iter(vec![Err::<Bytes, TestErr>(TestErr("boom"))]);
+        let mut obs = TtftObserverStream::new(inner, move |e| tx.send(e).unwrap());
+        assert!(matches!(obs.next().await, Some(Err(_))));
+        assert!(got.try_recv().is_ok(), "error before first chunk still records");
+        // error AFTER first chunk must not re-fire — verified by the exact-one
+        // guarantee in the channel assertion above.
+    }
+
+    #[tokio::test]
+    async fn observer_reports_on_eof_without_chunk() {
+        let (tx, got) = std::sync::mpsc::channel::<f64>();
+        let inner: futures_util::stream::Iter<
+            std::vec::IntoIter<Result<Bytes, TestErr>>,
+        > = futures_util::stream::iter(vec![]);
+        let mut obs = TtftObserverStream::new(inner, move |e| tx.send(e).unwrap());
+        assert!(obs.next().await.is_none(), "eof immediately");
+        assert!(got.try_recv().is_ok(), "eof without chunk records elapsed");
     }
 }

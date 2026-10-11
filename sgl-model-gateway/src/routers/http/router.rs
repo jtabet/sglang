@@ -38,7 +38,7 @@ use crate::{
         error::{self, extract_error_code_from_response},
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils,
-        streaming_utils::BreakerTrackedStream,
+        streaming_utils::{BreakerTrackedStream, TtftObserverStream},
         RouterTrait,
     },
 };
@@ -103,16 +103,31 @@ impl TtftWarmingRegistry {
     }
 }
 
-/// Per-worker EWMA of measured prefill throughput (tokens/second). Each warmup
-/// completion feeds `tokens / elapsed_secs` into the EWMA; the budget gate
-/// reads the per-worker rate so a slow worker (thermal throttle, narrow PCIe)
-/// gets a realistic estimate instead of the global seed.
+/// Per-worker, per-cache-band EWMA of measured prefill throughput
+/// (tokens/second).
 ///
-/// Entries are seeded lazily with `initial_tps` on first access, so the first
-/// request for a worker uses the configured fallback before any measurement.
+/// With the L0/L1/L2 cache hierarchy, a "match_rate=0.94" prompt is NOT cheap
+/// unless the KV currently lives in VRAM (L0): when the prefix was offloaded
+/// to the central mooncake store (L1), the engine must load the pages back
+/// before prefilling the tail, and load-back dominates — measured effective
+/// rates of 75–300 tok/s vs 2k–30k tok/s for a true L0 hit. A single
+/// per-worker EWMA is polluted by the fast L0-hot completions and keeps
+/// opening the budget gate for L1-warm requests that then blow the caller's
+/// TTFT budget (fetch timeout → escalation → cloud).
+///
+/// So the registry keeps a separate EWMA per (worker, band), where the band is
+/// derived from the match_rate the selector observed for THIS request:
+///   - Cold    (match_rate < 0.10): full prefill, no KV to load.
+///   - Partial (0.10..=0.60):      mixed hit; load-back of some pages.
+///   - Warm    (> 0.60):           KV exists but may live in L1/L2 —
+///                                 load-back cost dominates when L0-cold.
+/// Warmups (the background prefills spawned on a 425) always run against a
+/// cache the tree claims exists but the engine does not have hot — their
+/// measurements feed the Warm band, teaching the gate what load-back really
+/// costs for this worker.
 #[derive(Debug, Default)]
 struct TtftPrefillRateRegistry {
-    rates: std::sync::Mutex<std::collections::HashMap<String, f32>>,
+    rates: std::sync::Mutex<std::collections::HashMap<(String, u8), f32>>,
 }
 
 impl TtftPrefillRateRegistry {
@@ -121,19 +136,34 @@ impl TtftPrefillRateRegistry {
     /// to a thermal throttle event.
     const ALPHA: f32 = 0.3;
 
-    /// Returns the current rate for `url`, seeding with `fallback` on first
-    /// access.
-    fn get(&self, url: &str, fallback: f32) -> f32 {
-        let mut guard = self.rates.lock().unwrap();
-        *guard.entry(url.to_string()).or_insert(fallback)
+    /// Band index for a match_rate. `band(match)` is stable so `get`/`record`
+    /// always agree on the bucket.
+    fn band(match_rate: f32) -> u8 {
+        let mr = match_rate.clamp(0.0, 1.0);
+        if mr < 0.10 {
+            0 // cold
+        } else if mr <= 0.60 {
+            1 // partial
+        } else {
+            2 // warm (≥ 0.60)
+        }
     }
 
-    /// Update the EWMA for `url` with a new measurement. Seeded with
-    /// `fallback` if this is the first sample (so the EWMA starts from the
-    /// configured baseline rather than jumping straight to the measurement).
-    fn record(&self, url: &str, measured_tps: f32, fallback: f32) {
+    fn get(&self, url: &str, match_rate: f32, fallback: f32) -> f32 {
         let mut guard = self.rates.lock().unwrap();
-        let entry = guard.entry(url.to_string()).or_insert(fallback);
+        *guard
+            .entry((url.to_string(), Self::band(match_rate)))
+            .or_insert(fallback)
+    }
+
+    /// Update the band EWMA with a new measurement. Seeded with `fallback` if
+    /// this is the first sample for the band.
+    fn record(&self, url: &str, match_rate: f32, measured_tps: f32, fallback: f32) {
+        let band = Self::band(match_rate);
+        let mut guard = self.rates.lock().unwrap();
+        let entry = guard
+            .entry((url.to_string(), band))
+            .or_insert(fallback);
         *entry = Self::ALPHA * measured_tps + (1.0 - Self::ALPHA) * *entry;
     }
 }
@@ -161,6 +191,18 @@ pub(crate) fn estimate_ttft_ms(
 fn ttft_budget_ms(headers: Option<&HeaderMap>) -> Option<u64> {
     let value = headers?.get("x-ttft-budget-ms")?.to_str().ok()?;
     value.trim().parse::<u64>().ok()
+}
+
+/// Context for recording live-request TTFT measurements into the per-worker,
+/// per-band prefill-rate EWMA. Populated by `route_typed_request_once` only
+/// when a TTFT budget header was present (i.e. the caller is patchbay and the
+/// measurement is relevant to the gate); `None` otherwise so ordinary
+/// requests pay zero overhead beyond one closure allocation.
+#[derive(Clone, Copy)]
+struct TtftRecordCtx {
+    match_rate: f32,
+    est_tokens: u64,
+    seed_tps: f32,
 }
 
 impl std::fmt::Debug for Router {
@@ -452,13 +494,18 @@ impl Router {
         // flight for the selected worker, budgeted requests keep declining:
         // the tree already claims affinity but the engine cache is not
         // populated yet.
+        let gate_active = self.ttft_prefill_rate_tps > 0.0
+            && ttft_budget_ms(headers).is_some();
         if self.ttft_prefill_rate_tps > 0.0 {
             if let Some(budget_ms) = ttft_budget_ms(headers) {
-                // Use per-worker measured rate when available (EWMA seeded
-                // with the global config fallback on first access).
+                // Use the per-worker, per-band measured rate when available
+                // (EWMA seeded with the global config fallback on first
+                // access). The band comes from this request's match_rate so
+                // L1-warm (load-back-dominated) requests are estimated with
+                // load-back-inclusive rates, not L0-hot ones.
                 let prefill_tps = self
                     .ttft_prefill_rates
-                    .get(worker.url(), self.ttft_prefill_rate_tps);
+                    .get(worker.url(), match_rate, self.ttft_prefill_rate_tps);
                 let est_ms = estimate_ttft_ms(
                     text,
                     match_rate,
@@ -488,7 +535,7 @@ impl Router {
                     );
                     self.maybe_spawn_warmup(
                         headers, typed_req, route, &worker, is_stream,
-                        est_ms, budget_ms, &text,
+                        est_ms, budget_ms, &text, match_rate,
                     );
                     let total_425_latency = req_start.elapsed();
                     let warmup_elapsed = warmup_start.elapsed();
@@ -530,8 +577,24 @@ impl Router {
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
+        // Only budgeted (patchbay) requests feed the live TTFT recorder.
+        // est_tokens mirrors the warmup recorder: full text / chars_per_token
+        // — the band absorbs the cached fraction.
+        let ttft_ctx = if gate_active {
+            Some(TtftRecordCtx {
+                match_rate,
+                est_tokens: (text_len as f32 / self.ttft_chars_per_token.max(0.1))
+                    .max(1.0) as u64,
+                seed_tps: self.ttft_prefill_rate_tps,
+            })
+        } else {
+            None
+        };
+
         let response = self
-            .send_typed_request(headers, typed_req, route, &worker, is_stream, load_guard)
+            .send_typed_request(
+                headers, typed_req, route, &worker, is_stream, load_guard, ttft_ctx,
+            )
             .await;
 
         events::RequestReceivedEvent {}.emit();
@@ -584,6 +647,7 @@ impl Router {
         _est_ms: u64,
         _budget_ms: u64,
         text: &str,
+        match_rate: f32,
     ) {
         // Large prompts are exactly the ones that cannot cold-prefill within
         // a fetch budget, so they are the ones that most need a background
@@ -627,7 +691,8 @@ impl Router {
         let prefill_rates = self.ttft_prefill_rates.clone();
         let worker_url_str = worker.url().to_string();
         let chars_per_token = self.ttft_chars_per_token;
-        let seed_tps = self.ttft_prefill_rate_tps;
+        let warmup_match_rate = match_rate;
+        let warmup_seed_tps = self.ttft_prefill_rate_tps;
         // Estimate the token count the engine will prefill. We use the same
         // chars_per_token conversion as the budget gate — the match_rate is
         // not known here (the tree was updated but we don't have it), so we
@@ -690,29 +755,48 @@ impl Router {
                                 elapsed,
                                 worker_url_str
                             );
-                            // Feed the per-worker EWMA. Skip degenerate
-                            // cases (< 50ms = cache hit, > 600s = something
-                            // went wrong with timing).
-                            let elapsed_secs = elapsed.as_secs_f64().max(0.001);
-                            if elapsed_secs > 0.05 && elapsed_secs < 600.0 {
-                                let measured_tps =
-                                    est_tokens as f32 / elapsed_secs as f32;
-                                if measured_tps > 0.0 && measured_tps.is_finite() {
-                                    prefill_rates.record(
-                                        &worker_url_str,
-                                        measured_tps,
-                                        seed_tps,
-                                    );
-                                    tracing::debug!(
-                                        "TTFT prefill rate update: {} = {:.0} tps \
-                                         ({} tokens / {:.1}s, EWMA applied)",
-                                        worker_url_str,
-                                        prefill_rates.get(&worker_url_str, seed_tps),
-                                        est_tokens,
-                                        elapsed_secs,
-                                    );
-                                }
-                            }
+                          // Feed the per-worker, WARM-band EWMA: a warmup runs
+                          // against a prefix the selector counts as matched
+                          // but which lives in L1/L2 (or nowhere) — the
+                          // measurement includes load-back cost, exactly the
+                          // physics budgeted requests pay when the gate
+                          // wrongly opens. Skip degenerate cases (< 50ms
+                          // means the KV was already L0-hot; that sample
+                          // belongs to the warm band too, but it is the
+                          // *good* tail of it — feeding it keeps the warm
+                          // band honest about the load-back-free case).
+                          let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+                          if elapsed_secs > 0.05 && elapsed_secs < 600.0 {
+                              let measured_tps =
+                                  est_tokens as f32 / elapsed_secs as f32;
+                              if measured_tps > 0.0 && measured_tps.is_finite() {
+                                  prefill_rates.record(
+                                      &worker_url_str,
+                                      warmup_match_rate,
+                                      measured_tps,
+                                      warmup_seed_tps,
+                                  );
+                                  tracing::info!(
+                                      "TTFT prefill rate update (warmup, {} band): {} = \
+                                       {:.0} tps ({} tokens / {:.1}s, EWMA applied)",
+                                      if TtftPrefillRateRegistry::band(warmup_match_rate) == 2 {
+                                          "warm"
+                                      } else if TtftPrefillRateRegistry::band(warmup_match_rate) == 1 {
+                                          "partial"
+                                      } else {
+                                          "cold"
+                                      },
+                                      worker_url_str,
+                                      prefill_rates.get(
+                                          &worker_url_str,
+                                          warmup_match_rate,
+                                          warmup_seed_tps,
+                                      ),
+                                      est_tokens,
+                                      elapsed_secs,
+                                  );
+                              }
+                          }
                         }
                     }
                     tracing::debug!(
@@ -893,6 +977,7 @@ impl Router {
         worker: &Arc<dyn Worker>,
         is_stream: bool,
         load_guard: Option<WorkerLoadGuard>,
+        ttft_ctx: Option<TtftRecordCtx>,
     ) -> Response {
         let worker_url = worker.url();
         let api_key = worker.api_key().clone();
@@ -1028,8 +1113,61 @@ impl Router {
             // stream cleanly to `None` and Drop would record a spurious
             // success (and the streaming branch also skips the eager
             // `record_outcome` above).
+            // Wrap the raw byte stream in a TTFT observer (when budgeted) so
+            // the first chunk's latency — load-back + prefill included — is
+            // recorded into the per-worker, per-band prefill-rate EWMA.
+            // Streaming is exactly where live TTFT samples come from: warmups
+            // only cover the 425 path, while live streams cover every
+            // forwarded request including L1 load-back dominated ones.
+            let raw_stream = if let Some(ctx) = ttft_ctx {
+                // Token estimate must mirror what the warmup path uses: full
+                // text (est_tokens covers the whole prompt; the band already
+                // accounts for how much of it was cached).
+                let prefill_rates = self.ttft_prefill_rates.clone();
+                let worker_url_str = worker_url.to_string();
+                let seed_tps = ctx.seed_tps;
+                let match_rate = ctx.match_rate;
+                let est_tokens = ctx.est_tokens;
+                TtftObserverStream::new(res.bytes_stream(), move |elapsed_secs| {
+                    if elapsed_secs > 0.05 && elapsed_secs < 600.0 {
+                        let measured_tps = est_tokens as f32 / elapsed_secs.max(0.001) as f32;
+                        if measured_tps > 0.0 && measured_tps.is_finite() {
+                            prefill_rates.record(
+                                &worker_url_str,
+                                match_rate,
+                                measured_tps,
+                                seed_tps,
+                            );
+                            tracing::info!(
+                                "TTFT live prefill rate update ({} band): {} = {:.0} tps \
+                                 ({} tokens / {:.1}s, EWMA applied)",
+                                if TtftPrefillRateRegistry::band(match_rate) == 2 {
+                                    "warm"
+                                } else if TtftPrefillRateRegistry::band(match_rate) == 1 {
+                                    "partial"
+                                } else {
+                                    "cold"
+                                },
+                                worker_url_str,
+                                prefill_rates.get(&worker_url_str, match_rate, seed_tps),
+                                est_tokens,
+                                elapsed_secs,
+                            );
+                        }
+                    } else if elapsed_secs <= 0.05 {
+                        tracing::debug!(
+                            "TTFT live sample skipped: {}s < 50ms floor (L0-hot?)",
+                            elapsed_secs
+                        );
+                    }
+                })
+                .boxed()
+            } else {
+                res.bytes_stream().boxed()
+            };
+
             let mut tracked = BreakerTrackedStream::new(
-                res.bytes_stream(),
+                raw_stream,
                 worker.clone(),
                 worker_url.to_string(),
             );
@@ -1382,26 +1520,39 @@ mod tests {
     fn test_prefill_rate_ewma() {
         let reg = TtftPrefillRateRegistry::default();
         let seed = 2600.0;
+        let cold = 0.0;
+        let warm = 0.95;
 
-        // First access seeds with the fallback
-        let r = reg.get("w1", seed);
-        assert_eq!(r, seed);
+        // First access seeds with the fallback, per band
+        let r = reg.get("w1", cold, seed);
+        assert_eq!(r, seed, "cold band seeds at fallback");
+        let rw = reg.get("w1", warm, seed);
+        assert_eq!(rw, seed, "warm band independently seeds at fallback");
 
-        // Record a measurement of 2000 tps — EWMA should move toward it
-        // but not jump all the way (alpha=0.3)
-        reg.record("w1", 2000.0, seed);
-        let r1 = reg.get("w1", seed);
+        // Record a measurement of 2000 tps into the COLD band — the warm
+        // band must stay at seed (bands are independent)
+        reg.record("w1", cold, 2000.0, seed);
+        let r1 = reg.get("w1", cold, seed);
         // alpha=0.3: 0.3*2000 + 0.7*2600 = 2420
         assert!((r1 - 2420.0).abs() < 1.0, "r1={}", r1);
+        assert_eq!(reg.get("w1", warm, seed), seed, "warm band untouched");
 
         // Another measurement of 2000 — moves further toward 2000
-        reg.record("w1", 2000.0, seed);
-        let r2 = reg.get("w1", seed);
+        reg.record("w1", cold, 2000.0, seed);
+        let r2 = reg.get("w1", cold, seed);
         // 0.3*2000 + 0.7*2420 = 2294
         assert!((r2 - 2294.0).abs() < 1.0, "r2={}", r2);
 
-        // Different worker is independent
-        let r3 = reg.get("w2", seed);
+        // Different worker is independent even in the same band
+        let r3 = reg.get("w2", cold, seed);
         assert_eq!(r3, seed, "w2 should still be at seed");
+
+        // Band boundaries: 0.05 → cold(0), 0.10 → partial(1), 0.60 → partial(1),
+        // 0.61 → warm(2)
+        assert_eq!(TtftPrefillRateRegistry::band(0.05), 0);
+        assert_eq!(TtftPrefillRateRegistry::band(0.10), 1);
+        assert_eq!(TtftPrefillRateRegistry::band(0.60), 1);
+        assert_eq!(TtftPrefillRateRegistry::band(0.61), 2);
+        assert_eq!(TtftPrefillRateRegistry::band(0.95), 2);
     }
 }
