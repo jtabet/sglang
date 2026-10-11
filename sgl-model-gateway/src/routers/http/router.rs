@@ -253,6 +253,17 @@ impl TtftVerifiedWarmRegistry {
             .map(|at| at.elapsed() < Self::TTL)
             .unwrap_or(false)
     }
+
+    /// Drop the (worker, prefix) receipt if present. Called when a forwarded
+    /// high-match request's first chunk turns out SLOW — direct proof the KV
+    /// is no longer L0-resident (it was evicted under VRAM pressure, which the
+    /// engine never reports). A receipt left in place after that would send the
+    /// next same-prefix request into the same cold prefill → 90s fetch timeout.
+    /// The accompanying background warmup re-warms and re-mints a fresh receipt.
+    fn invalidate(&self, url: &str, prefix_hash: u64) {
+        let mut guard = self.entries.lock().unwrap();
+        guard.remove(&(url.to_string(), prefix_hash));
+    }
 }
 
 /// Estimated milliseconds to the first token for a request routed with the
@@ -1317,7 +1328,32 @@ impl Router {
                             if elapsed_secs < TtftVerifiedWarmRegistry::PROOF_MAX_SECS
                                 && match_rate > RECEIPT_MATCH_THRESHOLD
                             {
+                                // Fast first chunk on a high-match request is
+                                // proof the KV is L0-resident here — mint/
+                                // refresh the receipt.
                                 verified_warm.mark(&worker_url_str, prefix_hash);
+                            } else if elapsed_secs >= TtftVerifiedWarmRegistry::PROOF_MAX_SECS
+                                && match_rate > RECEIPT_MATCH_THRESHOLD
+                            {
+                                // SLOW first chunk on a high-match request proves
+                                // the KV was NOT L0-resident (evicted since a
+                                // prior receipt was minted, or never was). Left
+                                // in place, the surviving receipt would forward
+                                // the next same-prefix request into the same
+                                // cold prefill → 90s fetch timeout. Drop it so
+                                // that request re-estimates cold → 425 → clean
+                                // cloud fallback, while the background warmup
+                                // re-warms and re-mints a fresh receipt.
+                                verified_warm.invalidate(&worker_url_str, prefix_hash);
+                                tracing::info!(
+                                    "TTFT receipt invalidation: {:.1}s first chunk (>= {}s) on a \
+                                     {:.0}%-match request to {} proves KV not L0-resident — \
+                                     dropping (worker, prefix) receipt",
+                                    elapsed_secs,
+                                    TtftVerifiedWarmRegistry::PROOF_MAX_SECS,
+                                    match_rate * 100.0,
+                                    worker_url_str
+                                );
                             }
                         }
                     } else if elapsed_secs <= 0.05 {
@@ -1740,5 +1776,13 @@ mod tests {
         assert!(reg.is_verified("w1", hash_a), "marked receipt is visible");
         assert!(!reg.is_verified("w1", hash_b), "prefix B has no receipt");
         assert!(!reg.is_verified("w2", hash_a), "other worker has no receipt");
+
+        // A slow first chunk on a high-match request invalidates the receipt
+        // (KV evicted under VRAM pressure) so the next same-prefix request
+        // re-estimates cold → 425 instead of re-forwarding into a timeout.
+        reg.mark("w1", hash_b);
+        reg.invalidate("w1", hash_a);
+        assert!(!reg.is_verified("w1", hash_a), "invalidated receipt is gone");
+        assert!(reg.is_verified("w1", hash_b), "sibling receipt survives");
     }
 }
