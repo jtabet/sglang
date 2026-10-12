@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 use crate::{
     app_context::AppContext,
     config::RoutingMode,
-    core::{ConnectionMode, RuntimeType, WorkerRegistry, WorkerType},
+    core::{ConnectionMode, RuntimeType, Worker, WorkerRegistry, WorkerType},
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -65,6 +65,48 @@ pub struct RouterManager {
     routers_snapshot: ArcSwap<Vec<Arc<dyn RouterTrait>>>,
     default_router: Arc<std::sync::RwLock<Option<RouterId>>>,
     enable_igw: bool,
+}
+
+/// Aggregated concurrency capacity across a set of workers, computed from each
+/// healthy worker's persisted `max_running_requests` label and its live load.
+///
+/// `max_running_requests` is the sum over healthy workers that declared a limit;
+/// it is 0 when none did. A consumer MUST NOT read 0 as "unlimited" — it means
+/// "no worker reported a limit" (patchbay's slot tracker treats absence of a
+/// discovered value as no cap, which is a separate, pre-existing question, but
+/// the gateway must not itself fabricate a ceiling).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FleetCapacity {
+    healthy_workers: usize,
+    max_running_requests: usize,
+    workers_with_capacity: usize,
+    active_load: usize,
+    available_slots: usize,
+}
+
+fn aggregate_fleet_capacity(workers: &[Arc<dyn Worker>]) -> FleetCapacity {
+    let mut capacity = FleetCapacity::default();
+    for worker in workers {
+        if !worker.is_healthy() {
+            continue;
+        }
+        capacity.healthy_workers += 1;
+        capacity.active_load += worker.load();
+        // A worker without a persisted limit (older engines) reports nothing;
+        // only count it as capacity if it declared one, so the aggregate never
+        // overstates the fleet.
+        if let Some(mrr) = worker
+            .metadata()
+            .labels
+            .get("max_running_requests")
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            capacity.max_running_requests += mrr;
+            capacity.workers_with_capacity += 1;
+        }
+    }
+    capacity.available_slots = capacity.max_running_requests.saturating_sub(capacity.active_load);
+    capacity
 }
 
 impl RouterManager {
@@ -424,13 +466,29 @@ impl RouterTrait for RouterManager {
     }
 
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
-        // TODO: Aggregate info from all routers with healthy workers
+        // Aggregate fleet capacity across healthy workers so downstream slot
+        // trackers (patchbay reads `max_running_requests` here, exactly like a
+        // bare sglang engine's /server_info) get a real number instead of
+        // "unlimited". Per-worker decode concurrency is persisted to the
+        // worker's `max_running_requests` label at discovery time (see
+        // discover_metadata.rs).
+        let workers = self.worker_registry.get_all();
+        let capacity = aggregate_fleet_capacity(&workers);
+
         (
             StatusCode::OK,
             serde_json::json!({
                 "router_manager": true,
                 "routers_count": self.routers.len(),
-                "workers_count": self.worker_registry.get_all().len()
+                "workers_count": workers.len(),
+                "healthy_workers": capacity.healthy_workers,
+                // Aggregate decode-concurrency ceiling across healthy workers
+                // that reported a limit. 0 when no worker reported one — a
+                // caller must not treat 0 as "unlimited" (patchbay does not).
+                "max_running_requests": capacity.max_running_requests,
+                "workers_with_capacity": capacity.workers_with_capacity,
+                "active_load": capacity.active_load,
+                "available_slots": capacity.available_slots,
             })
             .to_string(),
         )
@@ -443,14 +501,19 @@ impl RouterTrait for RouterManager {
         if model_names.is_empty() {
             (StatusCode::SERVICE_UNAVAILABLE, "No models available").into_response()
         } else {
-            // Convert model names to OpenAI-compatible model objects
+            // Convert model names to OpenAI-compatible model objects.
+            // `owned_by` identifies the serving engine; patchbay's backend
+            // auto-detection keys on "sglang"/"vllm"/"llamacpp" to decide
+            // whether to probe for context-limit + slot capacity. Emitting
+            // "local" made it classify the gateway as `unknown` and skip the
+            // capacity probe entirely — so report the real engine name.
             let models: Vec<Value> = model_names
                 .iter()
                 .map(|name| {
                     serde_json::json!({
                         "id": name,
                         "object": "model",
-                        "owned_by": "local"
+                        "owned_by": "sglang"
                     })
                 })
                 .collect();
@@ -745,5 +808,106 @@ impl std::fmt::Debug for RouterManager {
             .field("workers_count", &self.worker_registry.get_all().len())
             .field("default_router", &*default_router)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::BasicWorkerBuilder;
+
+    fn worker_with(url: &str, max_running: Option<usize>, healthy: bool) -> Arc<dyn Worker> {
+        let mut builder = BasicWorkerBuilder::new(url).worker_type(WorkerType::Regular);
+        if let Some(mrr) = max_running {
+            builder = builder.label("max_running_requests", mrr.to_string());
+        }
+        let worker = builder.build();
+        worker.set_healthy(healthy);
+        Arc::new(worker)
+    }
+
+    #[test]
+    fn aggregates_capacity_across_healthy_workers() {
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            worker_with("http://a:8000", Some(4), true),
+            worker_with("http://b:8000", Some(4), true),
+            worker_with("http://c:8000", Some(4), true),
+        ];
+        let cap = aggregate_fleet_capacity(&workers);
+        assert_eq!(cap.healthy_workers, 3);
+        assert_eq!(cap.max_running_requests, 12);
+        assert_eq!(cap.workers_with_capacity, 3);
+        assert_eq!(cap.active_load, 0);
+        assert_eq!(cap.available_slots, 12);
+    }
+
+    #[test]
+    fn excludes_unhealthy_workers_from_capacity() {
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            worker_with("http://a:8000", Some(4), true),
+            worker_with("http://b:8000", Some(4), false),
+            worker_with("http://c:8000", Some(4), true),
+        ];
+        let cap = aggregate_fleet_capacity(&workers);
+        assert_eq!(cap.healthy_workers, 2);
+        assert_eq!(cap.max_running_requests, 8);
+        assert_eq!(cap.workers_with_capacity, 2);
+    }
+
+    #[test]
+    fn workers_without_a_limit_report_zero_capacity() {
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            worker_with("http://a:8000", None, true),
+            worker_with("http://b:8000", None, true),
+        ];
+        let cap = aggregate_fleet_capacity(&workers);
+        assert_eq!(cap.healthy_workers, 2);
+        assert_eq!(cap.max_running_requests, 0);
+        assert_eq!(cap.workers_with_capacity, 0);
+        assert_eq!(cap.available_slots, 0);
+    }
+
+    #[test]
+    fn subtracts_active_load_from_available_slots() {
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            worker_with("http://a:8000", Some(4), true),
+            worker_with("http://b:8000", Some(4), true),
+            worker_with("http://c:8000", Some(4), true),
+        ];
+        // Simulate 5 in-flight requests.
+        for _ in 0..5 {
+            workers[0].increment_load();
+        }
+        let cap = aggregate_fleet_capacity(&workers);
+        assert_eq!(cap.max_running_requests, 12);
+        assert_eq!(cap.active_load, 5);
+        assert_eq!(cap.available_slots, 7);
+    }
+
+    #[test]
+    fn saturates_available_slots_at_zero() {
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            worker_with("http://a:8000", Some(4), true),
+            worker_with("http://b:8000", Some(4), true),
+        ];
+        for _ in 0..20 {
+            workers[0].increment_load();
+        }
+        let cap = aggregate_fleet_capacity(&workers);
+        assert_eq!(cap.available_slots, 0);
+    }
+
+    #[test]
+    fn invalid_label_value_is_ignored() {
+        let mut builder =
+            BasicWorkerBuilder::new("http://a:8000").worker_type(WorkerType::Regular);
+        builder = builder.label("max_running_requests", "not-a-number");
+        let worker = builder.build();
+        worker.set_healthy(true);
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(worker)];
+        let cap = aggregate_fleet_capacity(&workers);
+        assert_eq!(cap.healthy_workers, 1);
+        assert_eq!(cap.max_running_requests, 0);
+        assert_eq!(cap.workers_with_capacity, 0);
     }
 }

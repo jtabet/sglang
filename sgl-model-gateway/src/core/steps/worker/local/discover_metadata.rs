@@ -337,6 +337,17 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
                     if let Some(disaggregation_mode) = server_info.disaggregation_mode {
                         labels.insert("disaggregation_mode".to_string(), disaggregation_mode);
                     }
+                    // Persist the engine's decode-concurrency limit so the
+                    // gateway can aggregate fleet capacity and expose it on
+                    // /get_server_info for downstream slot tracking (patchbay
+                    // reads `max_running_requests` there). Parsed-and-dropped
+                    // before this commit.
+                    if let Some(max_running_requests) = server_info.max_running_requests {
+                        labels.insert(
+                            "max_running_requests".to_string(),
+                            max_running_requests.to_string(),
+                        );
+                    }
                 }
 
                 if let Some(model_info) = model_info {
