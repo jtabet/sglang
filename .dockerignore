@@ -1,1 +1,16 @@
+**/target/
+.git/
 .gitignore
+**/node_modules/
+**/build/
+**/dist/
+**/sdist/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.mypy_cache/
+**/benchmark/
+docs/
+README.md
+LICENSE
+*.md
