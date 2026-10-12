@@ -198,21 +198,31 @@ struct TtftVerifiedWarmRegistry {
 }
 
 impl TtftVerifiedWarmRegistry {
-    /// Receipt TTL. The engine can evict L0 entries under VRAM pressure and
-    /// reports nothing to the router (and a pod restart wipes L0 entirely,
-    /// which the router never sees), so receipts age out conservatively.
-    /// Deliberately SHORT (2 min, not 15): a stale receipt is what sends the
-    /// next same-prefix request into a cold prefill → 90s fetch timeout, and a
-    /// worker restart/eviction leaves a burst of them "valid". 2 min bounds
-    /// that blast radius — after a worker goes down or its L0 is evicted, its
-    /// receipts die within 2 min and requests re-estimate cold → clean 425s
-    /// instead of a multi-minute timeout + cooldown storm. Active sessions are
-    /// unaffected: every sub-2s first chunk re-mints a fresh receipt, so the
-    /// TTL never binds for live traffic (only for idle gaps > 2 min, which
-    /// 425-once + warmup-re-mint handles). The prompt path is separately
-    /// covered by the slow-first-chunk and no-chunk-on-drop invalidation,
-    /// which react in a single request.
-    const TTL: std::time::Duration = std::time::Duration::from_secs(120);
+    /// Receipt TTL — a backstop only, NOT the primary staleness defense.
+    ///
+    /// The engine can evict L0 entries under VRAM pressure and reports nothing
+    /// to the router, and a pod restart wipes L0 entirely without the router
+    /// ever seeing it. The PRIMARY defense against a stale receipt (which would
+    /// forward the next same-prefix request into a cold prefill → 90s fetch
+    /// timeout → patchbay cooldown storm) is the REACTIVE invalidation on the
+    /// live path: the slow-first-chunk hook (>= PROOF_MAX_SECS on a high-match
+    /// request) and the no-chunk-on-drop hook (pb abort before first chunk)
+    /// both drop the (worker, prefix) receipt in a SINGLE request — the request
+    /// that actually proves the KV is no longer L0-resident. They bound the
+    /// stale-receipt window to one request, which is strictly better than any
+    /// TTL can do, because they react to the actual loss rather than a timer.
+    ///
+    /// The TTL therefore only has to cover IDLE prefixes — a prefix whose
+    /// receipt goes stale while nothing requests it — and that case is
+    /// harmless: no request, no bad forward. So keep it GENEROUS (15 min): a
+    /// short TTL is actively harmful, because craft traffic revisits a shared
+    /// 16K prefix over idle gaps > 2 min, and a 2-min TTL expires every
+    /// warmup-minted receipt before the next organic request arrives — the
+    /// system never reaches steady state and collapses to constant 425 → cloud
+    /// (the receipt-thrash regression). 15 min lets a re-warmed prefix stick
+    /// long enough for organic traffic to ride it, while the reactive hooks
+    /// still kill any receipt the moment a real request exposes it as stale.
+    const TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
     /// First-chunk latency under which a forwarded request proves the KV was
     /// resident in L0 — 2s is far above a true L0-hit first chunk (≤ ~0.5s
