@@ -1256,8 +1256,71 @@ impl Router {
             // For non-streaming requests, preserve headers
             let response_headers = header_utils::preserve_response_headers(res.headers());
 
+            // Non-streaming TTFT observation. Patchbay's tool-rescue path
+            // re-issues craft completions with stream:false (see
+            // forward-openai.ts), so this is where the bulk of craft traffic
+            // actually lands. The streaming branch's TtftObserverStream never
+            // runs for these, which left the prefill-rate EWMA fed by idle
+            // warmups only and the receipt registry unpopulated. The full-body
+            // arrival time is the only TTFT signal a non-stream response gives
+            // us: sub-2s on a high-match request proves the KV was L0-resident
+            // (mint the receipt); >=2s proves it was not (drop a stale one).
+            // We also feed the prefill-rate EWMA with uncached_tokens/elapsed,
+            // exactly like the streaming observer — a non-stream completion's
+            // body is prefill-dominated for the short tool-rescue completions
+            // that make up this traffic, so it is a usable cold-band sample.
+            let started = std::time::Instant::now();
+
             let response = match res.bytes().await {
                 Ok(body) => {
+                    let elapsed = started.elapsed().as_secs_f64();
+                    if let Some(ctx) = ttft_ctx {
+                        let worker_url_str = worker_url.to_string();
+                        let verified_warm = self.ttft_verified_warm.clone();
+                        let prefill_rates = self.ttft_prefill_rates.clone();
+                        // Receipt mint/invalidation: proof of L0 residency,
+                        // gated on the 2s proof threshold, NOT the 50ms rate
+                        // floor — a sub-2s full body on a high-match request is
+                        // proof the KV was resident.
+                        if ctx.match_rate > RECEIPT_MATCH_THRESHOLD {
+                            if elapsed < TtftVerifiedWarmRegistry::PROOF_MAX_SECS {
+                                verified_warm.mark(&worker_url_str, ctx.prefix_hash);
+                            } else {
+                                verified_warm.invalidate(&worker_url_str, ctx.prefix_hash);
+                                tracing::info!(
+                                    "TTFT non-stream receipt invalidation: {:.1}s full body (>= {}s) \
+                                     on a {:.0}%-match request to {} proves KV not L0-resident — \
+                                     dropping (worker, prefix) receipt",
+                                    elapsed,
+                                    TtftVerifiedWarmRegistry::PROOF_MAX_SECS,
+                                    ctx.match_rate * 100.0,
+                                    worker_url_str
+                                );
+                            }
+                        }
+                        if elapsed > 0.05 && elapsed < 600.0 {
+                            let uncached_tokens =
+                                ((1.0 - ctx.match_rate).max(0.0) * ctx.est_tokens as f32).max(1.0);
+                            let measured_tps = uncached_tokens / elapsed.max(0.001) as f32;
+                            if measured_tps > 0.0 && measured_tps.is_finite() {
+                                prefill_rates.record(
+                                    &worker_url_str,
+                                    ctx.match_rate,
+                                    measured_tps,
+                                    ctx.seed_tps,
+                                );
+                                tracing::info!(
+                                    "TTFT non-stream prefill rate update: {} = {:.0} tps \
+                                     ({:.0} uncached of {} tokens / {:.1}s, EWMA applied)",
+                                    worker_url_str,
+                                    measured_tps,
+                                    uncached_tokens,
+                                    ctx.est_tokens,
+                                    elapsed,
+                                );
+                            }
+                        }
+                    }
                     let mut response = Response::new(Body::from(body));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;
@@ -1310,6 +1373,39 @@ impl Router {
                 let verified_warm_drop = verified_warm.clone();
                 let worker_url_drop = worker_url_str.clone();
                 TtftObserverStream::new(res.bytes_stream(), move |elapsed_secs| {
+                    // Receipt mint/invalidation is a proof of L0 residency and
+                    // must run for EVERY first chunk — including sub-50ms
+                    // L0-hot hits, the strongest possible proof. The 50ms floor
+                    // applies ONLY to the prefill-RATE sample below (a sub-50ms
+                    // "rate" would be a cache hit, not a prefill).
+                    if elapsed_secs < TtftVerifiedWarmRegistry::PROOF_MAX_SECS
+                        && match_rate > RECEIPT_MATCH_THRESHOLD
+                    {
+                        // Fast first chunk on a high-match request is proof the
+                        // KV is L0-resident here — mint/refresh the receipt.
+                        verified_warm.mark(&worker_url_str, prefix_hash);
+                    } else if elapsed_secs >= TtftVerifiedWarmRegistry::PROOF_MAX_SECS
+                        && match_rate > RECEIPT_MATCH_THRESHOLD
+                    {
+                        // SLOW first chunk on a high-match request proves the KV
+                        // was NOT L0-resident (evicted since a prior receipt was
+                        // minted, or never was). Left in place, the surviving
+                        // receipt would forward the next same-prefix request into
+                        // the same cold prefill → 90s fetch timeout. Drop it so
+                        // that request re-estimates cold → 425 → clean cloud
+                        // fallback, while the background warmup re-warms and
+                        // re-mints a fresh receipt.
+                        verified_warm.invalidate(&worker_url_str, prefix_hash);
+                        tracing::info!(
+                            "TTFT receipt invalidation: {:.1}s first chunk (>= {}s) on a \
+                             {:.0}%-match request to {} proves KV not L0-resident — \
+                             dropping (worker, prefix) receipt",
+                            elapsed_secs,
+                            TtftVerifiedWarmRegistry::PROOF_MAX_SECS,
+                            match_rate * 100.0,
+                            worker_url_str
+                        );
+                    }
                     if elapsed_secs > 0.05 && elapsed_secs < 600.0 {
                         // The engine's time-to-first-token is spent prefilling
                         // the UNMATCHED portion of the prompt (the matched
@@ -1344,40 +1440,6 @@ impl Router {
                                 est_tokens,
                                 elapsed_secs,
                             );
-                            // A sub-2s first chunk on a high-match request is
-                            // proof the KV was resident in this worker's L0 —
-                            // mint/refresh the receipt so future requests may
-                            // trust the tree's claim for this prefix.
-                            if elapsed_secs < TtftVerifiedWarmRegistry::PROOF_MAX_SECS
-                                && match_rate > RECEIPT_MATCH_THRESHOLD
-                            {
-                                // Fast first chunk on a high-match request is
-                                // proof the KV is L0-resident here — mint/
-                                // refresh the receipt.
-                                verified_warm.mark(&worker_url_str, prefix_hash);
-                            } else if elapsed_secs >= TtftVerifiedWarmRegistry::PROOF_MAX_SECS
-                                && match_rate > RECEIPT_MATCH_THRESHOLD
-                            {
-                                // SLOW first chunk on a high-match request proves
-                                // the KV was NOT L0-resident (evicted since a
-                                // prior receipt was minted, or never was). Left
-                                // in place, the surviving receipt would forward
-                                // the next same-prefix request into the same
-                                // cold prefill → 90s fetch timeout. Drop it so
-                                // that request re-estimates cold → 425 → clean
-                                // cloud fallback, while the background warmup
-                                // re-warms and re-mints a fresh receipt.
-                                verified_warm.invalidate(&worker_url_str, prefix_hash);
-                                tracing::info!(
-                                    "TTFT receipt invalidation: {:.1}s first chunk (>= {}s) on a \
-                                     {:.0}%-match request to {} proves KV not L0-resident — \
-                                     dropping (worker, prefix) receipt",
-                                    elapsed_secs,
-                                    TtftVerifiedWarmRegistry::PROOF_MAX_SECS,
-                                    match_rate * 100.0,
-                                    worker_url_str
-                                );
-                            }
                         }
                     } else if elapsed_secs <= 0.05 {
                         tracing::debug!(
