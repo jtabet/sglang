@@ -629,12 +629,17 @@ class Envs:
     # batch's requests. <0 DISABLES the gate (default): the batch forwards and
     # its layer-N wait_until is bounded by SGLANG_MOONCAKE_LOAD_DEADLINE_SECS,
     # whose expiry fails the batch cleanly (recompute) instead of wedging.
-    # The gate itself is retired-by-default: a 20s budget tripped on big loads
-    # that legitimately need >20s from a healthy store, and every trip's
-    # cancel+requeue produced a re-mint admission live-lock (match re-mints the
-    # hit marker each tick at ~8k lines/min with zero requests forwarded) —
-    # strictly worse than the bounded deadline path.
-    SGLANG_MOONCAKE_LOAD_GATE_SECS = EnvFloat(-1)
+    # History: a 20s budget tripped on big loads that legitimately need >20s
+    # from a healthy store, and each trip's cancel+requeue produced a re-mint
+    # admission live-lock (match re-minted the hit marker every tick at ~8k
+    # lines/min with zero requests forwarded) — fixed by the unclaimed-mint
+    # recompute fallback (MINT_UNCLAIMED_MINTS), so the gate returned. The
+    # budget stays far above the healthy big-load range (21-30s for 1698
+    # pages) and far below the crash tail it prevents: a store key-miss during
+    # load-back raises RuntimeError in-forward and SIGQUITs the pod (jade,
+    # 2026-10-13 06:15/06:22/06:33), so the gate's pre-forward abort is the
+    # only NCCL-safe way to keep that failure off the forward path.
+    SGLANG_MOONCAKE_LOAD_GATE_SECS = EnvFloat(120.0)
     # Wall-clock budget (seconds) the worker's MooncakeStore.warmup() will keep
     # retrying the initial put() while the RDMA Transfer Engine comes up after a
     # (re)start. The store *server* check above already tolerates up to
