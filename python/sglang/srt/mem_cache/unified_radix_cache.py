@@ -3399,51 +3399,58 @@ class UnifiedRadixCache(BasePrefixCache):
         return 0
 
     def load_gate_tripped(self, consumer_index: int, budget_secs: float) -> bool:
-        """Whether a scheduled batch's load-back is too slow to forward yet.
+        """Whether a scheduled batch's load-back is too slow or already dead.
 
-        True when the batch's layer-0 future is not done after ``budget_secs``
-        of bounded waiting (consensus MIN across attn ranks: if ANY rank's load
-        is behind, ALL ranks gate together so none enters a forward whose
-        collectives would diverge). Returns False immediately when consumer
-        index is unset, the linker has no pending batch, or layer-0 is done.
-
-        ``budget_secs < 0`` disables the gate entirely: the batch proceeds
-        into forward and its layer-N wait_until blocks, bounded only by the
-        load deadline (SGLANG_MOONCAKE_LOAD_DEADLINE_SECS) — which fails the
-        batch's futures cleanly. Live evidence (kvarn-standalone 6d1a4444 /
-        ea59f9e2, 2026-10-13): a 20s budget trips on legitimately big loads
-        (1698 pages from a healthy store take >20s), and each trip's
-        cancel+requeue left a deferring admission loop that re-minted the hit
-        marker every tick (a ~8k lines/min live-lock per rank with zero
-        forwarding) — worse than the wedge it was protecting against, since
-        the deadline backstop already turns a wedged load into a bounded
-        failure.
+        Tri-state probe (READY / PENDING / FAILED) with consensus MAX across
+        attn ranks: if ANY rank's load is behind, ALL ranks gate together so
+        none enters a forward whose collectives would diverge; if ANY rank's
+        load FAILED, ALL ranks abort pre-forward — a failed load must never
+        reach ``wait_until`` mid-forward, where its raise SIGQUITs the pod
+        (jade 2026-10-13 06:15/06:22/06:33 key-miss crash class: store
+        missing 142-185/1698 keys raises in ~21-30s, far below any sane
+        budget, so a ready-only gate would pass the doomed batch through).
         """
         if budget_secs < 0:
             return False
         if consumer_index is None or consumer_index < 0:
             return False
         counter = self.linker.layer_done_counter if self.linker is not None else None
-        local_tripped = counter is None or not counter.layer_ready(consumer_index, 0)
-        tripped = torch.tensor(
-            [1 if local_tripped else 0], dtype=torch.int, device="cpu"
-        )
+        if counter is None:
+            return False
+        if counter.layer_ready(consumer_index, 0):
+            local_state = 0  # READY
+        elif counter.layer_failed(consumer_index, 0):
+            local_state = 2  # FAILED
+        else:
+            local_state = 1  # PENDING
+        tripped = torch.tensor([local_state], dtype=torch.int, device="cpu")
         self._all_reduce_attn_groups(tripped, torch.distributed.ReduceOp.MAX)
         if int(tripped.item()) == 0:
             return False
-        # Consensus: this batch's load is slow on at least one rank. Give it
-        # the bounded grace window before giving up — the point of the gate is
-        # to keep the scheduler free; waiting here is capped, not unbounded.
+        if int(tripped.item()) == 2:
+            # Some rank's load already failed: abort NOW, pre-forward, where
+            # abort is NCCL-safe. No grace wait can revive a raised future.
+            return True
+        # Consensus PENDING: this batch's load is slow on at least one rank.
+        # Give it the bounded grace window before giving up — the point of the
+        # gate is to keep the scheduler free; waiting here is capped, not
+        # unbounded. A failing rank converts the consensus to FAILED as soon
+        # as its future raises, exiting the loop early.
         deadline = time.monotonic() + max(0.0, budget_secs)
         while True:
             if counter is not None and counter.layer_ready(consumer_index, 0):
-                local_tripped = False
-            tripped = torch.tensor(
-                [0 if not local_tripped else 1], dtype=torch.int, device="cpu"
-            )
+                local_state = 0
+            elif counter is not None and counter.layer_failed(consumer_index, 0):
+                local_state = 2
+            else:
+                local_state = 1
+            tripped = torch.tensor([local_state], dtype=torch.int, device="cpu")
             self._all_reduce_attn_groups(tripped, torch.distributed.ReduceOp.MAX)
-            if int(tripped.item()) == 0:
+            state = int(tripped.item())
+            if state == 0:
                 return False
+            if state == 2:
+                return True
             if time.monotonic() >= deadline:
                 return True
             time.sleep(0.01)

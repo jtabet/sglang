@@ -100,9 +100,31 @@ class LayerWiseLoadCounter:
         self.futures[index][layer].set_result(None)
 
     def layer_ready(self, index: int, layer: int) -> bool:
-        """Non-blocking readiness probe for the pre-forward gate."""
+        """Non-blocking readiness probe for the pre-forward gate.
+
+        A FAILED future is NOT ready: ``done()`` alone would green-light a
+        batch whose load already raised (store key-miss class) and let the
+        forward block in ``wait_until`` on the stored exception — the jade
+        SIGQUIT crash class (2026-10-13). The gate must see the failure and
+        abort BEFORE forward, where abort is NCCL-safe.
+        """
         futures = self.futures.get(index)
-        return futures is None or futures[layer].done()
+        if futures is None:
+            return True
+        future = futures[layer]
+        if not future.done():
+            return False
+        return future.exception() is None
+
+    def layer_failed(self, index: int, layer: int) -> bool:
+        """Non-blocking failure probe: True only for a done-and-raised future."""
+        futures = self.futures.get(index)
+        if futures is None:
+            return False
+        future = futures[layer]
+        if not future.done():
+            return False
+        return future.exception() is not None
 
     def fail(self, index: int, error: BaseException) -> None:
         self._pending_until.pop(index, None)

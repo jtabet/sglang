@@ -146,6 +146,23 @@ class TestLayerWiseLoadCounter(unittest.TestCase):
         # fully-drained batch never re-gates.
         self.assertTrue(counter.layer_ready(999, 0))
 
+    def test_failed_future_is_not_ready_and_is_reported_failed(self):
+        # jade SIGQUIT crash class (2026-10-13): a failed layer-0 future must
+        # NOT read as ready — otherwise the pre-forward gate green-lights a
+        # doomed batch and the failure raises mid-forward via wait_until.
+        counter = self._counter(layers=2, deadline=5.0)
+        index = counter.update_producer()
+        counter.fail(index, RuntimeError("store key-miss"))
+        self.assertFalse(counter.layer_ready(index, 0))
+        self.assertTrue(counter.layer_failed(index, 0))
+        # fail() is batch-atomic: every layer's future carries the exception.
+        self.assertTrue(counter.layer_failed(index, 1))
+        # Unregistered batch: no failure can be observed.
+        self.assertFalse(counter.layer_failed(999, 0))
+        # A waiter on the failed future still raises (diagnosable path kept).
+        with self.assertRaises(RuntimeError):
+            counter.wait_until(0)
+
     def test_wait_times_out_on_stall(self):
         counter = self._counter(layers=1, deadline=0.2)
         index = counter.update_producer()
