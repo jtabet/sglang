@@ -159,9 +159,13 @@ class TestLayerWiseLoadCounter(unittest.TestCase):
         self.assertTrue(counter.layer_failed(index, 1))
         # Unregistered batch: no failure can be observed.
         self.assertFalse(counter.layer_failed(999, 0))
-        # A waiter on the failed future still raises (diagnosable path kept).
+        # A waiter on the failed future still raises (diagnosable path kept;
+        # wait_until wraps arbitrary load errors in its RuntimeError shell).
+        counter.set_consumer(index)
         with self.assertRaises(RuntimeError):
             counter.wait_until(0)
+        with self.assertRaises(RuntimeError):
+            counter.wait_until(1)
 
     def test_wait_times_out_on_stall(self):
         counter = self._counter(layers=1, deadline=0.2)
