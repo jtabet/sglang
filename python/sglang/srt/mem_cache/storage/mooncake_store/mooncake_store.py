@@ -678,23 +678,47 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         warmup_key = "sglang_mooncake_store_warmup_key" + uuid.uuid4().hex
         warmup_value = bytes(4 * 1024)  # 4 KB
 
-        # Retry logic to handle Transfer Engine startup race condition
-        max_retries = 10
+        # The store *server* (check_server above) can already be answering HTTP
+        # while the RDMA Transfer Engine is still coming up — most noticeably
+        # right after a node NotReady flap, when the fabric re-establishes slowly.
+        # The initial put() can therefore fail for a while even though the store
+        # is healthy. Wait a bounded, configurable wall-clock budget for the
+        # transfer engine rather than a short fixed attempt-count: a fixed
+        # 10-attempt (~10s) window crash-looped the worker at startup during node
+        # recovery (RuntimeError -> SIGQUIT -> k8s restart -> repeat). In the
+        # healthy case the put succeeds on the first attempt and this costs
+        # nothing. timeout <= 0 preserves the legacy fail-fast (10 attempts).
+        timeout_secs = envs.SGLANG_MOONCAKE_WARMUP_PUT_TIMEOUT_SECS.get()
         retry_delay = 1.0  # seconds
+        max_retries = 10 if timeout_secs <= 0 else None  # None => wall-clock bound
+        deadline = (
+            None if timeout_secs <= 0 else time.monotonic() + timeout_secs
+        )
 
-        for attempt in range(max_retries):
+        attempt = 0
+        while True:
+            attempt += 1
             ret = self.store.put(warmup_key, warmup_value)
             if ret == 0:
                 break
+            exhausted = (
+                (max_retries is not None and attempt >= max_retries)
+                or (deadline is not None and time.monotonic() >= deadline)
+            )
+            if exhausted:
+                break
             logger.warning(
-                f"[TP{self.local_rank}] Warmup put failed (attempt {attempt + 1}/{max_retries}), "
-                f"ret={ret}, retrying in {retry_delay}s..."
+                f"[TP{self.local_rank}] Warmup put failed (attempt {attempt}), "
+                f"ret={ret}, retrying in {retry_delay}s... "
+                f"(transfer engine may still be coming up)"
             )
             time.sleep(retry_delay)
-        else:
+
+        if ret != 0:
             raise RuntimeError(
-                f"[TP{self.local_rank}] Warmup put failed after {max_retries} attempts, "
-                "Transfer Engine might not be ready"
+                f"[TP{self.local_rank}] Warmup put failed after {attempt} attempts"
+                + (f" (budget {timeout_secs:.0f}s elapsed)" if deadline is not None else "")
+                + ", Transfer Engine might not be ready"
             )
 
         assert self.store.is_exist(warmup_key) == 1

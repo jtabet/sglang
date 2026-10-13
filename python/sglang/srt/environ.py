@@ -628,6 +628,14 @@ class Envs:
     # scheduled batch's load-back layer-0 before cancelling + requeueing the
     # batch's requests (0 disables the gate).
     SGLANG_MOONCAKE_LOAD_GATE_SECS = EnvFloat(20)
+    # Wall-clock budget (seconds) the worker's MooncakeStore.warmup() will keep
+    # retrying the initial put() while the RDMA Transfer Engine comes up after a
+    # (re)start. The store *server* check above already tolerates up to
+    # SETUP_TIMEOUT (600s); the transfer/put path can lag that (esp. after a node
+    # NotReady flap, where the fabric re-establishes slowly), so a short fixed
+    # retry window here used to crash-loop the worker at startup. 0 disables the
+    # bounded wait and preserves the legacy fail-fast (10 attempts) behaviour.
+    SGLANG_MOONCAKE_WARMUP_PUT_TIMEOUT_SECS = EnvFloat(300)
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
     # For non-streaming requests, the scheduler still flushes intermediate
