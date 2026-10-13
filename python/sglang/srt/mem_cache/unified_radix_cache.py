@@ -3406,7 +3406,21 @@ class UnifiedRadixCache(BasePrefixCache):
         is behind, ALL ranks gate together so none enters a forward whose
         collectives would diverge). Returns False immediately when consumer
         index is unset, the linker has no pending batch, or layer-0 is done.
+
+        ``budget_secs < 0`` disables the gate entirely: the batch proceeds
+        into forward and its layer-N wait_until blocks, bounded only by the
+        load deadline (SGLANG_MOONCAKE_LOAD_DEADLINE_SECS) — which fails the
+        batch's futures cleanly. Live evidence (kvarn-standalone 6d1a4444 /
+        ea59f9e2, 2026-10-13): a 20s budget trips on legitimately big loads
+        (1698 pages from a healthy store take >20s), and each trip's
+        cancel+requeue left a deferring admission loop that re-minted the hit
+        marker every tick (a ~8k lines/min live-lock per rank with zero
+        forwarding) — worse than the wedge it was protecting against, since
+        the deadline backstop already turns a wedged load into a bounded
+        failure.
         """
+        if budget_secs < 0:
+            return False
         if consumer_index is None or consumer_index < 0:
             return False
         counter = self.linker.layer_done_counter if self.linker is not None else None

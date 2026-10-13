@@ -626,8 +626,15 @@ class Envs:
     SGLANG_MOONCAKE_LOAD_DEADLINE_SECS = EnvFloat(0)
     # Pre-forward gate budget (seconds): the scheduler waits this long for a
     # scheduled batch's load-back layer-0 before cancelling + requeueing the
-    # batch's requests (0 disables the gate).
-    SGLANG_MOONCAKE_LOAD_GATE_SECS = EnvFloat(20)
+    # batch's requests. <0 DISABLES the gate (default): the batch forwards and
+    # its layer-N wait_until is bounded by SGLANG_MOONCAKE_LOAD_DEADLINE_SECS,
+    # whose expiry fails the batch cleanly (recompute) instead of wedging.
+    # The gate itself is retired-by-default: a 20s budget tripped on big loads
+    # that legitimately need >20s from a healthy store, and every trip's
+    # cancel+requeue produced a re-mint admission live-lock (match re-mints the
+    # hit marker each tick at ~8k lines/min with zero requests forwarded) —
+    # strictly worse than the bounded deadline path.
+    SGLANG_MOONCAKE_LOAD_GATE_SECS = EnvFloat(-1)
     # Wall-clock budget (seconds) the worker's MooncakeStore.warmup() will keep
     # retrying the initial put() while the RDMA Transfer Engine comes up after a
     # (re)start. The store *server* check above already tolerates up to
