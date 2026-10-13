@@ -75,6 +75,7 @@ from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    LoadQueueRejected,
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
 )
@@ -553,7 +554,7 @@ class UnifiedRadixCache(BasePrefixCache):
         same_results=["result.full_kv_hit_length", "result.swa_host_hit_length"],
     )
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        result = self.session.try_match_prefix(params)
+        result = self.session.try_match_prefix(params) if self.session else None
         if result is not None:
             return result
         if self.disable:
@@ -3273,7 +3274,14 @@ class UnifiedRadixCache(BasePrefixCache):
         req = params.req
         assert req is not None
         if self.linker is not None and self.linker.has_hit(req.rid):
-            return self.linker.load_back(req)
+            try:
+                return self.linker.load_back(req)
+            except LoadQueueRejected:
+                # Store refused the load queue (or the rid was cancelled
+                # mid-flight): the request stays in the waiting queue and
+                # retries next tick, where the match re-probes the store.
+                # Recompute-prefill remains the fallback if it keeps failing.
+                return None
         last_best_match_device_node_id = req.last_node
 
         if (
@@ -3313,12 +3321,20 @@ class UnifiedRadixCache(BasePrefixCache):
                 [
                     self.linker.num_completed_loads(),
                     self.linker.num_completed_offloads(),
+                    self.linker.num_failed_loads(),
                 ],
                 dtype=torch.int,
                 device="cpu",
             )
             self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
-            load_count, offload_count = map(int, finish_counts.tolist())
+            load_count, offload_count, failed_count = map(
+                int, finish_counts.tolist()
+            )
+            # Draining failures first matters: a partially-successful batch
+            # whose other rids arrive in the same step must not publish
+            # unverified tails before their error is observed.
+            for _ in range(failed_count):
+                self.linker.drain_failed_loads()
             self.linker.drain_loads(load_count)
             local_successes = self.linker.take_completed_offloads(offload_count)
             if local_successes:
@@ -3381,6 +3397,42 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.cache_controller is not None:
             return self.cache_controller.start_loading()
         return 0
+
+    def load_gate_tripped(self, consumer_index: int, budget_secs: float) -> bool:
+        """Whether a scheduled batch's load-back is too slow to forward yet.
+
+        True when the batch's layer-0 future is not done after ``budget_secs``
+        of bounded waiting (consensus MIN across attn ranks: if ANY rank's load
+        is behind, ALL ranks gate together so none enters a forward whose
+        collectives would diverge). Returns False immediately when consumer
+        index is unset, the linker has no pending batch, or layer-0 is done.
+        """
+        if consumer_index is None or consumer_index < 0:
+            return False
+        counter = self.linker.layer_done_counter if self.linker is not None else None
+        local_tripped = counter is None or not counter.layer_ready(consumer_index, 0)
+        tripped = torch.tensor(
+            [1 if local_tripped else 0], dtype=torch.int, device="cpu"
+        )
+        self._all_reduce_attn_groups(tripped, torch.distributed.ReduceOp.MAX)
+        if int(tripped.item()) == 0:
+            return False
+        # Consensus: this batch's load is slow on at least one rank. Give it
+        # the bounded grace window before giving up — the point of the gate is
+        # to keep the scheduler free; waiting here is capped, not unbounded.
+        deadline = time.monotonic() + max(0.0, budget_secs)
+        while True:
+            if counter is not None and counter.layer_ready(consumer_index, 0):
+                local_tripped = False
+            tripped = torch.tensor(
+                [0 if not local_tripped else 1], dtype=torch.int, device="cpu"
+            )
+            self._all_reduce_attn_groups(tripped, torch.distributed.ReduceOp.MAX)
+            if int(tripped.item()) == 0:
+                return False
+            if time.monotonic() >= deadline:
+                return True
+            time.sleep(0.01)
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
         """Return True after the local load-back event is complete.

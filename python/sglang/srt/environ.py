@@ -620,6 +620,14 @@ class Envs:
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
+    # Wall-clock deadline (seconds) for one registered Mooncake layer-wise load
+    # batch. Must stay below the scheduler watchdog timeout: a stuck store call
+    # must surface as a diagnosable load failure, not a watchdog SIGQUIT.
+    SGLANG_MOONCAKE_LOAD_DEADLINE_SECS = EnvFloat(0)
+    # Pre-forward gate budget (seconds): the scheduler waits this long for a
+    # scheduled batch's load-back layer-0 before cancelling + requeueing the
+    # batch's requests (0 disables the gate).
+    SGLANG_MOONCAKE_LOAD_GATE_SECS = EnvFloat(20)
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
     # For non-streaming requests, the scheduler still flushes intermediate

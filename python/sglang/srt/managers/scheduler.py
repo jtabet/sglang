@@ -3243,6 +3243,38 @@ class Scheduler(
         req.update_finish_state()
         self.output_streamer.stream_output([req], req.return_logprob)
 
+    def _hicache_load_gate(
+        self, consumer_index: int, can_run_list: list
+    ) -> bool:
+        """Pre-forward gate on externally-loaded KV: True = forward is safe.
+
+        Waits (bounded) for the batch's load-back layer-0 to complete; on a
+        trip, cancels the queued loads, releases the tree locks, quarantines
+        the tails and retracts the requests to the waiting queue. This keeps
+        the scheduler thread out of the unbounded in-forward wait that wedged
+        the scheduler when the store stalled (watchdog SIGQUIT crash class);
+        the affected requests re-match next tick against a re-probed store.
+        """
+        budget_secs = envs.SGLANG_MOONCAKE_LOAD_GATE_SECS.get()
+        tripped = self.tree_cache.load_gate_tripped(consumer_index, budget_secs)
+        if not tripped:
+            return True
+        logger.warning(
+            "HiCache load gate tripped after %.1fs: consumer_index=%d — "
+            "cancel+requeue %d request(s): %s",
+            budget_secs,
+            consumer_index,
+            len(can_run_list),
+            [req.rid for req in can_run_list][:3],
+        )
+        for req in can_run_list:
+            self.tree_cache.finish(
+                req.cache_request_handle, CacheRequestOutcome.ABORT
+            )
+            req.reset_for_retract()
+            self._add_request_to_queue(req)
+        return False
+
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
@@ -4075,6 +4107,18 @@ class Scheduler(
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
             )
+            if (
+                new_batch.hicache_consumer_index >= 0
+                and not self._hicache_load_gate(
+                    new_batch.hicache_consumer_index, can_run_list
+                )
+            ):
+                # Store too slow to trust this batch's load-back: the gate
+                # cancelled the queued loads and requeued the requests; skip
+                # this tick entirely (no forward that could block on an
+                # unverified load).
+                self.chunked_req = None
+                return None, running_batch
 
         new_batch.prepare_for_extend()
 

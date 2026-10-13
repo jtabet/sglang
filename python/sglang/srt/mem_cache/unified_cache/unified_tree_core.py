@@ -145,6 +145,13 @@ class UnifiedTreeNode:
         # Anchor NodeId of an in-flight H->D load-back reading this node's
         # host slots; such host copies must not be reclaimed until the ack.
         self.load_back_pending_id: Optional[int] = None
+        # External-linker load quarantine: True while a store->device load into
+        # this node's device slots is queued/running (or failed without being
+        # reclaimed). Matches must stop here — the device content is not yet
+        # trustworthy — until the load drains successfully. Cleared by the
+        # scheduler drain on success; on failure the slots stay quarantined
+        # until L2 eviction reclaims them.
+        self.external_load_pending = False
         # Logical-page KV sharding: rotation base of the chain this node's Full
         # KV pages belong to — the owner rank of position-page P along the chain
         # is (rotation_base + P) % shard_size. A host-side mirror of the
@@ -889,6 +896,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
             # HiCache: dead node (evicted + not backuped) — stop traversal
             if child.evicted and not child.backuped:
+                break
+            # External-linker quarantine: device slots under an in-flight (or
+            # failed, not yet reclaimed) store load must not be matched — the
+            # content is not verified until the load drains.
+            if child.external_load_pending:
                 break
 
             prefix_len = child.key.match_at(key, key_offset, page_size=self.page_size)
@@ -2556,6 +2568,36 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         for node in nodes:
             node.write_through_pending_id = None
             node.external_cache_stored |= success
+
+    def mark_external_cache_load_pending_path(self, tail_node_id: NodeId) -> None:
+        """Quarantine the tail of an externally restored path while it loads.
+
+        ``tail_node_id`` is the last node inserted by the current load-back
+        (its device slots receive the store->device transfer). Ancestors were
+        already device-resident before the load, so they stay matchable.
+        Split fragments created while the load is in flight keep the flag on
+        the subtree side (splits copy the flag to the fragment that holds the
+        tail content only when the tail IS the split part — _split_node copies
+        load_back_pending_id semantics; here the flag lives on the tail node
+        object itself, which split moves verbatim under the new parent).
+        """
+        node = self.node_by_id(tail_node_id)
+        node.external_load_pending = True
+
+    def clear_external_cache_load_pending(self, tail_node_id: NodeId) -> None:
+        """Load drained successfully — the tail content is verified; unquarantine."""
+        node = self.node_by_id(tail_node_id)
+        node.external_load_pending = False
+
+    def mark_external_cache_load_quarantined(self, tail_node_id: NodeId) -> None:
+        """Keep a failed/cancelled tail quarantined until L2 eviction reclaims it."""
+        node = self.node_by_id(tail_node_id)
+        node.external_load_pending = True
+
+    def clear_external_cache_load_pending_rid(self, rid: str) -> None:
+        """No-op placeholder: rid-keyed tree state is resolved via
+        pending_loads[node_id] at release time; see linker.release_request."""
+        return
 
     def finish_write_through(self, node_ids: list[NodeId], ack_id: int) -> None:
         """Clear the write-through-pending mark (when it matches ack_id) and record the

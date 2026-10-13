@@ -63,6 +63,16 @@ _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
 )
 
 
+class LoadQueueRejected(RuntimeError):
+    """The external store refused/dropped a queued load before it started.
+
+    Raised from ``init_load_back`` so the scheduler requeues the request for
+    the next tick — where the match re-probes the store — instead of crashing
+    the scheduler (event loops have no per-batch catch). The store rejecting a
+    load queue is recoverable; a whole-pod SIGQUIT is not.
+    """
+
+
 class UnifiedCacheLinker(ABC):
     """External KV store reached directly from the device pools."""
 
@@ -459,12 +469,33 @@ class UnifiedCacheLinkerWrapper:
         try:
             queued = self.cache_linker.load(rid, transfers)
         except BaseException:
+            # The insert above already committed a device tail, but the store
+            # raised before queueing a load into it — the tail's device slots
+            # are uninitialised. Quarantine it so the match walk stops there
+            # and L2 reclaims the slots instead of matching them as a valid
+            # device prefix (silent-corruption guard), then release the lock.
             self.cache.dec_lock_ref(node_id, lock_params)
+            self.cache.tree_core.mark_external_cache_load_quarantined(node_id)
             raise
         if not queued:
+            # Store-side rejected the queue (or the rid was cancelled between
+            # match and queue). Same post-insert state as the exception path:
+            # the tail node is in the tree holding device slots the store will
+            # never write, so quarantine it (match-stop + eviction-reclaimable)
+            # before releasing the lock and falling back to recompute prefill.
             self.cache.dec_lock_ref(node_id, lock_params)
-            raise RuntimeError(f"Failed to queue the linker load for rid={rid!r}.")
+            self.cache.tree_core.mark_external_cache_load_quarantined(node_id)
+            logger.warning(
+                "linker._queue_load: rid=%s — store rejected the load queue; "
+                "quarantining the loaded tail and falling back to recompute "
+                "prefill",
+                rid,
+            )
+            raise LoadQueueRejected(
+                f"Linker load queue rejected for rid={rid!r}."
+            )
         self.pending_loads[rid] = (node_id, lock_params)
+        self.cache.tree_core.mark_external_cache_load_pending_path(node_id)
 
     def _update_load(
         self,
@@ -609,11 +640,52 @@ class UnifiedCacheLinkerWrapper:
     def num_completed_loads(self) -> int:
         return self.cache_linker.num_completed_loads()
 
+    def num_failed_loads(self) -> int:
+        return self.cache_linker.num_failed_loads()
+
+    def drain_failed_loads(self) -> None:
+        """Drain load failures even when no batch completed (deadline expiry)."""
+        for rid, error in self.cache_linker.pop_failed_loads():
+            pending = self.pending_loads.pop(rid, None)
+            if pending is not None:
+                node_id, lock_params = pending
+                self.cache.dec_lock_ref(node_id, lock_params)
+                self.cache.tree_core.mark_external_cache_load_quarantined(node_id)
+                logger.warning(
+                    "linker.drain_failed_loads: rid=%s load FAILED (%s) — "
+                    "tail %s quarantined until eviction",
+                    rid,
+                    error,
+                    node_id,
+                )
+
     def drain_loads(self, finish_count: int) -> None:
+        # Failures first: quarantine tails BEFORE the success channel could
+        # publish overlapping rids, so a partially-successful batch never
+        # briefly exposes unverified device content.
+        for rid, error in self.cache_linker.pop_failed_loads():
+            pending = self.pending_loads.pop(rid, None)
+            if pending is not None:
+                node_id, lock_params = pending
+                self.cache.dec_lock_ref(node_id, lock_params)
+                self.cache.tree_core.mark_external_cache_load_quarantined(node_id)
+                logger.warning(
+                    "linker.drain_loads: rid=%s load FAILED (%s) — tail %s "
+                    "quarantined until eviction",
+                    rid,
+                    error,
+                    node_id,
+                )
         for _ in range(finish_count):
             for rid in self.cache_linker.pop_completed_load():
-                node_id, lock_params = self.pending_loads.pop(rid)
+                pending = self.pending_loads.pop(rid, None)
+                if pending is None:
+                    # Drained by release_request (abort) after publication —
+                    # the load's tree lock was already released there.
+                    continue
+                node_id, lock_params = pending
                 self.cache.dec_lock_ref(node_id, lock_params)
+                self.cache.tree_core.clear_external_cache_load_pending(node_id)
 
     def take_completed_offloads(self, finish_count: int) -> list[bool]:
         assert finish_count <= len(self.pending_offloads)
@@ -651,11 +723,19 @@ class UnifiedCacheLinkerWrapper:
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
-        # TODO: Roll back the published tree and component state atomically before
-        # canceling; otherwise the tree may retain device slots that were never loaded.
+        self.cache.tree_core.clear_external_cache_load_pending_rid(rid)
         if self.cache_linker.cancel_queued_load(rid):
-            node_id, lock_params = self.pending_loads.pop(rid)
-            self.cache.dec_lock_ref(node_id, lock_params)
+            # The load will never report completion through pop_completed_load
+            # (cancelled pre-publication skips it; started batches fail their
+            # counter and are drained without a completed-load entry because
+            # the rid was already marked cancelled). Release the tree lock now
+            # — but keep the node's quarantine flag: device slots the store is
+            # still RDMA-writing must not be matched or evicted-as-loaded.
+            pending = self.pending_loads.pop(rid, None)
+            if pending is not None:
+                node_id, lock_params = pending
+                self.cache.dec_lock_ref(node_id, lock_params)
+                self.cache.tree_core.mark_external_cache_load_quarantined(node_id)
 
     def close(self) -> None:
         self.cache_linker.close()
