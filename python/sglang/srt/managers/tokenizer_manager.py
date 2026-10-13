@@ -1760,6 +1760,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state = self.rid_to_state[obj.rid]
         return self._stream_one_response(obj=obj, state=state, request=request)
 
+    @staticmethod
+    async def _check_disconnected(request) -> bool:
+        """Check if the client disconnected, tolerating transport errors.
+
+        ``request.is_disconnected()`` awaits the uvicorn/h11 receive task, which
+        can raise ``CancelledError`` when the connection is being torn down at
+        the same instant (e.g. client timeout racing the wait-timeout check).
+        A transport-level failure here is itself proof the connection is gone,
+        so we treat any exception as ``disconnected=True`` instead of letting
+        it propagate and kill the scheduler process.
+        """
+        try:
+            return await request.is_disconnected()
+        except BaseException:
+            return True
+
     async def _stream_one_response(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1777,7 +1793,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if (
                     request is not None
                     and not obj.background
-                    and await request.is_disconnected()
+                    and await self._check_disconnected(request)
                 ):
                     # Abort the request for disconnected requests (non-streaming, waiting queue)
                     self.abort_request(obj.rid)
@@ -1865,7 +1881,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if (
                     request is not None
                     and not obj.background
-                    and await request.is_disconnected()
+                    and await self._check_disconnected(request)
                 ):
                     # Abort the request for disconnected requests (non-streaming, running)
                     self.abort_request(obj.rid)
