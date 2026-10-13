@@ -187,6 +187,14 @@ class UnifiedCacheLinkerWrapper:
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
+        # Rids whose external load drained as a FAILURE: the store could not
+        # serve the prefix, so re-minting the hit marker on the next match
+        # would re-initiate a load that fails again (match re-mints it every
+        # tick while the tree tail stays quarantined — a retry storm that ends
+        # in the stash re-match asserting protected_len > device indices).
+        # Loading is skipped for these rids for their lifetime: recompute is
+        # the always-correct fallback. Cleared by reset().
+        self._load_failed: set[str] = set()
         # Loads in flight, each pinning its inserted endpoint until DMA completes.
         self.pending_loads: dict[str, tuple[NodeId, DecLockRefParams]] = {}
         # Offloads in flight, each holding a lock on its node until it lands.
@@ -255,6 +263,17 @@ class UnifiedCacheLinkerWrapper:
             device_hit_pages=0,
         )
         if hit_pages == 0:
+            return result
+        if req.rid in self._load_failed:
+            # A prior load for this rid drained as a failure: the store could
+            # not serve this tail. Do not re-mint the hit marker — init_load_back
+            # would re-queue a load that fails again while the tree tail stays
+            # quarantined, and the chunked stash's re-match would then see fewer
+            # device indices than cache_protected_len claims. Recompute instead.
+            # (No extra allreduce: _load_failed is only mutated inside the
+            # consensus-MIN-synced drains of check_hicache_events, so it stays
+            # identical across attn ranks for a given batch — same symmetry the
+            # drain's completed/failed counts already rely on.)
             return result
         hit_tokens = hit_pages * page
 
@@ -474,17 +493,27 @@ class UnifiedCacheLinkerWrapper:
             # are uninitialised. Quarantine it so the match walk stops there
             # and L2 reclaims the slots instead of matching them as a valid
             # device prefix (silent-corruption guard), then release the lock.
+            # Mark the rid load-failed so the next match recomputes instead
+            # of re-minting a hit that would be re-inserted and re-rejected
+            # (or re-loaded into a store that just failed). Re-raising the raw
+            # store error here would propagate to the scheduler and crash the
+            # pod — recompute is the always-correct fallback.
             self.cache.dec_lock_ref(node_id, lock_params)
             self.cache.tree_core.mark_external_cache_load_quarantined(node_id)
-            raise
+            self._load_failed.add(rid)
+            raise LoadQueueRejected(
+                f"Linker load raised for rid={rid!r}; recompute fallback engaged."
+            )
         if not queued:
             # Store-side rejected the queue (or the rid was cancelled between
             # match and queue). Same post-insert state as the exception path:
             # the tail node is in the tree holding device slots the store will
             # never write, so quarantine it (match-stop + eviction-reclaimable)
-            # before releasing the lock and falling back to recompute prefill.
+            # and mark the rid load-failed so the request recomputes rather
+            # than re-inserting + re-rejecting every re-admission.
             self.cache.dec_lock_ref(node_id, lock_params)
             self.cache.tree_core.mark_external_cache_load_quarantined(node_id)
+            self._load_failed.add(rid)
             logger.warning(
                 "linker._queue_load: rid=%s — store rejected the load queue; "
                 "quarantining the loaded tail and falling back to recompute "
@@ -646,6 +675,7 @@ class UnifiedCacheLinkerWrapper:
     def drain_failed_loads(self) -> None:
         """Drain load failures even when no batch completed (deadline expiry)."""
         for rid, error in self.cache_linker.pop_failed_loads():
+            self._load_failed.add(rid)
             pending = self.pending_loads.pop(rid, None)
             if pending is not None:
                 node_id, lock_params = pending
@@ -653,7 +683,8 @@ class UnifiedCacheLinkerWrapper:
                 self.cache.tree_core.mark_external_cache_load_quarantined(node_id)
                 logger.warning(
                     "linker.drain_failed_loads: rid=%s load FAILED (%s) — "
-                    "tail %s quarantined until eviction",
+                    "tail %s quarantined until eviction; rid marked load-failed "
+                    "(future matches recompute instead of re-loading)",
                     rid,
                     error,
                     node_id,
@@ -664,6 +695,7 @@ class UnifiedCacheLinkerWrapper:
         # publish overlapping rids, so a partially-successful batch never
         # briefly exposes unverified device content.
         for rid, error in self.cache_linker.pop_failed_loads():
+            self._load_failed.add(rid)
             pending = self.pending_loads.pop(rid, None)
             if pending is not None:
                 node_id, lock_params = pending
@@ -671,7 +703,8 @@ class UnifiedCacheLinkerWrapper:
                 self.cache.tree_core.mark_external_cache_load_quarantined(node_id)
                 logger.warning(
                     "linker.drain_loads: rid=%s load FAILED (%s) — tail %s "
-                    "quarantined until eviction",
+                    "quarantined until eviction; rid marked load-failed "
+                    "(future matches recompute instead of re-loading)",
                     rid,
                     error,
                     node_id,
@@ -708,6 +741,7 @@ class UnifiedCacheLinkerWrapper:
     def reset(self) -> None:
         self.cache_linker.reset()
         self.hit_markers.clear()
+        self._load_failed.clear()
         self._release_pending_locks()
 
     def _release_pending_locks(self) -> None:
