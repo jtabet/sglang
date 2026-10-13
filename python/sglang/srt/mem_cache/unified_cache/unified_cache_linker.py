@@ -20,6 +20,7 @@ The tree only needs a handful of guarded hooks:
 from __future__ import annotations
 
 import logging
+import time
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
@@ -30,6 +31,12 @@ import torch
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 
 logger = logging.getLogger(__name__)
+
+# Number of consecutive unclaimed mints after which a rid converts to the
+# recompute path (see UnifiedCacheLinkerWrapper.match). 3 ticks ≈ a few
+# hundred ms of scheduler time — far below anything admission legitimately
+# takes, and enough to bridge a single tick where the batch could not form.
+MINT_UNCLAIMED_MINTS = 3
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     InsertParams,
@@ -195,6 +202,15 @@ class UnifiedCacheLinkerWrapper:
         # Loading is skipped for these rids for their lifetime: recompute is
         # the always-correct fallback. Cleared by reset().
         self._load_failed: set[str] = set()
+        # rid -> consecutive unclaimed-mint count (tick-deterministic, rank-
+        # symmetric by construction: one match call per scheduler tick per
+        # rid on every rank). Reset each time the marker is claimed by
+        # init_load_back or the rid is released; past MINT_UNCLAIMED_MINTS
+        # the rid falls back to recompute (see match).
+        self._mint_count: dict[str, int] = {}
+        # rid -> monotonic ts of the last mint (observability only; the
+        # fallback decision is driven by the counter above).
+        self._mint_last_ts: dict[str, float] = {}
         # Loads in flight, each pinning its inserted endpoint until DMA completes.
         self.pending_loads: dict[str, tuple[NodeId, DecLockRefParams]] = {}
         # Offloads in flight, each holding a lock on its node until it lands.
@@ -218,6 +234,11 @@ class UnifiedCacheLinkerWrapper:
         page = cache.page_size
         device_hit_len = int(result.device_indices.numel())
         if device_hit_len >= len(key):
+            return result
+
+        # Load-failed rid: skip EVERYTHING below — no tail hashes, no store
+        # RPC, no allreduce. Recompute is the decided fallback for this rid.
+        if req.rid in self._load_failed:
             return result
 
         tail_hashes = self._tail_hashes(key, result, device_hit_len)
@@ -264,17 +285,33 @@ class UnifiedCacheLinkerWrapper:
         )
         if hit_pages == 0:
             return result
-        if req.rid in self._load_failed:
-            # A prior load for this rid drained as a failure: the store could
-            # not serve this tail. Do not re-mint the hit marker — init_load_back
-            # would re-queue a load that fails again while the tree tail stays
-            # quarantined, and the chunked stash's re-match would then see fewer
-            # device indices than cache_protected_len claims. Recompute instead.
-            # (No extra allreduce: _load_failed is only mutated inside the
-            # consensus-MIN-synced drains of check_hicache_events, so it stays
-            # identical across attn ranks for a given batch — same symmetry the
-            # drain's completed/failed counts already rely on.)
+        now = time.monotonic()
+        # Tick-deterministic mint counter: identical on all ranks (match is
+        # called once per scheduler tick per rid, and the rid's tick sequence
+        # is the same everywhere — no clock skew can diverge ranks). A minted
+        # marker that stays unclaimed for MINT_UNCLAIMED_MINTS consecutive
+        # mints means admission keeps deferring this request BEFORE
+        # init_load_back on the memory budget — the request then bounces
+        # match→mint→defer every tick with zero forward progress (live-lock:
+        # ~8k store lookups/min per rank, running=0 for >10 min, all craft
+        # traffic falling to cloud). Past the threshold the rid converts to
+        # the recompute path: no future store probes, admission proceeds
+        # without a promised host hit (host_hit_length 0), the prefill runs,
+        # and the request makes progress.
+        mint_count = self._mint_count.get(req.rid, 0) + 1
+        if mint_count > MINT_UNCLAIMED_MINTS:
+            logger.info(
+                "linker.match: rid=%s — hit marker unclaimed for %d mints "
+                "(admission keeps deferring before load); falling back to "
+                "recompute and skipping future store probes for this rid",
+                req.rid,
+                mint_count,
+            )
+            self._load_failed.add(req.rid)
+            self._mint_count.pop(req.rid, None)
             return result
+        self._mint_count[req.rid] = mint_count
+        self._mint_last_ts[req.rid] = now
         hit_tokens = hit_pages * page
 
         swa_transfer = by_pool.get(PoolName.SWA)
@@ -347,6 +384,11 @@ class UnifiedCacheLinkerWrapper:
         cache = self.cache
         empty_indices = cache.tree_core.empty_match_result.device_indices
         hit = self.hit_markers.pop(req.rid, None)
+        # Claimed: the mint loop ends here regardless of what the load does
+        # next (it may succeed, fail, or be gated) — the unclaimed-mint
+        # fallback no longer applies to this rid.
+        self._mint_count.pop(req.rid, None)
+        self._mint_last_ts.pop(req.rid, None)
         if hit is None:
             return empty_indices, req.last_node
 
@@ -742,6 +784,8 @@ class UnifiedCacheLinkerWrapper:
         self.cache_linker.reset()
         self.hit_markers.clear()
         self._load_failed.clear()
+        self._mint_count.clear()
+        self._mint_last_ts.clear()
         self._release_pending_locks()
 
     def _release_pending_locks(self) -> None:
@@ -757,6 +801,8 @@ class UnifiedCacheLinkerWrapper:
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
+        self._mint_count.pop(rid, None)
+        self._mint_last_ts.pop(rid, None)
         self.cache.tree_core.clear_external_cache_load_pending_rid(rid)
         if self.cache_linker.cancel_queued_load(rid):
             # The load will never report completion through pop_completed_load
