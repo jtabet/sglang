@@ -236,10 +236,14 @@ class UnifiedCacheLinkerWrapper:
         if device_hit_len >= len(key):
             return result
 
-        # Load-failed rid: skip EVERYTHING below — no tail hashes, no store
-        # RPC, no allreduce. Recompute is the decided fallback for this rid.
-        if req.rid in self._load_failed:
-            return result
+        # NOTE: no early return here for `req.rid in self._load_failed`. The
+        # skip decision must be rank-symmetric: _load_failed is seeded per-rank
+        # by async load failures, so one rank could return early while its peer
+        # blocks in the _sync_restorable_prefix allreduce below (a TP rank
+        # divergence that crashes the engine). The load-failed state is instead
+        # folded into that allreduce as a sentinel bit so both ranks always
+        # reach the collective in lockstep and land on the same verdict.
+        local_failed = req.rid in self._load_failed
 
         tail_hashes = self._tail_hashes(key, result, device_hit_len)
         if not tail_hashes:
@@ -282,6 +286,8 @@ class UnifiedCacheLinkerWrapper:
             restorable,
             num_pages=len(tail_hashes),
             device_hit_pages=0,
+            failed=local_failed,
+            rid=req.rid,
         )
         if hit_pages == 0:
             return result
@@ -338,7 +344,13 @@ class UnifiedCacheLinkerWrapper:
         )
 
     def _sync_restorable_prefix(
-        self, restorable: list[int], *, num_pages: int, device_hit_pages: int
+        self,
+        restorable: list[int],
+        *,
+        num_pages: int,
+        device_hit_pages: int,
+        failed: bool = False,
+        rid: str = "",
     ) -> int:
         """Intersect the per-rank sets of restorable prefix lengths and return the
         longest one, or 0 when the ranks share none beyond the device prefix.
@@ -346,16 +358,41 @@ class UnifiedCacheLinkerWrapper:
         A rank's set is sparse, so reducing per-rank maxima could land on a
         length that only some ranks can restore. On a 0/1 mask MIN is AND, which
         makes the reduction an intersection.
+
+        Rank-symmetric skip decision: `_load_failed` is seeded per-rank by async
+        load failures, so a per-rank early return before this collective would
+        let one rank skip the allreduce while its peer blocks in it — a TP rank
+        divergence that crashes the engine. Instead the failed state is folded
+        into this single allreduce as a sentinel bit so every rank always enters
+        the collective in lockstep.
+
+        Sentinel polarity: the mask is reduced with MIN (= AND over ranks), so a
+        `1` bit survives only when EVERY rank sets it. We therefore encode "any
+        rank failed" as its complement — index 0 is set to 0 when this rank
+        failed (0 propagates via MIN to all ranks). After the reduce, mask[0]==0
+        means at least one rank failed, so ALL ranks must recompute: a one-rank
+        restore with a peer recompute would diverge KV. The real page flags live
+        at indices 1..num_pages.
         """
-        mask = torch.zeros(num_pages + 1, dtype=torch.int)
+        mask = torch.zeros(num_pages + 2, dtype=torch.int)
+        mask[0] = 0 if failed else 1
         for pages in restorable:
             if device_hit_pages < pages <= num_pages:
                 mask[pages] = 1
         self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
-        common = mask.nonzero()
+        if int(mask[0].item()) == 0:
+            # At least one rank holds this rid in _load_failed. Mark it here too
+            # so the surviving ranks stop re-probing the store for it on the
+            # next tick (recompute is the decided fallback fleet-wide).
+            if rid:
+                self._load_failed.add(rid)
+            return 0
+        common = mask[1:].nonzero()
         if common.numel() == 0:
             return 0
-        return int(common[-1].item())
+        # `mask[1:]` shifts the page flags: slice position p corresponds to
+        # page flag at original index p+1, i.e. `pages = p + 1`.
+        return int(common[-1].item()) + 1
 
     def _tail_hashes(
         self, key: RadixKey, result: MatchResult, device_hit_len: int
