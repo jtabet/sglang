@@ -585,7 +585,7 @@ impl Router {
         let req_start = std::time::Instant::now();
         let select_start = std::time::Instant::now();
         let text_len = text.chars().count();
-        let (worker, match_rate) = match self
+        let (mut worker, match_rate) = match self
             .select_worker_for_model(model_id, Some(text), headers)
             .await
         {
@@ -636,10 +636,45 @@ impl Router {
                 // it was capacity-rejected, is still in flight, or the KV was
                 // evicted) — assume NOTHING is resident and use the cold
                 // band's rate with match_rate 0.0, so every token is charged.
-                let unverified = match_rate > RECEIPT_MATCH_THRESHOLD
-                    && !self
-                        .ttft_verified_warm
-                        .is_verified(worker.url(), prefix_hash);
+                //
+                // FLEXIBLE ASSIGNMENT (mooncake store is shared): before
+                // declining, check whether ANOTHER healthy worker holds a
+                // verified L0 receipt for the same prefix — the KV bytes are
+                // content-addressed in the shared store, so any worker can
+                // serve them, and the one holding an L0 receipt gives the
+                // sub-2s path regardless of which worker prefilled it. Route
+                // there instead of 425 → cloud. If no receipt anywhere, fall
+                // through to the cold estimate (the warmup/425 path heals it).
+                let prefix_hash = TtftVerifiedWarmRegistry::hash_prefix(text);
+                let mut verified = self
+                    .ttft_verified_warm
+                    .is_verified(worker.url(), prefix_hash);
+                if !verified && match_rate > RECEIPT_MATCH_THRESHOLD {
+                    let alternates = self.worker_registry.get_workers_filtered(
+                        if !self.enable_igw { None } else { model_id },
+                        Some(WorkerType::Regular),
+                        Some(ConnectionMode::Http),
+                        None,
+                        false,
+                    );
+                    if let Some(alt) = alternates.iter().find(|w| {
+                        w.url() != worker.url()
+                            && w.is_available()
+                            && !self.ttft_warming.is_warming(w.url())
+                            && self.ttft_verified_warm.is_verified(w.url(), prefix_hash)
+                    }) {
+                        tracing::info!(
+                            "TTFT cross-worker receipt hit: {} unverified for prefix but \
+                             {} holds a verified L0 receipt — mooncake store is shared, \
+                             rerouting to the receipt holder",
+                            worker.url(),
+                            alt.url()
+                        );
+                        worker = alt.clone();
+                        verified = true;
+                    }
+                }
+                let unverified = match_rate > RECEIPT_MATCH_THRESHOLD && !verified;
                 let (est_match_rate, prefill_tps) = if unverified {
                     tracing::info!(
                         "TTFT receipt miss: prefix matches {:.0}% in tree but {} has no verified \
