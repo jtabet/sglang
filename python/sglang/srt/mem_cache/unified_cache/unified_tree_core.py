@@ -152,6 +152,16 @@ class UnifiedTreeNode:
         # scheduler drain on success; on failure the slots stay quarantined
         # until L2 eviction reclaims them.
         self.external_load_pending = False
+        # rid of the request whose in-flight load writes into this node's device
+        # slots, while ``external_load_pending`` is set for that in-flight load.
+        # Set when the load is queued, cleared on load success AND on quarantine
+        # (a failed load must NOT grant its owner the match-through below). A
+        # match for this same rid is the owner's own re-anchor of device slots it
+        # already locks, so it must not be defeated by the pending mark (which
+        # would undercount ``cache_protected_len`` and trip the stash assert).
+        # Rank-symmetric: the load is queued under rank_consensus init_load_back
+        # and the flag/owner only change under the MIN-gated scheduler drain.
+        self.external_load_owner_rid: Optional[str] = None
         # Logical-page KV sharding: rotation base of the chain this node's Full
         # KV pages belong to — the owner rank of position-page P along the chain
         # is (rotation_base + P) % shard_size. A host-side mirror of the
@@ -696,9 +706,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _assert_receipt_anchor(node: UnifiedTreeNode, params: DecLockRefParams) -> None:
         """A receipt releases only the node its acquire returned; a mispaired
         node would silently release (or steal) another holder's segment."""
-        assert params.node_id is None or params.node_id == node.id, (
-            f"lock receipt anchored on node {params.node_id} released on node {node.id}"
-        )
+        assert (
+            params.node_id is None or params.node_id == node.id
+        ), f"lock receipt anchored on node {params.node_id} released on node {node.id}"
 
     def _release_components(
         self,
@@ -816,6 +826,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if len(key) == 0:
             return self._empty_match_result
 
+        # rid being matched, so the walk can let the owner's own in-flight
+        # load tail through (see the ``external_load_pending`` gate below).
+        # None for a req-less match: the pending gate then always stops.
+        matched_rid = params.req.rid if params.req is not None else None
         (
             value,
             best_match_node,
@@ -823,7 +837,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_value_len,
             full_kv_hit_length,
             action,
-        ) = self._match_prefix_helper(key)
+        ) = self._match_prefix_helper(key, matched_rid)
         return self._match_post_processor(
             params,
             value,
@@ -835,7 +849,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
     def _match_prefix_helper(
-        self, key: RadixKey
+        self, key: RadixKey, matched_rid: Optional[str] = None
     ) -> tuple[
         list[torch.Tensor],
         UnifiedTreeNode,
@@ -899,8 +913,23 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 break
             # External-linker quarantine: device slots under an in-flight (or
             # failed, not yet reclaimed) store load must not be matched — the
-            # content is not verified until the load drains.
-            if child.external_load_pending:
+            # content is not verified until the load drains. EXCEPTION: the
+            # request whose load IS in flight into this node is re-anchoring
+            # device slots it already locks (its prefix_indices and
+            # cache_protected_len already include this tail, and the
+            # pre-forward load gate holds its forward until the load drains).
+            # Breaking here for the owner would undercount new_indices below
+            # cache_protected_len and trip the cache_unfinished_req assert
+            # (iteration-24 jade crash: whole prefix = one in-flight load,
+            # len(new_indices)=0 on both ranks). Owner is rank-symmetric, so the
+            # skip cannot desync a TP pair. A failed/quarantined load has its
+            # owner cleared (external_load_owner_rid is None), so it still stops
+            # the walk: a failed owner is retried by the load gate / recompute
+            # fallback, never matched against unverified content.
+            if (
+                child.external_load_pending
+                and child.external_load_owner_rid != matched_rid
+            ):
                 break
 
             prefix_len = child.key.match_at(key, key_offset, page_size=self.page_size)
@@ -2569,7 +2598,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             node.write_through_pending_id = None
             node.external_cache_stored |= success
 
-    def mark_external_cache_load_pending_path(self, tail_node_id: NodeId) -> None:
+    def mark_external_cache_load_pending_path(
+        self, tail_node_id: NodeId, owner_rid: Optional[str] = None
+    ) -> None:
         """Quarantine the tail of an externally restored path while it loads.
 
         ``tail_node_id`` is the last node inserted by the current load-back
@@ -2580,19 +2611,33 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         tail content only when the tail IS the split part — _split_node copies
         load_back_pending_id semantics; here the flag lives on the tail node
         object itself, which split moves verbatim under the new parent).
+
+        ``owner_rid`` is the request whose load this is; recorded so that same
+        rid's own re-match can thread through its in-flight tail (see
+        _match_prefix_helper) while every other rid still stops here.
         """
         node = self.node_by_id(tail_node_id)
         node.external_load_pending = True
+        node.external_load_owner_rid = owner_rid
 
     def clear_external_cache_load_pending(self, tail_node_id: NodeId) -> None:
         """Load drained successfully — the tail content is verified; unquarantine."""
         node = self.node_by_id(tail_node_id)
         node.external_load_pending = False
+        node.external_load_owner_rid = None
 
     def mark_external_cache_load_quarantined(self, tail_node_id: NodeId) -> None:
-        """Keep a failed/cancelled tail quarantined until L2 eviction reclaims it."""
+        """Keep a failed/cancelled tail quarantined until L2 eviction reclaims it.
+
+        Also clears the owner: a *failed* load must NOT let even its owner's
+        re-match thread through unverified content — the owner is retried by the
+        pre-forward load gate / recompute fallback instead, so breaking the walk
+        here (and letting the gate / recompute handle the owner) is the safe
+        behavior and keeps the skip decision TP-symmetric.
+        """
         node = self.node_by_id(tail_node_id)
         node.external_load_pending = True
+        node.external_load_owner_rid = None
 
     def clear_external_cache_load_pending_rid(self, rid: str) -> None:
         """No-op placeholder: rid-keyed tree state is resolved via
@@ -2684,9 +2729,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             covered = assign_end
             if covered >= window_end:
                 break
-        assert covered == window_end, (
-            f"attach_swa_window covered {covered} of [{window_start}, {window_end})"
-        )
+        assert (
+            covered == window_end
+        ), f"attach_swa_window covered {covered} of [{window_start}, {window_end})"
         return actions
 
     def _attach_swa_segment(

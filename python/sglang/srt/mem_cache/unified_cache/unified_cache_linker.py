@@ -249,7 +249,9 @@ class UnifiedCacheLinkerWrapper:
         if not tail_hashes:
             logger.info(
                 "linker.match: rid=%s device_hit=%d key_len=%d — no tail_hashes (last_hash missing?)",
-                req.rid, device_hit_len, len(key),
+                req.rid,
+                device_hit_len,
+                len(key),
             )
             return result
 
@@ -265,7 +267,8 @@ class UnifiedCacheLinkerWrapper:
                 # component is the one that matters for cache lookups.
                 logger.debug(
                     "linker.match: rid=%s — component %s returned None transfer for LOOKUP, skipping",
-                    req.rid, component,
+                    req.rid,
+                    component,
                 )
                 continue
             lookup_transfers.append(transfer)
@@ -278,8 +281,12 @@ class UnifiedCacheLinkerWrapper:
         logger.debug(
             "linker.match: rid=%s device_hit=%d key_len=%d tail_pages=%d "
             "restorable_count=%d restorable_first10=%s stats=%s",
-            req.rid, device_hit_len, len(key), len(tail_hashes),
-            len(restorable), restorable[:10] if restorable else "[]",
+            req.rid,
+            device_hit_len,
+            len(key),
+            len(tail_hashes),
+            len(restorable),
+            restorable[:10] if restorable else "[]",
             self.cache_linker.stats,
         )
         hit_pages = self._sync_restorable_prefix(
@@ -445,7 +452,8 @@ class UnifiedCacheLinkerWrapper:
                 # component is the one that matters for load-back.
                 logger.debug(
                     "linker.load_back: rid=%s — component %s returned None for LOAD, skipping",
-                    req.rid, component,
+                    req.rid,
+                    component,
                 )
                 continue
             component_transfers.append((component, transfer))
@@ -599,11 +607,12 @@ class UnifiedCacheLinkerWrapper:
                 "prefill",
                 rid,
             )
-            raise LoadQueueRejected(
-                f"Linker load queue rejected for rid={rid!r}."
-            )
+            raise LoadQueueRejected(f"Linker load queue rejected for rid={rid!r}.")
         self.pending_loads[rid] = (node_id, lock_params)
-        self.cache.tree_core.mark_external_cache_load_pending_path(node_id)
+        # Record the owner so this rid's own re-match threads through its
+        # in-flight tail (the slots it already locks) instead of undercounting
+        # below cache_protected_len; every other rid still stops at the node.
+        self.cache.tree_core.mark_external_cache_load_pending_path(node_id, rid)
 
     def _update_load(
         self,
