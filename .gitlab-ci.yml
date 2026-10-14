@@ -1,0 +1,73 @@
+stages:
+  - build
+
+# Build jobs are pinned to the self-managed runner (tag: gpus) because a
+# 30-50GB image cannot be built on GitLab.com shared runners (10GiB dind disk).
+#
+# Auth: [REDACTED-0xf59b4f00] (= CI_JOB_TOKEN) grant push+pull
+# on this project's registry automatically.
+#
+# Intended sequence (all manual, click the play button in the UI):
+#   1. upload-base                 (once ever: pushes local 30.7GB base to the
+#                                   private registry; GitLab blob-dedups it)
+#   2. build-standalone            (any time; delta build on top of :base)
+#   3. build-ornith1-5-9b-int8     (needs 2. pushed first: adds model layer)
+#
+# NOTE on long pushes: GitLab.com registry auth tokens live 15 minutes. If a
+# huge push dies mid-flight with "unauthorized: authentication required",
+# simply retry the job - docker resumes blob upload and skips finished layers.
+#
+# NOTE on long pushes: GitLab.com registry auth tokens live 15 minutes. If a
+# huge push dies mid-flight with "unauthorized: authentication required",
+# simply retry the job - docker resumes blob upload and skips finished layers.
+
+upload-base:
+  stage: build
+  tags: [gpus]
+  when: manual
+  # One-time job: seeds the private registry with the local 30.7GB base so all
+  # later builds deduplicate against it and only ship delta layers.
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+    - docker tag jtabet/sglang:kvarn-latest "$CI_REGISTRY_IMAGE:base"
+    - docker tag jtabet/sglang:kvarn-latest "$CI_REGISTRY_IMAGE:base-kvarn"
+    - docker push "$CI_REGISTRY_IMAGE:base"
+    - docker push "$CI_REGISTRY_IMAGE:base-kvarn"
+
+build-standalone:
+  stage: build
+  tags: [gpus]
+  when: manual
+  variables:
+    GIT_DEPTH: 1
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+    - docker build --progress=plain
+      --build-arg BASE_IMAGE="$CI_REGISTRY_IMAGE:base"
+      -f docker/Dockerfile.kvarn-standalone
+      -t "$CI_REGISTRY_IMAGE:kvarn-standalone" .
+    - docker push "$CI_REGISTRY_IMAGE:kvarn-standalone"
+
+build-ornith1-5-9b-int8:
+  stage: build
+  tags: [gpus]
+  when: manual
+  variables:
+    GIT_DEPTH: 1
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+    - docker build --progress=plain
+      -f docker/Dockerfile.ornith1.5-9b-int8
+      -t "$CI_REGISTRY_IMAGE:ornith1.5-9b-int8" .
+    - docker push "$CI_REGISTRY_IMAGE:ornith1.5-9b-int8"
+
+cleanup-runner-disk:
+  stage: build
+  tags: [gpus]
+  when: manual
+  # NEVER deletes tagged images - only build cache and dangling layers.
+  script:
+    - df -h / /home || df -h /
+    - docker builder prune --force --max-used-space 100GB || true
+    - docker image prune --force --filter "until=168h" || true
+    - df -h / /home || df -h /

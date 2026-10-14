@@ -1,0 +1,60 @@
+# Registry-driven variant: standalone image built in CI (registry.gitlab.com/
+# orchestrel-ai/sglang:kvarn-standalone) + Ornith-1.5-9B INT8 (W8A8) weights baked in.
+#
+# The image ships with the model in /models/ornith1.5-9b-int8 so a container can
+# run inference fully offline, e.g.:
+#   python -m sglang.launch_server --model-path /models/ornith1.5-9b-int8
+#
+# Build context = repo root (same as the other kvarn Dockerfiles).
+#
+# NOTE: only the shards referenced by model.safetensors.index.json are
+# downloaded (~20.4 GB). The hub repo also contains ~10 GB of unreferenced
+# alternate shards which are intentionally skipped.
+FROM registry.gitlab.com/orchestrel-ai/sglang:kvarn-standalone
+
+ENV HF_HOME=/hfcache
+
+RUN mkdir -p /models/ornith1.5-9b-int8 /hfcache && python - <<'PYEOF'
+import json
+import urllib.request
+
+from huggingface_hub import snapshot_download
+
+ORG, NAME = "orchestrel-ai", "Ornith-1.5-9B-INT8-W8A8"
+url = f"https://huggingface.co/{ORG}/{NAME}/resolve/main/model.safetensors.index.json"
+idx = json.load(urllib.request.urlopen(url, timeout=60))
+needed = sorted(set(idx["weight_map"].values()))
+print(f"index references {len(needed)} shards: {needed}")
+
+snapshot_download(
+    repo_id=f"{ORG}/{NAME}",
+    allow_patterns=[
+        *needed,
+        "config.json",
+        "generation_config.json",
+        "decoder_config.json",
+        "chat_template.jinja",
+        "preprocessor_config.json",
+        "processor_config.json",
+        "video_preprocessor_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "merges.txt",
+        "vocab.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "model.safetensors.index.json",
+    ],
+    local_dir="/models/ornith1.5-9b-int8",
+)
+print("download complete")
+PYEOF
+
+RUN du -sh /models/ornith1.5-9b-int8 && \
+    python -c "
+import os, json
+d='/models/ornith1.5-9b-int8'
+idx=json.load(open(os.path.join(d,'model.safetensors.index.json')))
+missing=[f for f in set(idx['weight_map'].values()) if not os.path.exists(os.path.join(d,f))]
+assert not missing, f'missing shards: {missing}'
+print('all shards present, model dir ready')"
