@@ -23,6 +23,7 @@ stages:
 
 upload-base:
   stage: build
+  tags: [gpus]
   when: manual
   # One-time job: seeds the private registry with the local 30.7GB base so all
   # later builds deduplicate against it and only ship delta layers.
@@ -35,6 +36,7 @@ upload-base:
 
 build-standalone:
   stage: build
+  tags: [gpus]
   when: manual
   variables:
     GIT_DEPTH: 1
@@ -48,6 +50,7 @@ build-standalone:
 
 build-ornith1-5-9b-int8:
   stage: build
+  tags: [gpus]
   when: manual
   variables:
     GIT_DEPTH: 1
@@ -60,6 +63,7 @@ build-ornith1-5-9b-int8:
 
 cleanup-runner-disk:
   stage: build
+  tags: [gpus]
   when: manual
   # NEVER deletes tagged images - only build cache and dangling layers.
   script:
