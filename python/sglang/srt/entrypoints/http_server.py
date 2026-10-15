@@ -175,6 +175,7 @@ from sglang.srt.utils import (
     kill_process_tree,
     set_uvicorn_logging_configs,
 )
+from sglang.srt.utils.stale_shm_cleanup import cleanup_startup_shm
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
 from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
@@ -2842,6 +2843,11 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
+    # Reclaim leaked /dev/shm segments from a previous container incarnation
+    # (SIGKILL teardown skips every unlink; PID-1-stamped names defeat the
+    # pid-based CI sweep). Runs before NCCL/weight-load creates anything live.
+    cleanup_startup_shm()
+
     # Launch subprocesses
     (
         tokenizer_manager,

@@ -3,11 +3,13 @@ import subprocess
 import sys
 import unittest
 from multiprocessing import shared_memory
+from pathlib import Path
 from unittest.mock import patch
 
 from sglang.srt.utils.stale_shm_cleanup import (
     _creator_pid,
     cleanup_stale_shm,
+    cleanup_startup_shm,
     make_shm_name,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -147,6 +149,41 @@ class TestCleanupStaleShm(unittest.TestCase):
         for path in stale:
             self.assertFalse(os.path.exists(path), path)
         self.assertTrue(os.path.exists(unknown))
+
+
+@unittest.skipUnless(os.path.isdir("/dev/shm"), "requires /dev/shm")
+class TestCleanupStartupShm(unittest.TestCase):
+    def _make_raw_file(self, name: str) -> str:
+        path = f"/dev/shm/{name}"
+        with open(path, "wb") as f:
+            f.write(b"\0" * 4096)
+        self.addCleanup(self._unlink_quiet, path)
+        return path
+
+    @staticmethod
+    def _unlink_quiet(path: str):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+    def test_unlinks_leak_families_and_keeps_foreign(self):
+        stale = [
+            self._make_raw_file("sgl_shm_mm_1_aaaa0000"),
+            self._make_raw_file("sglang_loads_deadbeef.shm"),
+            self._make_raw_file("nccl-testonly"),
+        ]
+        unknown = self._make_raw_file("unknown_family_file")
+
+        cleanup_startup_shm()
+
+        for path in stale:
+            self.assertFalse(os.path.exists(path), path)
+        self.assertTrue(os.path.exists(unknown))
+
+    def test_noop_when_no_shm_dir(self):
+        with patch("sglang.srt.utils.stale_shm_cleanup._SHM_DIR", Path("/nonexistent-shm")):
+            cleanup_startup_shm()  # must not raise
 
 
 if __name__ == "__main__":

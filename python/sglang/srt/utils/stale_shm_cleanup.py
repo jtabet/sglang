@@ -79,6 +79,63 @@ def cleanup_stale_shm() -> None:
         )
 
 
+# Segments that are safe to unlink UNCONDITIONALLY at container startup.
+#
+# SGLang is launched as PID 1 inside its container, so `make_shm_name` stamps
+# every segment with pid=1 regardless of which incarnation created it. The
+# pid-based reclaim in `_cleanup_stale_shm_impl` can therefore never free a
+# leaked segment across a container restart (PID 1 is always alive in the new
+# container's namespace). In the k8s/emptyDir model /dev/shm is per-pod and
+# shared by no other tenant, so at the *very start* of server launch — before
+# NCCL, weight load, or any request creates a fresh segment — any leftover file
+# under these families is by construction a leak from a previous incarnation.
+_STARTUP_UNLINK_PREFIXES = (
+    "sgl_shm_",  # make_shm_name: multimodal feature transport (mm), mq, nodecheck
+    "sglang_loads_",  # managers/load_snapshot.py slot files
+    "nccl-",  # NCCL communicator segments
+)
+
+
+def cleanup_startup_shm() -> None:
+    """Unlink leftover /dev/shm segments from a previous container incarnation.
+
+    Intended to be called once, at the very beginning of server launch, before
+    any live segment is created. Unlike `cleanup_stale_shm` (CI-gated), this
+    runs in production and unlinks the leak families unconditionally — safe
+    only because nothing live exists yet at that point. Best-effort: never
+    raises.
+    """
+    try:
+        if not _SHM_DIR.is_dir():
+            return
+        removed = 0
+        freed_bytes = 0
+        for entry in _SHM_DIR.iterdir():
+            if not entry.name.startswith(_STARTUP_UNLINK_PREFIXES):
+                continue
+            try:
+                freed_bytes += entry.stat().st_size
+                entry.unlink()
+                removed += 1
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.warning(
+                    "cleanup_startup_shm: failed to remove %s", entry.name,
+                    exc_info=True,
+                )
+        if removed:
+            logger.info(
+                "cleanup_startup_shm: removed %d stale segment(s), freed %.1f MiB",
+                removed,
+                freed_bytes / (1 << 20),
+            )
+    except Exception:
+        logger.warning(
+            "cleanup_startup_shm: sweep failed, continuing startup", exc_info=True
+        )
+
+
 def _is_in_ci() -> bool:
     # Same semantics as sglang.utils.is_in_ci, read directly so the module
     # stays import-free (CI runs it by path before sglang is installed).
