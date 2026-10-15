@@ -50,11 +50,12 @@ snapshot_download(
 print("download complete")
 PYEOF
 
-RUN du -sh /models/ornith1.5-9b-int8 && \
-    python -c "
-import os, json
-d='/models/ornith1.5-9b-int8'
-idx=json.load(open(os.path.join(d,'model.safetensors.index.json')))
-missing=[f for f in set(idx['weight_map'].values()) if not os.path.exists(os.path.join(d,f))]
-assert not missing, f'missing shards: {missing}'
-print('all shards present, model dir ready')"
+RUN du -sh /models/ornith1.5-9b-int8 && python - <<'PYEOF'
+import json, os
+
+d = "/models/ornith1.5-9b-int8"
+idx = json.load(open(os.path.join(d, "model.safetensors.index.json")))
+missing = [f for f in set(idx["weight_map"].values()) if not os.path.exists(os.path.join(d, f))]
+assert not missing, f"missing shards: {missing}"
+print("all shards present, model dir ready")
+PYEOF
