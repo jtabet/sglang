@@ -372,31 +372,6 @@ class KVarNAttnBackend(AttentionBackend):
             device=device,
         )
 
-        # Pre-allocated full-context K/V materialization buffers for the
-        # prefill/extend path (forward_extend build_packed_kv). Sized once to
-        # the KV-cache capacity and reused every chunk step via a
-        # [:total_tokens] view, instead of a fresh torch.empty per step: a
-        # per-step torch.empty of a monotonically growing buffer fragments the
-        # torch caching allocator on long-context chunked prefill (free bytes
-        # exist but no contiguous span of the requested size → "MemoryError /
-        # memory allocation failed"). One stable allocation, made while the
-        # allocator is unfragmented at init, eliminates that churn entirely.
-        max_ctx_tokens = max(mr.max_total_num_tokens, 1)
-        self._kv_packed_K = torch.empty(
-            max_ctx_tokens,
-            self.num_kv_heads,
-            self.head_dim,
-            dtype=torch.float16,
-            device=device,
-        )
-        self._kv_packed_V = torch.empty(
-            max_ctx_tokens,
-            self.num_kv_heads,
-            self.v_head_dim,
-            dtype=torch.float16,
-            device=device,
-        )
-
         # Report real GPU memory usage through the NoOp pool so the metrics
         # collector (kv_cache_memory_usage_gb) and load inquirer see the
         # actual tail pool + int4 compressed cache footprint.  Without this,
@@ -423,8 +398,6 @@ class KVarNAttnBackend(AttentionBackend):
             + self._mid_o_buf.numel() * self._mid_o_buf.element_size()
             + self._mid_lse_buf.numel() * self._mid_lse_buf.element_size()
             + self._H_fp16.numel() * self._H_fp16.element_size()
-            + self._kv_packed_K.numel() * self._kv_packed_K.element_size()
-            + self._kv_packed_V.numel() * self._kv_packed_V.element_size()
         )
         total_bytes = tail_pool_bytes + int4_cache_bytes + scratch_bytes
         if hasattr(self.token_to_kv_pool, "mem_usage"):
@@ -1158,31 +1131,20 @@ class KVarNAttnBackend(AttentionBackend):
         max_blocks = block_table.shape[1]
         total_tokens = int(cu_seqlens[-1].item())
 
-        # Reuse the pre-allocated full-context buffer (sized to the KV-cache
-        # capacity in _init_pools) instead of torch.empty per step — the
-        # per-step materialize+free of a growing buffer is what fragments the
-        # torch caching allocator on long-context chunked prefill. View the
-        # live prefix; only if the batch somehow exceeds the capacity (should
-        # be impossible — the scheduler bounds total in-flight tokens to the
-        # pool size) fall back to a fresh allocation, preserving old behavior.
-        if total_tokens <= self._kv_packed_K.shape[0]:
-            K_packed = self._kv_packed_K[:total_tokens]
-            V_packed = self._kv_packed_V[:total_tokens]
-        else:
-            K_packed = torch.empty(
-                total_tokens,
-                self.num_kv_heads,
-                self.head_dim,
-                dtype=torch.float16,
-                device=self.device,
-            )
-            V_packed = torch.empty(
-                total_tokens,
-                self.num_kv_heads,
-                self.v_head_dim,
-                dtype=torch.float16,
-                device=self.device,
-            )
+        K_packed = torch.empty(
+            total_tokens,
+            self.num_kv_heads,
+            self.head_dim,
+            dtype=torch.float16,
+            device=self.device,
+        )
+        V_packed = torch.empty(
+            total_tokens,
+            self.num_kv_heads,
+            self.v_head_dim,
+            dtype=torch.float16,
+            device=self.device,
+        )
 
         use_triton_extend = True
 
