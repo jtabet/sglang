@@ -487,6 +487,31 @@ class UnifiedCacheLinkerWrapper:
         prefix_indices = torch.cat(
             [req.prefix_indices.to(torch.int64), full_transfer.device_indices]
         )
+        if prefix_indices.numel() < prefix_len:
+            # The restorable-prefix length claimed at match time (hit.prefix_key)
+            # can exceed the device indices actually materialized here. For kvarn
+            # (int4-tile compressed cache + NoOp logical pool) the request's own
+            # prefix (req.prefix_indices) can have shrunk between match and this
+            # async load-back, so cat([req.prefix_indices, loaded tail]) is shorter
+            # than the claimed prefix_len. Inserting a node whose key is longer
+            # than its value is internally inconsistent and later trips the
+            # cache_unfinished_req assertion (new_prefix_len <= len(new_indices)).
+            # Fall back to recompute instead — the prefix is still fully recoverable
+            # via normal prefill. Mirrors the mamba-allocator abort below.
+            logger.warning(
+                "linker.load_back: rid=%s — materialized %d < claimed %d tokens; "
+                "recomputing prefix (kvarn prefix-length divergence)",
+                req.rid,
+                prefix_indices.numel(),
+                prefix_len,
+            )
+            self._update_load(
+                ExternalLinkerLoadPhase.ABORT,
+                req,
+                component_transfers,
+                prefix_len,
+            )
+            return empty_indices, req.last_node
         mamba_transfer = next(
             (
                 transfer
