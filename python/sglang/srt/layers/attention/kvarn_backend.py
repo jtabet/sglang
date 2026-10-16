@@ -801,14 +801,14 @@ class KVarNAttnBackend(AttentionBackend):
         Hq = self.num_heads
         D = self.head_dim
         hidden = Hq * D
-        for num_tokens in (1, 1024):
-            attn_out = torch.zeros(
-                num_tokens, hidden, dtype=torch.float16, device=device
-            )
-            gate = torch.zeros(
-                num_tokens, Hq, D, dtype=torch.float16, device=device
-            )
-            fused_sigmoid_mul(attn_out, gate, inplace=True)
+        # The model runs bfloat16 (config dtype=bfloat16); the GDN gate and
+        # attention output are bf16. Warm both dtypes to be robust against any
+        # fp16 path in the attention output.
+        for dtype in (torch.bfloat16, torch.float16):
+            for num_tokens in (1, 1024):
+                attn_out = torch.zeros(num_tokens, hidden, dtype=dtype, device=device)
+                gate = torch.zeros(num_tokens, Hq, D, dtype=dtype, device=device)
+                fused_sigmoid_mul(attn_out, gate, inplace=True)
 
     def _warmup_build_packed_kv_kernel(
         self, max_batch_size: int, max_blocks_per_req: int
