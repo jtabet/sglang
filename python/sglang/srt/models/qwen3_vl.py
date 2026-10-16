@@ -958,16 +958,19 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         )
 
         # ---- pre-compute attention metadata once for all layers ----
+        # Real token lens (B,) and the host-side max segment length, derived on
+        # CPU before any device copy: a device reduction + blocking .item() here
+        # can deadlock the launch on hosts whose TP all-reduce runs over host
+        # RAM (no P2P).
+        real_seq_lens = token_cu_seqlens[1:] - token_cu_seqlens[:-1]
+        max_seqlen = int(real_seq_lens.max()) if real_seq_lens.size > 0 else 0
+
         packed_indptrs = None
         flashinfer_sequence_lengths = None
         flashinfer_max_seqlen = 0
 
         if get_mm().mm_attention_backend == "flashinfer_cudnn":
-            # real token lens (B,)
-            real_seq_lens = token_cu_seqlens[1:] - token_cu_seqlens[:-1]
-            flashinfer_max_seqlen = self.bucket_flashinfer_max_seqlen(
-                int(real_seq_lens.max()) if real_seq_lens.size > 0 else 0
-            )
+            flashinfer_max_seqlen = self.bucket_flashinfer_max_seqlen(max_seqlen)
 
             # (B_padded,) token lengths
             seq_lens_padded = self.compute_flashinfer_sequence_lengths_padded(
@@ -1002,6 +1005,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         forward_metadata = prepare_vision_attention_metadata(
             cu_seqlens,
             device=self.device,
+            max_seqlen=max_seqlen,
             packed_indptrs=packed_indptrs,
             sequence_lengths=flashinfer_sequence_lengths,
             flashinfer_max_seqlen=flashinfer_max_seqlen,

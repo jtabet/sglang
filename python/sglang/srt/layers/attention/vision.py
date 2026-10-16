@@ -147,6 +147,22 @@ class VisionAttentionMetadata:
     flashinfer_max_seqlen: Optional[int] = None
 
 
+def _max_seqlen_from_cu_seqlens(cu_seqlens: torch.Tensor) -> int:
+    """Maximum segment length as a host scalar, without touching the device.
+
+    Callers build ``cu_seqlens`` on CPU (from host-side grid_thw) and copy it
+    to the device with ``non_blocking=True``. Deriving the max from the device
+    copy instead launches a reduce kernel on the copy stream and then blocks on
+    ``.item()``, which can wedge the launch when the TP all-reduce traffic
+    runs over host RAM (no P2P). Prefer the host source when it is on CPU;
+    only device-resident sources pay the reduction + sync.
+    """
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    if cu_seqlens.device.type == "cpu":
+        return int(seq_lens.max())
+    return int(seq_lens.max().item())
+
+
 def prepare_vision_attention_metadata(
     cu_seqlens: torch.Tensor,
     device: torch.device,
@@ -158,10 +174,12 @@ def prepare_vision_attention_metadata(
 ) -> VisionAttentionMetadata:
     # Compute all attention metadata once before the encoder layer loop.
 
+    # Derive the host scalar from the CPU source BEFORE the async device copy
+    # so no reduce kernel races the copy (see _max_seqlen_from_cu_seqlens).
+    if max_seqlen is None:
+        max_seqlen = _max_seqlen_from_cu_seqlens(cu_seqlens)
     cu_seqlens = cu_seqlens.to(device=device, dtype=torch.int32, non_blocking=True)
     seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-    if max_seqlen is None:
-        max_seqlen = int(seq_lens.max().item())
     return VisionAttentionMetadata(
         cu_seqlens=cu_seqlens,
         seq_lens=seq_lens,
@@ -178,6 +196,9 @@ def prepare_flashinfer_cudnn_vision_attention_metadata(
     *,
     elem_per_token: int,
 ) -> VisionAttentionMetadata:
+    # Derive the host scalar from the CPU source BEFORE the async device copy
+    # so no reduce kernel races the copy (see _max_seqlen_from_cu_seqlens).
+    real_max_seqlen = _max_seqlen_from_cu_seqlens(cu_seqlens)
     cu_seqlens = cu_seqlens.to(device=device, dtype=torch.int32, non_blocking=True)
     seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
     batch_size = int(seq_lens.numel())
@@ -194,7 +215,6 @@ def prepare_flashinfer_cudnn_vision_attention_metadata(
         padded_seq_lens = seq_lens
 
     elem_indptrs = padded_indptrs * elem_per_token
-    real_max_seqlen = int(seq_lens.max().item())
     max_seqlen = next(
         (size for size in FLASHINFER_MAX_SEQLEN_BUCKETS if size >= real_max_seqlen),
         math.ceil(real_max_seqlen / FLASHINFER_MAX_SEQLEN_BUCKETS[-1])
