@@ -806,9 +806,18 @@ class KVarNAttnBackend(AttentionBackend):
         # fp16 path in the attention output.
         for dtype in (torch.bfloat16, torch.float16):
             for num_tokens in (1, 1024):
+                # Strided-gate path: gate is 3D [num_tokens, num_heads, head_dim];
+                # kernel specializes HEAD_DIM = head_dim (256).
                 attn_out = torch.zeros(num_tokens, hidden, dtype=dtype, device=device)
                 gate = torch.zeros(num_tokens, Hq, D, dtype=dtype, device=device)
                 fused_sigmoid_mul(attn_out, gate, inplace=True)
+                # Flat-gate path (fused QK-norm+gate): gate is 2D
+                # [num_tokens, hidden]; kernel specializes HEAD_DIM = hidden_dim
+                # (num_heads * head_dim). Distinct specialization from the
+                # strided path above.
+                flat_attn = torch.zeros(num_tokens, hidden, dtype=dtype, device=device)
+                flat_gate = torch.zeros(num_tokens, hidden, dtype=dtype, device=device)
+                fused_sigmoid_mul(flat_attn, flat_gate, inplace=True)
 
     def _warmup_build_packed_kv_kernel(
         self, max_batch_size: int, max_blocks_per_req: int
