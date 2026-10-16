@@ -746,7 +746,69 @@ class KVarNAttnBackend(AttentionBackend):
         except Exception as e:
             logger.warning(f"KVarN build_packed_kv warmup failed (non-fatal): {e}")
 
+        # Pre-load two kernels that JIT lazily at their FIRST serve-time use,
+        # OUTSIDE the attention path covered above. Their cuModuleLoadData needs
+        # free device memory outside the torch allocator's high-water mark, so
+        # under long-context load they die with CUDA OOM (see the
+        # "device-loaded after serving started" warnings from triton_load_watch).
+        try:
+            self._warmup_lazy_alloc_and_gate_kernels()
+        except Exception as e:
+            logger.warning(f"KVarN lazy-kernel warmup failed (non-fatal): {e}")
+
         logger.info("KVarN Triton kernels warmed up")
+
+    def _warmup_lazy_alloc_and_gate_kernels(self):
+        """Pre-load the allocator-extend and GDN-gate Triton kernels.
+
+        These are specialized on constexpr args, so each variant in production
+        use must be launched once at init to load its cubin while memory is
+        plentiful:
+
+        - ``alloc_extend_kernel`` (KV-cache allocator extend) specializes on
+          ``bs_upper`` (next_power_of_2 of the batch size). The fleet runs
+          ``max_running_requests=4``, so ``bs_upper`` in {1, 2, 4}.
+        - ``_fused_sigmoid_mul_kernel`` (GDN attention-output gate) specializes
+          on ``hidden_dim``/``HEAD_DIM``/``BLOCK_H``. ``BLOCK_H`` is 1024 for
+          <1024 tokens and 2048 above; cover both.
+        """
+        device = self.device
+        page_size = self.page_size
+
+        from sglang.kernels.ops.memory.allocator import alloc_extend_kernel
+
+        for bs in (1, 2, 4):
+            bs_upper = 1 << (bs - 1).bit_length()
+            prefix_lens = torch.zeros(bs, dtype=torch.int32, device=device)
+            seq_lens = torch.full((bs,), page_size, dtype=torch.int32, device=device)
+            last_loc = torch.full((bs,), -1, dtype=torch.int32, device=device)
+            free_pages = torch.zeros(bs + 1, dtype=torch.int64, device=device)
+            out_indices = torch.empty(
+                bs * page_size, dtype=torch.int64, device=device
+            )
+            alloc_extend_kernel[(bs,)](
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                free_pages,
+                out_indices,
+                bs_upper,
+                page_size,
+            )
+
+        from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+
+        Hq = self.num_heads
+        D = self.head_dim
+        hidden = Hq * D
+        for num_tokens in (1, 1024):
+            attn_out = torch.zeros(
+                num_tokens, hidden, dtype=torch.float16, device=device
+            )
+            gate = torch.zeros(
+                num_tokens, Hq, D, dtype=torch.float16, device=device
+            )
+            fused_sigmoid_mul(attn_out, gate, inplace=True)
 
     def _warmup_build_packed_kv_kernel(
         self, max_batch_size: int, max_blocks_per_req: int
