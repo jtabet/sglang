@@ -43,6 +43,20 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
+
+# The fused silu_and_mul (JIT) writes its output as a flat row-major
+# [num_tokens, width] tensor (it does ``out.view(-1, width)`` internally), so it
+# requires a CONTIGUOUS ``out``. A strided slice of gate_up (e.g.
+# ``gate_up[:, :width]``) is not a valid target and would corrupt the result. On
+# CUDA the module-level ``silu_and_mul`` is the same function that
+# ``SiluAndMul.forward_cuda`` calls; on other platforms it is not exported, in
+# which case we fall back to the unfused ``self.act_fn`` path.
+try:
+    from sglang.srt.layers.activation import silu_and_mul as _silu_and_mul
+except ImportError:  # pragma: no cover - non-CUDA platforms
+    _silu_and_mul = None
+from sglang.srt.layers.moe.utils import is_tbo_enabled
+
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -174,6 +188,25 @@ def can_fuse_shared_expert(
     return True
 
 
+# Grow-only shared silu_and_mul output buffer (one per device/dtype/width),
+# reused by every Qwen2MoeMLP layer. Reusing one persistent, row-major
+# contiguous buffer removes the per-step ``torch.empty`` churn
+# (~272 MiB x 64 layers/step) that fragments the allocator. The fused
+# silu_and_mul kernel writes ``out`` as a flat [num_tokens, width] tensor and
+# does ``out.view(-1, width)`` internally, so ``out`` must be contiguous -- a
+# leading slice of a contiguous buffer satisfies that.
+_silu_out_cache: dict = {}
+
+
+def _get_silu_out(num_tokens: int, width: int, dtype, device) -> torch.Tensor:
+    key = (device.index, dtype, width)
+    buf = _silu_out_cache.get(key)
+    if buf is None or buf.shape[0] < num_tokens:
+        buf = torch.empty((num_tokens, width), dtype=dtype, device=device)
+        _silu_out_cache[key] = buf
+    return buf[:num_tokens]
+
+
 class Qwen2MoeMLP(nn.Module):
     def __init__(
         self,
@@ -255,9 +288,32 @@ class Qwen2MoeMLP(nn.Module):
         if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
             x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))
             return x
-        x = self.act_fn(gate_up)
+        x = self._silu(gate_up)
         x, _ = self.down_proj(x)
         return x
+
+    def _silu(self, gate_up: torch.Tensor) -> torch.Tensor:
+        # silu_and_mul(gate_up) previously did a fresh per-step torch.empty of
+        # [num_tokens, width//2] (272 MiB at 16384 tokens) inside
+        # SiluAndMul.forward_cuda. Write into a persistent, row-major contiguous
+        # buffer instead: same fused silu_and_mul kernel and numerics, but the
+        # 272 MiB allocation happens once and is reused, so the allocator no
+        # longer churns it 64x/step. A strided slice of gate_up is NOT a valid
+        # out (the kernel writes out flat and requires contiguity), hence the
+        # dedicated contiguous buffer.
+        # The buffer is shared across layers, so it is only safe when forwards
+        # are sequential. Under TBO two batches' forwards overlap and would
+        # race on the shared buffer, so fall back to the original per-call
+        # allocation there.
+        if _silu_and_mul is None or is_tbo_enabled():
+            return self.act_fn(gate_up)
+        out = _get_silu_out(
+            gate_up.shape[0],
+            gate_up.shape[-1] // 2,
+            gate_up.dtype,
+            gate_up.device,
+        )
+        return _silu_and_mul(gate_up, out=out)
 
 
 class Qwen2MoeSparseMoeBlock(nn.Module):
