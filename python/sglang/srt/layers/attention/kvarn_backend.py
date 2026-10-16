@@ -498,6 +498,17 @@ class KVarNAttnBackend(AttentionBackend):
         if self.pool_slots == 0:
             self._init_pools()
 
+        if in_capture:
+            # Capture uses a dummy batch against a capture stream; flushing is
+            # meaningless here and the flush's blocking GPU->CPU reads
+            # (seq_lens.cpu(), block_table .tolist()) deadlock the capture
+            # (CPU waits on the capture-held stream → kernel never completes,
+            # 100% SM / 0% mem-bw). Skip all flush/slot mutation; only fill the
+            # static buffers the captured graph consumes.
+            if hasattr(self, "_cg_block_table"):
+                self._fill_cg_buffers(forward_batch)
+            return
+
         # Flush full blocks from tail pool to int4 cache
         self._maybe_flush_blocks(forward_batch)
 
