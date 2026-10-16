@@ -531,6 +531,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 model_runner.device,
             )
         )
+        # Pre-allocated leading-slice scratch for the Triton GDN prefill (fla
+        # chunk) kernels, which otherwise allocate A/w/u/h/v_new/o fresh on
+        # every extend step (see _get_chunk_scratch). Allocated lazily on the
+        # first extend so dtype/shard dims are taken from real activations.
+        self._chunk_scratch: Optional[dict] = None
+        self._chunk_scratch_cap = 0
+        self._chunk_scratch_key: Optional[tuple] = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -804,6 +811,83 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         return (core_attn_out, z) if return_z else core_attn_out
 
+    def _get_chunk_scratch(
+        self,
+        T: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Optional[dict]:
+        """Pre-allocated leading-slice scratch for the Triton GDN prefill
+        (fla chunk) kernels.
+
+        The chunk wrappers (chunk_fwd / wy_fast / chunk_delta_h / chunk_o)
+        allocate A, w, u, h, v_new and o fresh on every extend step — at a
+        16K-token chunk that is several hundred MiB of allocator churn per
+        layer, fragmenting the pool toward OOM. Buffers are allocated once,
+        sized to the chunked-prefill cap, and reused as leading slices; a
+        call that exceeds the pre-allocated size (or changes dtype/dims)
+        falls back to fresh allocations. Never an OOB view.
+        """
+        if is_cpu() or is_npu():
+            return None
+        key = (dtype, num_v_heads, head_k_dim, head_v_dim)
+        if self._chunk_scratch is not None:
+            if self._chunk_scratch_key != key:
+                # Incompatible dims/dtype (should not happen mid-run):
+                # reallocate on the next call.
+                self._chunk_scratch = None
+                self._chunk_scratch_key = None
+            elif T > self._chunk_scratch_cap:
+                # Batch exceeds the pre-allocated size: fall back to fresh
+                # allocations for this call; keep the buffers for the next.
+                return None
+            else:
+                return self._chunk_scratch
+        cap = max(T, get_schedule().chunked_prefill_size or 0, FLA_CHUNK_SIZE)
+        scratch = {
+            "A": torch.empty(
+                1,
+                cap,
+                num_v_heads,
+                FLA_CHUNK_SIZE,
+                dtype=dtype,
+                device=device,
+            ),
+            "w": torch.empty(
+                1, cap, num_v_heads, head_k_dim, dtype=dtype, device=device
+            ),
+            "u": torch.empty(
+                1, cap, num_v_heads, head_v_dim, dtype=dtype, device=device
+            ),
+            "h": torch.empty(
+                1,
+                (cap + FLA_CHUNK_SIZE - 1) // FLA_CHUNK_SIZE,
+                num_v_heads,
+                head_v_dim,
+                head_k_dim,
+                dtype=dtype,
+                device=device,
+            ),
+            "v_new": torch.empty(
+                1, cap, num_v_heads, head_v_dim, dtype=dtype, device=device
+            ),
+            "o": torch.empty(
+                1, cap, num_v_heads, head_v_dim, dtype=dtype, device=device
+            ),
+        }
+        self._chunk_scratch = scratch
+        self._chunk_scratch_cap = cap
+        self._chunk_scratch_key = key
+        rank0_log(
+            f"GDN chunk scratch pre-allocated: cap={cap} tokens, "
+            f"H={num_v_heads} K={head_k_dim} V={head_v_dim} dtype={dtype}, "
+            f"~{sum(t.numel() * t.element_size() for t in scratch.values()) / 1e9:.2f} GB"
+        )
+        return scratch
+
     def forward_extend(
         self,
         layer: RadixLinearAttention,
@@ -1018,6 +1102,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            chunk_scratch = self._get_chunk_scratch(
+                T=actual_seq_len,
+                num_v_heads=value.shape[2],
+                head_k_dim=key.shape[3],
+                head_v_dim=value.shape[3],
+                dtype=key.dtype,
+                device=key.device,
+            )
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -1027,6 +1119,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states_contig,
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
+                chunk_scratch=chunk_scratch,
                 state_checkpoint_cu_starts=(
                     forward_metadata.state_checkpoint_cu_starts
                 ),

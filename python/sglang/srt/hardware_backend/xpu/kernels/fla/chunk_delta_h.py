@@ -243,7 +243,11 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_indices: Optional[torch.LongTensor] = None,
     use_exp2: bool = False,
     inplace_update: bool = True,
+    scratch: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # XPU variant: `scratch` is accepted for signature parity with the CUDA
+    # wrapper (chunk.py threads it unconditionally) but unused — the XPU
+    # kernels keep their fresh allocations.
     if not inplace_update:
         raise NotImplementedError(
             "GDN multi-item scoring is not supported by the XPU chunk kernel"
