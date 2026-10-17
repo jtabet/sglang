@@ -92,7 +92,11 @@ def cleanup_stale_shm() -> None:
 _STARTUP_UNLINK_PREFIXES = (
     "sgl_shm_",  # make_shm_name: multimodal feature transport (mm), mq, nodecheck
     "sglang_loads_",  # managers/load_snapshot.py slot files
-    "nccl-",  # NCCL communicator segments
+    # NOTE: do NOT unlink "nccl-". NCCL's host-RAM SHM transport (used on P2P-less
+    # pairs like jade's x1) creates /dev/shm/nccl-* communicator segments; unlinking
+    # them at startup left NCCL's all-reduce polling a deleted buffer → 100% SM /
+    # 0% mem-bw spin. The sgl_shm_/sglang_loads_ families above are the real
+    # 837MB leak; the nccl- segments are small and re-created by NCCL anyway.
 )
 
 
