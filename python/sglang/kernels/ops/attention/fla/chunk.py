@@ -45,6 +45,7 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: torch.LongTensor | None = None,
     inplace_update: bool = True,
+    chunk_scratch: Optional[dict] = None,
 ):
     g = chunk_local_cumsum(
         g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
@@ -58,6 +59,7 @@ def chunk_gated_delta_rule_fwd(
         beta=beta,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        scratch=chunk_scratch,
     )
 
     h, v_new = chunk_gated_delta_rule_fwd_h(
@@ -70,6 +72,7 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         inplace_update=inplace_update,
+        scratch=chunk_scratch,
     )
     o = chunk_fwd_o(
         q=q,
@@ -79,6 +82,7 @@ def chunk_gated_delta_rule_fwd(
         g=g,
         scale=scale,
         cu_seqlens=cu_seqlens,
+        scratch=chunk_scratch,
     )
     if SUPPRESS_LEVEL < 3:
         return g, o, A, None, h, None
@@ -103,6 +107,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         cu_seqlens: Optional[torch.LongTensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
         inplace_update: bool = True,
+        chunk_scratch: Optional[dict] = None,
     ):
         q_orig = q
         k_orig = k
@@ -128,6 +133,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             inplace_update=inplace_update,
+            chunk_scratch=chunk_scratch,
         )
         return o.to(q.dtype), h
 
@@ -146,6 +152,7 @@ def chunk_gated_delta_rule(
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     inplace_update: bool = True,
+    chunk_scratch: Optional[dict] = None,
 ):
     r"""
     Args:
@@ -176,6 +183,11 @@ def chunk_gated_delta_rule(
             Default: `False`.
         inplace_update (Optional[bool]):
             Whether to write final states back to `initial_state`. Default: `True`.
+        chunk_scratch (Optional[dict]):
+            Pre-allocated scratch buffers (keys "A", "w", "u", "h", "v_new",
+            "o") reused as leading slices to avoid per-step allocations.
+            Buffers that are missing or too small are replaced by fresh
+            allocations. Default: `None`.
 
     Returns:
         o (torch.Tensor):
@@ -263,6 +275,7 @@ def chunk_gated_delta_rule(
         cu_seqlens,
         use_qk_l2norm_in_kernel,
         inplace_update,
+        chunk_scratch,
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")

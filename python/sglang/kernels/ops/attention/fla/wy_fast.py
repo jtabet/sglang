@@ -118,6 +118,8 @@ def recompute_w_u_fwd(
     A: torch.Tensor,
     cu_seqlens: Optional[torch.LongTensor],
     chunk_indices: torch.LongTensor | None = None,
+    w_scratch: Optional[torch.Tensor] = None,
+    u_scratch: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     B, T, Hg, K, V = *k.shape, v.shape[-1]
     H = v.shape[-2]
@@ -128,8 +130,10 @@ def recompute_w_u_fwd(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BK = 64
     BV = 64
-    u = torch.empty_like(v)
-    w = k.new_empty(B, T, H, K)
+    # Reuse pre-allocated leading-slice scratch when provided (validated by
+    # the caller via scratch_slice); otherwise a fresh allocation.
+    u = u_scratch if u_scratch is not None else torch.empty_like(v)
+    w = w_scratch if w_scratch is not None else k.new_empty(B, T, H, K)
     recompute_w_u_fwd_kernel[(NT, B * H)](
         k=k,
         v=v,
