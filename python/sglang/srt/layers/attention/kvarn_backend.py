@@ -343,36 +343,6 @@ class KVarNAttnBackend(AttentionBackend):
             device=device,
         )
 
-        # Pre-allocated Q rotation/unrotation scratch for the extend path
-        # (CUDA graph capture-safe; reused across layers + steps).
-        # forward_extend computes q_rot = (q_3d.float() @ H).to(fp16) and
-        # un-rotates the attention output as (fa_out.float() @ H.T), i.e.
-        # two fresh fp32 [N, Hq, D] temporaries + fp16 results per prefill
-        # step (~1 GiB of allocator churn at 16K tokens). These persistent
-        # buffers make both matmuls allocation-free. Sized for
-        # max_prefill rows (the chunked-prefill cap); a larger batch
-        # falls back to a fresh allocation in forward_extend.
-        self._q_rot_max_rows = max_prefill
-        self._q_rot_in_fp32 = torch.empty(
-            max_prefill,
-            self.num_heads,
-            self.head_dim,
-            dtype=torch.float32,
-            device=device,
-        )
-        self._q_rot_out_fp32 = torch.empty_like(self._q_rot_in_fp32)
-        self._q_rot_fp16 = torch.empty(
-            max_prefill,
-            self.num_heads,
-            self.head_dim,
-            dtype=torch.float16,
-            device=device,
-        )
-        # Pre-allocated extend attention output (flash_attn_varlen result +
-        # un-rotation target). Separate from _q_rot_fp16 because both are
-        # alive around the flash call.
-        self._extend_out_fp16 = torch.empty_like(self._q_rot_fp16)
-
         # Pre-allocated fused-decode output + split-K mid buffers
         # (CUDA graph capture-safe; reused across layers + steps).
         # Sized for the decode regime: max_running * Hq rows (flat N = B*Hq).
@@ -428,10 +398,6 @@ class KVarNAttnBackend(AttentionBackend):
             + self._mid_o_buf.numel() * self._mid_o_buf.element_size()
             + self._mid_lse_buf.numel() * self._mid_lse_buf.element_size()
             + self._H_fp16.numel() * self._H_fp16.element_size()
-            + self._q_rot_in_fp32.numel() * self._q_rot_in_fp32.element_size()
-            + self._q_rot_out_fp32.numel() * self._q_rot_out_fp32.element_size()
-            + self._q_rot_fp16.numel() * self._q_rot_fp16.element_size()
-            + self._extend_out_fp16.numel() * self._extend_out_fp16.element_size()
         )
         total_bytes = tail_pool_bytes + int4_cache_bytes + scratch_bytes
         if hasattr(self.token_to_kv_pool, "mem_usage"):
@@ -1153,20 +1119,8 @@ class KVarNAttnBackend(AttentionBackend):
         if is_verify:
             return self._fused_verify_path(q_3d, layer, forward_batch, H)
 
-        # Rotate Q. Reuses the pre-allocated fp32 in/out + fp16 result
-        # scratch as leading slices (same math: fp32 matmul with the fp32
-        # Hadamard, fp16 result). A batch larger than the pre-allocated
-        # rows falls back to a fresh allocation.
-        use_qrot_scratch = N <= self._q_rot_max_rows
-        if use_qrot_scratch:
-            q_rot_in = self._q_rot_in_fp32[:N]
-            q_rot_out = self._q_rot_out_fp32[:N]
-            q_rot = self._q_rot_fp16[:N]
-            q_rot_in.copy_(q_3d)
-            torch.matmul(q_rot_in, H, out=q_rot_out)
-            q_rot.copy_(q_rot_out)
-        else:
-            q_rot = (q_3d.float() @ H).to(torch.float16)
+        # Rotate Q
+        q_rot = (q_3d.float() @ H).to(torch.float16)
 
         # Normal extend path: build_packed_kv + flash_attn_varlen
         # Build block_table, seq_lens, cu_seqlens
@@ -1251,12 +1205,9 @@ class KVarNAttnBackend(AttentionBackend):
         # Run attention via flash_attn_varlen (batched, no Python loop)
         # Cached multiquery path: one flash_attn_varlen
         # call for the whole batch instead of per-request SDPA.
-        if N <= self._q_rot_max_rows and q.dtype == torch.float16:
-            out = self._extend_out_fp16[:N]
-        else:
-            out = torch.empty(
-                N, self.num_heads, self.head_dim, dtype=q.dtype, device=q.device
-            )
+        out = torch.empty(
+            N, self.num_heads, self.head_dim, dtype=q.dtype, device=q.device
+        )
 
         extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
         extend_prefix_lens = getattr(forward_batch, "extend_prefix_lens", None)
@@ -1323,14 +1274,7 @@ class KVarNAttnBackend(AttentionBackend):
             if fa_out.dim() == 2:
                 fa_out = fa_out.view(N, self.num_heads, self.head_dim)
             # Un-rotate each head: [N, Hq, D] @ [D, D]^T = [N, Hq, D]
-            if use_qrot_scratch:
-                # Reuse the rotation scratch (free at this point):
-                # fp32 in -> fp32 matmul -> in-place fp16 cast into out.
-                q_rot_in.copy_(fa_out)
-                torch.matmul(q_rot_in, H.T, out=q_rot_out)
-                out.copy_(q_rot_out)
-            else:
-                out[:] = (fa_out.float() @ H.T).to(q.dtype)
+            out[:] = (fa_out.float() @ H.T).to(q.dtype)
         else:
             # Fallback: per-request SDPA
             if extend_seq_lens is not None:

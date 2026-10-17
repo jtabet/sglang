@@ -183,10 +183,6 @@ class TritonGDNKernel(LinearAttnKernelBase):
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
         inplace_update_args = {"inplace_update": inplace_update}
-        # Pre-allocated leading-slice scratch for the fla chunk kernels (see
-        # GDNAttnBackend._get_chunk_scratch). Only the in-tree CUDA/XPU chunk
-        # wrapper accepts it; the NPU/CPU bindings have a fixed signature.
-        chunk_scratch = kwargs.pop("chunk_scratch", None)
         if is_cpu():
             if not inplace_update:
                 raise NotImplementedError(
@@ -204,22 +200,6 @@ class TritonGDNKernel(LinearAttnKernelBase):
             # control. Its existing behavior is equivalent to True.
             inplace_update_args = {}
 
-        if chunk_scratch is not None and not is_npu() and not is_cpu():
-            # In-tree (CUDA/XPU) wrapper accepts pre-allocated scratch.
-            return chunk_gated_delta_rule(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                initial_state=recurrent_state,
-                cu_seqlens=query_start_loc,
-                head_first=False,
-                use_qk_l2norm_in_kernel=True,
-                **recurrent_state_indices_args,
-                **inplace_update_args,
-                chunk_scratch=chunk_scratch,
-            )
         return chunk_gated_delta_rule(
             q=q,
             k=k,

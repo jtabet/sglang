@@ -71,33 +71,6 @@ def check_environments():
     return None
 
 
-def scratch_slice(
-    scratch: Optional[dict],
-    name: str,
-    shape: Tuple[int, ...],
-    dtype: torch.dtype,
-) -> Optional[torch.Tensor]:
-    """Leading-slice of a pre-allocated scratch buffer, or None.
-
-    `scratch[name]` must be a buffer whose trailing dims match `shape[2:]`
-    exactly and whose second dim (tokens / chunks) is at least `shape[1]`;
-    then `buf[:shape[0], :shape[1]]` is returned so callers can reuse the
-    allocation (zero per-step allocator churn). Otherwise None is returned
-    so the caller falls back to a fresh allocation — never an OOB view.
-    """
-    if scratch is None:
-        return None
-    buf = scratch.get(name)
-    if buf is None or buf.dtype != dtype:
-        return None
-    shape = tuple(shape)
-    if buf.ndim < 2 or buf.shape[0] < shape[0] or buf.shape[1] < shape[1]:
-        return None
-    if buf.shape[2:] != tuple(shape[2:]):
-        return None
-    return buf[: shape[0], : shape[1]]
-
-
 def get_abs_err(x, y):
     return (x.detach() - y.detach()).flatten().abs().max().item()
 
