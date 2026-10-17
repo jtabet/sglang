@@ -1494,6 +1494,15 @@ class KVarNHostKVCache(HostKVCache):
             self._hk * self._tile_bytes * self._num_compressed_layers // self.page_size
         )
 
+    def get_ksize_per_token(self):
+        """KVarN tiles pack K and V together in the int4 block, so there is no
+        separate K component: ksize equals the (K+V) size per token. Storage
+        backends (mooncake_store/npu_memcache) use this only for page-size
+        bookkeeping and throughput telemetry — matching the convention of the
+        sibling host pools (DeepSeekV4PagedHostPool, state pools) where
+        get_ksize_per_token() returns the same value as get_size_per_token()."""
+        return self.get_size_per_token()
+
     def init_kv_buffer(self):
         """Allocate uint8 tile storage: [page_num, layer_num, Hk, tile_bytes]."""
         dims = (self.page_num, self._num_compressed_layers, self._hk, self._tile_bytes)
