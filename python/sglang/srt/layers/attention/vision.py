@@ -1126,6 +1126,8 @@ class VisionAttention(nn.Module):
         workspace_buffer: Optional[torch.Tensor] = None,
         use_sink: bool = False,
         window_size: Tuple[int, int] = (-1, -1),
+        tp_size: Optional[int] = None,
+        tp_rank: Optional[int] = None,
         **kwargs,
     ):
         super().__init__()
@@ -1136,8 +1138,15 @@ class VisionAttention(nn.Module):
                 DeprecationWarning,
                 stacklevel=2,
             )
-        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
-        self.tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
+        # Explicit tp_size/tp_rank override (used by models that run their vision
+        # tower replicated per rank instead of attn-TP sharded); None (default)
+        # keeps the previous attn-TP-driven sharding untouched.
+        self.tp_size = 1 if use_data_parallel else (
+            tp_size if tp_size is not None else get_parallel().attn_tp_size
+        )
+        self.tp_rank = 0 if use_data_parallel else (
+            tp_rank if tp_rank is not None else get_parallel().attn_tp_rank
+        )
         self.dropout = dropout
         num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.head_size = head_dim if head_dim is not None else embed_dim // num_heads

@@ -103,6 +103,25 @@ logger = logging.getLogger(__name__)
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
+# Qwen3-VL vision encodes with variable image-token counts, so unlike the
+# language model it has no compile-time bound on the shape of the tensors that
+# flow into its TP all-reduce: the per-ViT-call `pos_embed` gather, the per-
+# block attention/MLP projections and the patch merger each all-reduce a new
+# (4 * patches x hidden) size class, re-registered with NCCL on first use over
+# the current stream. On rank pairs without P2P (e.g. a PCIe x1 link, with
+# NCCL_P2P_DISABLE=1) that path is the host-RAM SHM transport, which stalls:
+# both ranks' NCCL kernels spin waiting on the peer's SHM flag (100% GPU, 0%
+# mem bandwidth), the launch queue backs up behind the never-completing
+# collective, and the *next* enqueued kernel — the vision block's `norm1`
+# LayerNorm reduction (qwen3_vl.py Qwen3_VisionBlock.forward) wedges the CPU
+# inside cuLaunchKernel. The tower's inputs are replicated per rank and its
+# output is complete on every rank, so it needs no cross-rank synchronization
+# at all. Therefore run the whole vision tower with tp_size=1: each rank holds
+# the full (replicated) ViT weights and computes identical full features with
+# zero collectives, on every worker regardless of P2P capability. This also
+# removes the redundant TP split of the ViT's small attention/MLP work.
+_VISION_REPLICATED_TP = (1, 0)
+
 # Below this image count the per-image loop beats the vectorized path (which has a
 # fixed setup cost; measured crossover ~6 on H20); both give the same result.
 _VECTORIZED_VL_POS_EMBED_MIN_IMAGES = 6
@@ -118,13 +137,21 @@ def _resolve_vision_tp(
         if tp_size is not None or tp_rank is not None:
             raise ValueError("Explicit vision TP cannot be combined with data parallel")
         return 1, 0
-    if (tp_size is None) != (tp_rank is None):
-        raise ValueError("Vision tp_size and tp_rank must be set together")
-    if tp_size is None:
-        parallel = get_parallel()
-        return parallel.attn_tp_size, parallel.attn_tp_rank
-    assert tp_rank is not None
-    return tp_size, tp_rank
+    # The vision tower always runs replicated per rank (see _VISION_REPLICATED_TP):
+    # its all-reduce sizes vary per image batch, which would repeatedly re-register
+    # NCCL size classes on the (possibly host-RAM) TP-communicator path mid-request,
+    # and it has no shape-independent cross-rank structure to exploit. Explicit
+    # overrides remain for callers/tests that need a specific shard.
+    if tp_size is not None and tp_rank is not None:
+        if tp_size != _VISION_REPLICATED_TP[0] or tp_rank != _VISION_REPLICATED_TP[1]:
+            logger.warning(
+                "Ignoring explicit vision tp_size=%s/tp_rank=%s: the Qwen3-VL "
+                "vision tower always runs replicated per rank (%s)",
+                tp_size,
+                tp_rank,
+                _VISION_REPLICATED_TP,
+            )
+    return _VISION_REPLICATED_TP
 
 
 class Qwen3_VisionMLP(nn.Module):
@@ -218,6 +245,8 @@ class Qwen3_VisionBlock(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        tp_size: Optional[int] = None,
+        tp_rank: Optional[int] = None,
         workspace_buffer: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
@@ -237,6 +266,8 @@ class Qwen3_VisionBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
             use_data_parallel=use_data_parallel,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
             use_dp_attention_reduce=is_dp_attention_enabled(),
             workspace_buffer=workspace_buffer,
         )
@@ -248,6 +279,8 @@ class Qwen3_VisionBlock(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
             use_data_parallel=use_data_parallel,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
         )
 
     def forward(
@@ -382,12 +415,19 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         self.out_hidden_size = merger_out_dim * (1 + len(self.deepstack_visual_indexes))
         self.patch_embed = Qwen3VLVisionPatchEmbed(config=vision_config)
         if self.pp_group.is_first_rank:
+            # Replicated per rank (tp_size=1): the vocab-parallel shard + TP
+            # all-reduce of this gather is the first collective of every ViT
+            # call, at a per-image-batch size class — the item that wedges the
+            # x1 host-RAM all-reduce host (see _VISION_REPLICATED_TP). With
+            # enable_tp=False VocabParallelEmbedding.forward localizes to a
+            # plain gather and skips the all-reduce entirely; the full table
+            # (a few MB — the full table is loaded on every rank) replaces the
+            # sharded one bit-exactly.
             self.pos_embed = VocabParallelEmbedding(
                 self.num_position_embeddings,
                 self.hidden_size,
                 quant_config=quant_config,
-                enable_tp=not use_data_parallel,
-                use_attn_tp_group=is_dp_attention_enabled() and not use_data_parallel,
+                enable_tp=False,
                 prefix=add_prefix("pos_embed", prefix),
             )
         else:
@@ -435,6 +475,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
                     use_data_parallel=use_data_parallel,
+                    tp_size=_VISION_REPLICATED_TP[0],
+                    tp_rank=_VISION_REPLICATED_TP[1],
                     workspace_buffer=workspace_buffer,
                 )
                 for layer_idx in range(vision_config.depth)
@@ -470,7 +512,9 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             ]
         )
 
-        self.tp_size = 1 if use_data_parallel else get_parallel().tp_size
+        # tp_size=1: the tower runs replicated per rank (see _VISION_REPLICATED_TP),
+        # so every attn-TP width computation below must use 1 as well.
+        self.tp_size = 1
         self.graph_runners = graph_runners_dict[self.device.type](self)
 
     @property
