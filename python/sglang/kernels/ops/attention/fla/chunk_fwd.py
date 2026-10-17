@@ -10,7 +10,6 @@ from sglang.kernels.ops.attention.fla.op import safe_exp
 from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
     is_tf32_supported,
-    scratch_slice,
 )
 from sglang.kernels.ops.attention.fla.wy_fast import recompute_w_u_fwd
 
@@ -347,7 +346,6 @@ def chunk_gated_delta_rule_fwd_intra(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
-    scratch: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""
     GDN intra-chunk forward: fused kkt + solve_tril + recompute_w_u.
@@ -375,10 +373,6 @@ def chunk_gated_delta_rule_fwd_intra(
             The chunk size. Default: 64.
         chunk_indices (torch.LongTensor):
             Precomputed chunk indices. Default: `None`.
-        scratch (dict):
-            Optional pre-allocated scratch buffers keyed by "A", "w", "u".
-            Each entry, when large enough (see scratch_slice), is reused as a
-            leading slice instead of a fresh allocation. Default: `None`.
 
     Returns:
         w (torch.Tensor): shape `[B, T, H, K]`
@@ -386,7 +380,6 @@ def chunk_gated_delta_rule_fwd_intra(
         A (torch.Tensor): shape `[B, T, H, BT]`, the solved (I+A)^{-1} matrix
     """
     B, T, Hg, K = k.shape
-    V = v.shape[-1]
     H = beta.shape[-1]
     BT = chunk_size
     BC = 16
@@ -396,11 +389,7 @@ def chunk_gated_delta_rule_fwd_intra(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     # Step 1: fused kkt + solve_tril
-    # The kernel writes every element of A exactly once, so a pre-allocated
-    # buffer holding stale data is safe to reuse (no read-modify-write).
-    A = scratch_slice(scratch, "A", (B, T, H, BT), k.dtype)
-    if A is None:
-        A = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
+    A = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
     chunk_gated_delta_rule_fwd_kkt_solve_kernel[(NT, B * H)](
         k=k,
         g=g,
@@ -417,8 +406,6 @@ def chunk_gated_delta_rule_fwd_intra(
     )
 
     # Step 2: recompute_w_u
-    w_scratch = scratch_slice(scratch, "w", (B, T, H, K), k.dtype)
-    u_scratch = scratch_slice(scratch, "u", (B, T, H, V), v.dtype)
     w, u = recompute_w_u_fwd(
         k=k,
         v=v,
@@ -427,7 +414,5 @@ def chunk_gated_delta_rule_fwd_intra(
         g_cumsum=g,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
-        w_scratch=w_scratch,
-        u_scratch=u_scratch,
     )
     return w, u, A

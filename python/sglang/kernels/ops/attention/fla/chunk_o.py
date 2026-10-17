@@ -10,11 +10,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.op import exp, safe_exp
-from sglang.kernels.ops.attention.fla.utils import (
-    check_shared_mem,
-    is_nvidia_hopper,
-    scratch_slice,
-)
+from sglang.kernels.ops.attention.fla.utils import check_shared_mem, is_nvidia_hopper
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
@@ -138,7 +134,6 @@ def chunk_fwd_o(
     scale: Optional[float] = None,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_size: int = 64,
-    scratch: Optional[dict] = None,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
@@ -150,11 +145,7 @@ def chunk_fwd_o(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    # The kernel writes every element of o exactly once, so a pre-allocated
-    # buffer holding stale data is safe to reuse (no read-modify-write).
-    o = scratch_slice(scratch, "o", (B, T, H, V), v.dtype)
-    if o is None:
-        o = torch.zeros_like(v)
+    o = torch.zeros_like(v)
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)

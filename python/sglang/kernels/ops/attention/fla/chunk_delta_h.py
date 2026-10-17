@@ -17,7 +17,6 @@ from sglang.kernels.ops.attention.fla.op import exp, exp2, safe_exp
 from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
     is_nvidia_hopper,
-    scratch_slice,
 )
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
@@ -364,7 +363,6 @@ def chunk_gated_delta_rule_fwd_h(
     inplace_update: bool = True,
     track_state: Optional[torch.Tensor] = None,
     track_chunk_idx: Optional[torch.Tensor] = None,
-    scratch: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert not (use_exp2 and g is not None), (
         "use_exp2 covers only the per-channel gk path; scalar g stays natural-exp"
@@ -395,18 +393,9 @@ def chunk_gated_delta_rule_fwd_h(
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
-    # The kernel writes every element of h / v_new exactly once, so
-    # pre-allocated buffers holding stale data are safe to reuse.
-    h = scratch_slice(scratch, "h", (B, NT, H, V, K), k.dtype)
-    if h is None:
-        h = k.new_empty(B, NT, H, V, K)
+    h = k.new_empty(B, NT, H, V, K)
 
-    if save_new_value:
-        v_new = scratch_slice(scratch, "v_new", (B, T, H, V), u.dtype)
-        if v_new is None:
-            v_new = torch.empty_like(u)
-    else:
-        v_new = None
+    v_new = torch.empty_like(u) if save_new_value else None
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)

@@ -254,11 +254,7 @@ def chunk_gated_delta_rule_fwd_intra(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
-    scratch: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # XPU variant: `scratch` is accepted for signature parity with the CUDA
-    # wrapper (chunk.py threads it unconditionally) but unused — the XPU
-    # kernels keep their fresh allocations.
     r"""
     GDN intra-chunk forward: fused kkt + solve_tril + recompute_w_u.
 
