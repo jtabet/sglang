@@ -3271,6 +3271,16 @@ class Scheduler(
             self.tree_cache.finish(
                 req.cache_request_handle, CacheRequestOutcome.ABORT
             )
+            # The gate's requeue bypasses release_kv_cache, whose no-KV
+            # branch frees the request's mamba slot; reset_for_retract()
+            # only nulls the index. Free it here or every trip leaks one
+            # mamba slot (2026-10-18 jade: mamba 19/20 after gate trips,
+            # the idle-leak check then killed the pod).
+            if req.kv.mamba_pool_idx is not None:
+                self.tree_cache.req_to_token_pool.mamba_allocator.free(
+                    req.kv.mamba_pool_idx.unsqueeze(-1)
+                )
+                req.kv.mamba_pool_idx = None
             req.reset_for_retract()
             self._add_request_to_queue(req)
         return False

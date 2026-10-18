@@ -1263,6 +1263,45 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             (FreeDeviceKV, FreeDeviceKVFullOnly, ReplaceWriteThroughOnNodeSplit),
         )
 
+    def _reverify_quarantined_node_on_insert(
+        self,
+        node: UnifiedTreeNode,
+        fresh_value: torch.Tensor,
+        step_actions: list,
+        session_id: Optional[str] = None,
+    ) -> None:
+        """Swap a quarantined store-load tail for the inserting request's
+        verified KV — the insert walk's counterpart of the match walk breaking
+        at ``external_load_pending`` nodes.
+
+        A gate trip / cancel leaves the node quarantined (owner cleared) with
+        load-target device slots the store never verified. If the insert
+        consumed them as an existing prefix while the match walk breaks there,
+        the two walks diverge and ``cache_unfinished_req``'s
+        ``new_prefix_len <= len(new_indices)`` invariant trips (2026-10-18
+        emerald crash, both TP ranks). The fresh KV is the only verified
+        content for the span: point the node at it, hand the unverified
+        slots back to L1, and clear the flag so every subsequent walk agrees.
+        """
+        ct = BASE_COMPONENT_TYPE
+        cd = node.component_data[ct]
+        old = cd.value
+        cd.value = fresh_value.clone()
+        node.external_load_pending = False
+        node.external_load_owner_rid = None
+        if old is not None and old.numel() > 0:
+            step_actions.append(FreeDeviceKV([old]))
+        # Span accounting is unchanged: the node held an n-token span before
+        # (the load targets) and holds an n-token span after (the fresh KV);
+        # only the tensor behind it is swapped and the old slots are freed.
+        self._update_evictable_leaf_sets(node)
+        self._update_duplicate_tracking(node)
+        if node.parent is not None:
+            self._update_evictable_leaf_sets(node.parent)
+        self.kv_events.record_store(
+            node, medium=StorageMedium.GPU, session_id=session_id
+        )
+
     def _insert_walk_step(self, state: _InsertWalkState) -> None:
         """Process one walked node, appending its barrier actions to the state."""
         key = state.key
@@ -1294,6 +1333,41 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             # FULL was restored from the request's fresh KV. Aux
             # components (e.g. SWA) may still hold tombstones and need
             # to rebuild their value from the same slice.
+            for component in self.components:
+                if component.component_type == BASE_COMPONENT_TYPE:
+                    continue
+                component.recover_after_unevict(
+                    node=node,
+                    prefix_len=prefix_len,
+                    total_prefix_len=state.total_prefix_length,
+                    params=state.params,
+                    result=state.result,
+                    cache_actions=step_actions,
+                )
+        elif node.external_load_pending and (
+            node.external_load_owner_rid != state.params.rid
+        ):
+            # Store-load quarantine the match walk refuses (failed/failed-
+            # cancelled tail, owner cleared): consuming it as an existing
+            # prefix here while the match walk breaks at the same node makes
+            # insert and match disagree for the same key — the divergence
+            # behind the 2026-10-18 emerald crash (new_prefix_len=11392,
+            # len(new_indices)=0 on both TP ranks). The fresh KV is the only
+            # verified content for this span: adopt it and clear the flag so
+            # every later walk agrees.
+            self._reverify_quarantined_node_on_insert(
+                node,
+                state.value[:prefix_len],
+                step_actions,
+                session_id=state.params.session_id,
+            )
+            state.result.record_adopted_range(
+                BASE_COMPONENT_TYPE,
+                state.total_prefix_length,
+                state.total_prefix_length + prefix_len,
+            )
+            # Aux components may hold tombstones for the replaced span; rebuild
+            # them from the same fresh slice, same as the unevict path.
             for component in self.components:
                 if component.component_type == BASE_COMPONENT_TYPE:
                     continue

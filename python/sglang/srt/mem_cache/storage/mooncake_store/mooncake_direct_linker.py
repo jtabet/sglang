@@ -497,9 +497,32 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if live:
                     try:
                         ready_event.synchronize()
-                        self.load_layer_wise(
-                            counter_index, list(live.values())
-                        )
+                        # Bounded retry: a transient store-side lease conflict
+                        # (the request's own concurrent write-through holds the
+                        # key's lease, ttl ~5s, 2026-10-18 emerald:
+                        # ~90 OBJECT_HAS_LEASE per batch seconds after its own
+                        # PutStart) surfaces as a short/None range-get and used
+                        # to fail the whole batch — converting a self-healing
+                        # race into a gate trip + quarantine + recompute
+                        # cascade. Retry a couple of times before giving up;
+                        # a genuinely missing key just wastes two cheap probes.
+                        for attempt in range(3):
+                            try:
+                                self.load_layer_wise(
+                                    counter_index, list(live.values())
+                                )
+                                break
+                            except BaseException as error:
+                                if attempt == 2:
+                                    raise
+                                logger.warning(
+                                    "Mooncake load batch %d attempt %d "
+                                    "failed (%s) — retrying",
+                                    counter_index,
+                                    attempt + 1,
+                                    error,
+                                )
+                                time.sleep(0.2 * (attempt + 1))
                     except BaseException as error:
                         load_error = error
                 if load_error is not None:

@@ -202,6 +202,14 @@ class UnifiedCacheLinkerWrapper:
         # Loading is skipped for these rids for their lifetime: recompute is
         # the always-correct fallback. Cleared by reset().
         self._load_failed: set[str] = set()
+        # Rids whose recompute fallback has been DECIDED rank-symmetrically (the
+        # unclaimed-mint branch below, or the MIN-reduced failed sentinel in
+        # _sync_restorable_prefix). Unlike _load_failed, this set is identical
+        # on every rank, so it may gate the store probe. It must NOT gate the
+        # restorable-prefix allreduce: match() still enters that collective
+        # unconditionally (suppressing only the local I/O keeps ranks in
+        # lockstep even if the sets were ever to diverge).
+        self._recompute_decided: set[str] = set()
         # rid -> consecutive unclaimed-mint count (tick-deterministic, rank-
         # symmetric by construction: one match call per scheduler tick per
         # rid on every rank). Reset each time the marker is claimed by
@@ -277,7 +285,15 @@ class UnifiedCacheLinkerWrapper:
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
-        restorable = self.cache_linker.lookup(req.rid, lookup_transfers)
+        # Skip the store probe once recompute is decided — this is what the
+        # fallback logs as "skipping future store probes". Suppressing only the
+        # local I/O (not the collective below) keeps the skip TP-symmetric even
+        # if the decided-set ever diverged: a rank that skips reports an empty
+        # restorable set, and the MIN intersection then yields 0 on all ranks.
+        if req.rid in self._recompute_decided:
+            restorable = []
+        else:
+            restorable = self.cache_linker.lookup(req.rid, lookup_transfers)
         logger.debug(
             "linker.match: rid=%s device_hit=%d key_len=%d tail_pages=%d "
             "restorable_count=%d restorable_first10=%s stats=%s",
@@ -321,7 +337,15 @@ class UnifiedCacheLinkerWrapper:
                 mint_count,
             )
             self._load_failed.add(req.rid)
+            self._recompute_decided.add(req.rid)
             self._mint_count.pop(req.rid, None)
+            # Retire the marker this decision abandons. Leaving it in place
+            # keeps has_hit(rid) True, so the next tick that re-exposes any
+            # host hit re-enters init_load_back -> load_back and restarts the
+            # loop for a rid already converted to recompute (the 2026-10-18
+            # 06:30 live-lock: stale marker + ~200 store probes/s + no prefill).
+            self.hit_markers.pop(req.rid, None)
+            self._mint_last_ts.pop(req.rid, None)
             return result
         self._mint_count[req.rid] = mint_count
         self._mint_last_ts[req.rid] = now
@@ -393,6 +417,7 @@ class UnifiedCacheLinkerWrapper:
             # next tick (recompute is the decided fallback fleet-wide).
             if rid:
                 self._load_failed.add(rid)
+                self._recompute_decided.add(rid)
             return 0
         common = mask[1:].nonzero()
         if common.numel() == 0:
@@ -558,6 +583,7 @@ class UnifiedCacheLinkerWrapper:
                 chunked=True,
                 priority=getattr(req, "priority", 0) or 0,
                 track_adopted_ranges=True,
+                rid=req.rid,
             )
         )
         if insert_result.mamba_exist:
@@ -855,6 +881,7 @@ class UnifiedCacheLinkerWrapper:
         self.cache_linker.reset()
         self.hit_markers.clear()
         self._load_failed.clear()
+        self._recompute_decided.clear()
         self._mint_count.clear()
         self._mint_last_ts.clear()
         self._release_pending_locks()
@@ -874,6 +901,7 @@ class UnifiedCacheLinkerWrapper:
         self.hit_markers.pop(rid, None)
         self._mint_count.pop(rid, None)
         self._mint_last_ts.pop(rid, None)
+        self._recompute_decided.discard(rid)
         self.cache.tree_core.clear_external_cache_load_pending_rid(rid)
         if self.cache_linker.cancel_queued_load(rid):
             # The load will never report completion through pop_completed_load

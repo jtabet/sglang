@@ -1000,6 +1000,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 priority=getattr(req, "priority", 0) or 0,
                 session_id=req.session_id,
                 rotation_base=req.kv_rotation_base,
+                rid=req.rid,
             )
 
             # components prepare insert data + return effective cache_len
@@ -1144,6 +1145,7 @@ class UnifiedRadixCache(BasePrefixCache):
             priority=getattr(req, "priority", 0) or 0,
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
+            rid=req.rid,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:

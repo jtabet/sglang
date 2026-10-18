@@ -262,13 +262,23 @@ try:
     from sglang.srt.mem_cache.base_prefix_cache import (
         InsertParams,
         MatchPrefixParams,
+        MatchResult,
     )
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
     from sglang.srt.mem_cache.radix_cache import RadixKey
+    from sglang.srt.mem_cache.unified_cache import unified_cache_linker
     from sglang.srt.mem_cache.unified_cache.components import (
         BASE_COMPONENT_TYPE,
         ComponentType,
+        ExternalLinkerLoadPhase,
+        LinkerTransferPhase,
     )
+    from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+        MINT_UNCLAIMED_MINTS,
+        UnifiedCacheLinkerWrapper,
+    )
+    from sglang.srt.mem_cache.unified_cache.cache_action import FreeDeviceKV
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
         UnifiedTreeCore,
         UnifiedTreeNode,
@@ -279,6 +289,14 @@ try:
 except Exception as error:  # sglang graph unimportable on this host
     _IMPORT_OK = False
     _IMPORT_ERROR = str(error)
+    # A dir-mode pytest pass can import a sibling test file that shadows
+    # sglang.srt.mem_cache, which fails the guarded import above even though
+    # every test here would be @skipUnless'd anyway. Bind a placeholder so the
+    # module-level class bodies (which name ComponentType at creation time)
+    # still evaluate; the placeholder is never used at runtime in that case.
+    globals().setdefault(
+        "ComponentType", type("ComponentTypePlaceholder", (), {"FULL": "FULL"})
+    )
 
 
 class _FakeReq:
@@ -516,6 +534,643 @@ class TestOwnerSeesOwnInFlightTail(unittest.TestCase):
         result = self._match(core, key, "rid-other")
         self.assertEqual(result.device_indices.numel(), 8)
         _strip_tail(core, key)
+
+
+class _LinkerStoreStandIn:
+    """External store stub for the mint-fallback lifecycle test."""
+
+    def __init__(self, restorable_pages):
+        self.restorable_pages = restorable_pages
+        self.lookup_calls = 0
+        self.queued_load_rids = []
+        self.stats = {"lookup": 0, "load": 0, "offload": 0}
+
+    def lookup(self, rid, transfers):
+        self.lookup_calls += 1
+        return list(range(1, self.restorable_pages + 1))
+
+    def load(self, rid, transfers):
+        self.queued_load_rids.append(rid)
+        return True
+
+
+class _LinkerComponentStandIn:
+    """Full-component stub: reports the tail, materializes one slot short."""
+
+    component_type = ComponentType.FULL
+
+    def __init__(self):
+        self.load_transfer_requests = 0
+
+    def build_external_linker_transfer(self, phase, node, keys):
+        if not keys:
+            return None
+        if phase == LinkerTransferPhase.LOOKUP:
+            return PoolTransfer(name=PoolName.KV, keys=list(keys))
+        if phase == LinkerTransferPhase.LOAD:
+            self.load_transfer_requests += 1
+            # One slot short of the claimed prefix: load_back's
+            # materialized < claimed guard aborts into recompute, which is
+            # exactly the branch that must not be re-entered after the
+            # unclaimed-mint fallback has decided on recompute.
+            return PoolTransfer(
+                name=PoolName.KV,
+                device_indices=torch.arange(len(keys) - 1, dtype=torch.int64),
+                keys=list(keys),
+            )
+        return None
+
+    def update_external_linker_load(
+        self, phase, req, full_transfer, transfer, prefix_len, **kwargs
+    ):
+        return None if phase == ExternalLinkerLoadPhase.ABORT else transfer
+
+
+class _LinkerWrapperCacheStandIn:
+    """Cache stub: the fields UnifiedCacheLinkerWrapper/load_back dereference."""
+
+    page_size = 1
+
+    def __init__(self, component, store):
+        self.tree_components = (ComponentType.FULL,)
+        self.components = {ComponentType.FULL: component}
+        self._components_tuple = (component,)
+        self.token_to_kv_pool_allocator = None
+        self.cache_linker = store
+        self.write_through_threshold = 1
+        self.all_reduce_calls = 0
+        self.tree_core = types.SimpleNamespace(
+            is_eagle=False,
+            enable_external_cache_linker=False,
+            empty_match_result=MatchResult(
+                device_indices=torch.empty(0, dtype=torch.int64),
+                last_device_node=None,
+                last_host_node=None,
+                best_match_node=None,
+            ),
+        )
+
+    def get_last_hash_value(self, node):
+        return "anchor-hash"
+
+    def _all_reduce_attn_groups(self, mask, op):
+        # Single-rank stand-in: a MIN/MAX over one participant is the identity.
+        self.all_reduce_calls += 1
+
+
+class _LinkerReqStandIn:
+    def __init__(self, rid):
+        self.rid = rid
+        self.last_node = None
+        self.prefix_indices = torch.empty(0, dtype=torch.int64)
+        self.kv = None
+
+
+@unittest.skipUnless(_IMPORT_OK, f"sglang imports unavailable: {_IMPORT_ERROR}")
+class TestUnclaimedMintFallback(unittest.TestCase):
+    """The mint fallback must retire the marker it decided to abandon.
+
+    Live-lock (emerald 2026-10-18 06:30:17 and 00:19:46): a request whose
+    prefix sits warm in the store mints a hit marker every tick, but admission
+    defers before ``init_load_back`` (the FULL pool cannot take the promised
+    span), so the marker is never claimed. Past ``MINT_UNCLAIMED_MINTS``
+    ``match`` converts the rid to recompute — but it leaves the marker in
+    ``hit_markers``, so ``has_hit(rid)`` stays True and every later tick where
+    the device tree re-exposes any host hit re-enters ``load_back`` on a rid
+    that was already decided. The request bounces ~200 store probes/s and
+    never prefills.
+    """
+
+    def _wrapper(self):
+        store = _LinkerStoreStandIn(restorable_pages=6)
+        component = _LinkerComponentStandIn()
+        cache = _LinkerWrapperCacheStandIn(component, store)
+        wrapper = UnifiedCacheLinkerWrapper(cache, store)
+        req = _LinkerReqStandIn("rid-unclaimed")
+        key = RadixKey(array("q", range(32)), "mint-fallback")
+        return store, component, cache, wrapper, req, key
+
+    def _match(self, wrapper, cache, key, req):
+        # The native hash extension is unavailable on CPU-only hosts; the
+        # storage hashes are opaque to this test's assertions.
+        with mock.patch.object(
+            unified_cache_linker,
+            "get_storage_hash_str",
+            lambda k, prior_hash=None, page_size=1: ["h"] * len(k),
+        ):
+            return wrapper.match(key, req, cache.tree_core.empty_match_result)
+
+    def test_fallback_retires_hit_marker(self):
+        store, component, cache, wrapper, req, key = self._wrapper()
+
+        for _ in range(MINT_UNCLAIMED_MINTS):
+            result = self._match(wrapper, cache, key, req)
+            self.assertEqual(result.host_hit_length, 6)
+            self.assertTrue(wrapper.has_hit(req.rid))
+
+        result = self._match(wrapper, cache, key, req)
+        self.assertEqual(result.host_hit_length, 0, "fallback promises no host hit")
+        self.assertIn(req.rid, wrapper._load_failed)
+        self.assertFalse(
+            wrapper.has_hit(req.rid),
+            "the abandoned marker must be retired: a stale marker keeps "
+            "has_hit() True and re-arms init_load_back for a rid already "
+            "decided to recompute (the 06:30 live-lock)",
+        )
+        self.assertNotIn(req.rid, wrapper.hit_markers)
+        self.assertNotIn(req.rid, wrapper._mint_last_ts)
+
+    def test_fallback_stops_store_probes(self):
+        store, component, cache, wrapper, req, key = self._wrapper()
+        for _ in range(MINT_UNCLAIMED_MINTS + 1):
+            self._match(wrapper, cache, key, req)
+        self.assertIn(req.rid, wrapper._load_failed)
+
+        probes_before = store.lookup_calls
+        for _ in range(3):
+            self._match(wrapper, cache, key, req)
+        # `_load_failed` only zeroes hit_pages; the probe runs before it. The
+        # fallback's promise to "skip future store probes" therefore holds only
+        # if the marker/tail state stops the rid from reaching lookup again.
+        self.assertEqual(
+            store.lookup_calls - probes_before,
+            0,
+            "fallback promised no further store probes for this rid",
+        )
+
+    def test_fallback_blocks_load_back_reentry(self):
+        store, component, cache, wrapper, req, key = self._wrapper()
+        for _ in range(MINT_UNCLAIMED_MINTS + 1):
+            self._match(wrapper, cache, key, req)
+        self.assertIn(req.rid, wrapper._load_failed)
+
+        indices, node = wrapper.load_back(req)
+        # A retired marker means init_load_back's has_hit() gate is closed:
+        # load_back is a no-op and the request prefills from its device prefix.
+        self.assertEqual(indices.numel(), 0)
+        self.assertEqual(
+            component.load_transfer_requests,
+            0,
+            "a rid already converted to recompute must not allocate slots or "
+            "queue another store load",
+        )
+        self.assertEqual(store.queued_load_rids, [])
+
+
+class RecordingAllocator:
+    """Allocator stand-in that records free_segment calls for leak tests."""
+
+    def __init__(self):
+        self.freed = set()
+
+    def free_segment(self, indices, start_pos=0):
+        for i in indices.tolist():
+            self.freed.add(int(i))
+
+
+class _InsertCapableFullComponent(_StandInFullComponent):
+    """Full-component stub that also tolerates the insert hooks.
+
+    ``TestOwnerSeesOwnInFlightTail`` builds its tail by hand (no insert), so the
+    stand-in there only implements the match protocol. The emerald regression
+    below must drive a *real* insert (that is where the divergence is produced),
+    so extend the stub with the hooks the insert walk calls.
+    """
+
+    def __init__(self, fake_cache):
+        super().__init__(fake_cache)
+        self.cache = fake_cache
+        self._alloc = RecordingAllocator()
+
+    def free_segment(self, indices, start_pos=0):
+        # RecordingAllocator passthrough (the free path consults this stub).
+        for i in indices.tolist():
+            self._alloc.freed.add(int(i))
+
+    def update_component_on_insert_overlap(self, **kwargs):
+        # Full takes ownership of every overlapping slot it already holds.
+        return kwargs["prefix_len"]
+
+    def commit_insert_component_data(self, **kwargs):
+        return None
+
+    def needs_incremental_backup(self, node):
+        return False
+
+    def recover_after_unevict(self, **kwargs):
+        return None
+
+
+@unittest.skipUnless(_IMPORT_OK, f"sglang imports unavailable: {_IMPORT_ERROR}")
+class TestQuarantinedTailInsertDivergence(unittest.TestCase):
+    """Reproduce the emerald 2026-10-18 07:08 crash at the tree level.
+
+    Emerald chain: the pre-forward load gate tripped (store stalled, 480 s),
+    cancelled the rid's queued load and ``mark_external_cache_load_quarantined``
+    cleared the owner; the request was retracted (``reset_for_retract``) and
+    requeued. On re-admission it re-inserted its own prefix — and the insert
+    walk found the *already existing* quarantined node, kept it (updating it in
+    place) instead of creating a fresh matchable leaf. ``insert`` therefore
+    reported the full ``prefix_len`` while ``match_prefix`` stopped at the
+    quarantine and returned 0 device indices, tripping
+
+        assert new_prefix_len <= len(new_indices)   # 11392 <= 0
+
+    In ``cache_unfinished_req`` (unified_radix_cache.py:1222), which SIGQUITs
+    both TP ranks. These tests pin the two halves of that contract: the match
+    walk must stop at a quarantined node, and the insert walk must agree with
+    it — otherwise the pair is internally inconsistent and the assert fires.
+    """
+
+    def _core(self):
+        return UnifiedTreeCore(
+            _FakeCache(), {ComponentType.FULL: _InsertCapableFullComponent(None)}
+        )
+
+    @staticmethod
+    def _pump(core, params):
+        """Run an insert the way UnifiedRadixCache.insert pumps the walk."""
+        step = core.begin_insert(params)
+        while step.result is None:
+            step = core.resume_insert()
+        core.end_insert()
+        return step.result
+
+    @staticmethod
+    def _pump_and_apply(core, alloc, params):
+        """Run an insert exactly the way UnifiedRadixCache.insert does: apply
+        each step's barrier actions (FreeDeviceKV -> allocator) and drain the
+        tail. The adoption test asserts on the freed slots."""
+        step = core.begin_insert(params)
+        while True:
+            for action in step.actions:
+                if isinstance(action, FreeDeviceKV):
+                    for indices in action.indices:
+                        alloc.free_segment(indices, start_pos=0)
+            if step.result is not None:
+                for action in core.end_insert():
+                    if isinstance(action, FreeDeviceKV):
+                        for indices in action.indices:
+                            alloc.free_segment(indices, start_pos=0)
+                return step.result
+            step = core.resume_insert()
+
+    def _key(self, tokens):
+        return RadixKey(array("q", [10**9 + i for i in range(tokens)]), "emerald")
+
+    def test_insert_reuses_quarantined_node_and_diverges_from_match(self):
+        """Pre-fix shape (rid-less insert), kept as a walk-behavior pin.
+
+        Without a rid on InsertParams the walk cannot tell whose load the
+        quarantined tail was, so it conservatively keeps its pre-fix
+        behavior: reuse the node in place, leave the flag set. The
+        production paths (cache_unfinished_req / cache_finished_req /
+        linker.load_back) all carry rid, and land on the FIXED contract in
+        test_insert_adopts_quarantined_tail_from_fresh_kv below. If either
+        walk's shape changes, both tests must be re-reconciled or the
+        assert class reopens.
+        """
+        core = self._core()
+        key = self._key(8)
+        first = self._pump(
+            core, InsertParams(key=key, value=torch.arange(8, dtype=torch.int64))
+        )
+        self.assertEqual(first.prefix_len, 0)
+        tail = core.node_by_id(first.last_device_node)
+
+        # Gate trip: cancel_queued_load + mark_external_cache_load_quarantined.
+        core.mark_external_cache_load_pending_path(tail.id, "rid-emerald")
+        core.mark_external_cache_load_quarantined(tail.id)
+        self.assertTrue(tail.external_load_pending)
+        self.assertIsNone(tail.external_load_owner_rid)
+
+        matched = core.match_prefix(
+            MatchPrefixParams(key=key, req=_FakeReq("rid-emerald"))
+        )
+        self.assertEqual(
+            matched.device_indices.numel(),
+            0,
+            "a quarantined tail must never be matched, even by its ex-owner",
+        )
+
+        again = self._pump(
+            core, InsertParams(key=key, value=torch.arange(100, 108, dtype=torch.int64))
+        )
+        self.assertEqual(
+            again.prefix_len,
+            8,
+            "the insert walk reuses the quarantined node and reports the whole "
+            "prefix as inserted",
+        )
+        self.assertGreater(
+            again.prefix_len,
+            matched.device_indices.numel(),
+            "insert prefix_len must stay <= match device span; the emerald "
+            "assert (new_prefix_len <= len(new_indices)) encodes exactly this",
+        )
+        # The reused node is still quarantined: the insert did not clear the
+        # flag, so the divergence persists across ticks (no self-healing).
+        self.assertTrue(tail.external_load_pending)
+        self.assertIsNone(tail.external_load_owner_rid)
+
+    def test_insert_adopts_quarantined_tail_from_fresh_kv(self):
+        """The FIXED contract (the production rid-carrying shape).
+
+        With the request's rid on InsertParams, a quarantined node the
+        request does not own must be ADOPTED from the request's fresh KV:
+        the node's value is replaced by the fresh slots, the unverified
+        load-target slots are freed, the flag clears, and every later walk
+        (match included) sees a verified, matchable node — so
+        cache_unfinished_req's new_prefix_len <= len(new_indices) holds.
+        """
+        core = self._core()
+        alloc = RecordingAllocator()
+        core.token_to_kv_pool_allocator = alloc
+        key = self._key(8)
+        first = self._pump(
+            core, InsertParams(key=key, value=torch.arange(8, dtype=torch.int64))
+        )
+        tail = core.node_by_id(first.last_device_node)
+        old_slots = tail.component_data[ComponentType.FULL].value.clone()
+
+        core.mark_external_cache_load_pending_path(tail.id, "rid-emerald")
+        core.mark_external_cache_load_quarantined(tail.id)
+        self.assertTrue(tail.external_load_pending)
+
+        matched = core.match_prefix(
+            MatchPrefixParams(key=key, req=_FakeReq("rid-emerald"))
+        )
+        self.assertEqual(matched.device_indices.numel(), 0)
+
+        fresh = torch.arange(100, 108, dtype=torch.int64)
+        again = self._pump_and_apply(core, alloc, InsertParams(key=key, value=fresh.clone(), rid="rid-emerald"))
+        self.assertEqual(again.prefix_len, 8)
+        self.assertFalse(
+            tail.external_load_pending,
+            "the adoption must clear the quarantine: the fresh KV re-verified "
+            "the span, so later walks must agree with the insert",
+        )
+
+        rematched = core.match_prefix(
+            MatchPrefixParams(key=key, req=_FakeReq("rid-emerald"))
+        )
+        self.assertEqual(
+            rematched.device_indices.numel(),
+            8,
+            "after adoption the match must return the full span — otherwise "
+            "cache_unfinished_req's assert (new_prefix_len=11392, "
+            "len(new_indices)=0) reopens",
+        )
+        # The unverified load-target slots must have been handed back.
+        freed = core.token_to_kv_pool_allocator.freed
+        self.assertTrue(
+            set(old_slots.tolist()).issubset(freed),
+            "adoption must free the old load-target slots (got freed=%r, "
+            "old=%r)" % (freed, old_slots.tolist()),
+        )
+
+    def test_adoption_only_for_unowned_quarantine(self):
+        """Owner-threading preserved: the ex-owner's own re-insert over its
+        in-flight tail is NOT an adoption (its load is still in flight; the
+        match walk threads the owner through, so insert must agree by
+        consuming). Regression guard for the fix's ownership test."""
+        core = self._core()
+        key = self._key(8)
+        first = self._pump(
+            core, InsertParams(key=key, value=torch.arange(8, dtype=torch.int64))
+        )
+        tail = core.node_by_id(first.last_device_node)
+        core.mark_external_cache_load_pending_path(tail.id, "rid-owner")
+        self.assertIsNotNone(tail.external_load_owner_rid)
+
+        # Owner's own in-flight tail: rid matches -> consume, no adoption.
+        again = self._pump(
+            core,
+            InsertParams(key=key, value=torch.arange(100, 108, dtype=torch.int64), rid="rid-owner"),
+        )
+        self.assertEqual(again.prefix_len, 8)
+        self.assertIsNotNone(
+            tail.external_load_owner_rid,
+            "the owner's insert must not clear its own in-flight marker",
+        )
+
+    def test_insert_does_not_clear_the_quarantine_flag(self):
+        """A quarantined node keeps its flag through an overlapping insert.
+
+        The insert walk's overlap branch updates an existing node in place
+        (``_insert_walk_step``) and never touches the external-load flags. So a
+        requeued request cannot heal the tree by re-inserting, which is why the
+        emerald loop repeated until the assert instead of recovering.
+        """
+        core = self._core()
+        key = self._key(8)
+        first = self._pump(
+            core, InsertParams(key=key, value=torch.arange(8, dtype=torch.int64))
+        )
+        tail = core.node_by_id(first.last_device_node)
+        core.mark_external_cache_load_quarantined(tail.id)
+
+        for _ in range(3):
+            self._pump(
+                core,
+                InsertParams(
+                    key=key, value=torch.arange(100, 108, dtype=torch.int64)
+                ),
+            )
+            self.assertTrue(
+                tail.external_load_pending,
+                "re-inserting over a quarantined tail must not clear its flag "
+                "(the slots are still unverified)",
+            )
+            matched = core.match_prefix(
+                MatchPrefixParams(key=key, req=_FakeReq("rid-emerald"))
+            )
+            self.assertEqual(matched.device_indices.numel(), 0)
+
+    def test_prepend_shaped_match_after_quarantine_is_empty(self):
+        """The exact emerald shape: whole prefix carried by one node.
+
+        Emerald's node spanned the request's entire 11392-token prefix
+        (89 pages), so a match after the quarantine returns zero indices while
+        the re-insert reports 11392. Reproduce with a single-node prefix and
+        assert both halves of the pair, so the numbers in the report are pinned.
+        """
+        core = self._core()
+        page = 128
+        pages = 3
+        tokens = page * pages
+        key = self._key(tokens)
+        first = self._pump(
+            core,
+            InsertParams(
+                key=key, value=torch.arange(tokens, dtype=torch.int64)
+            ),
+        )
+        tail = core.node_by_id(first.last_device_node)
+        core.mark_external_cache_load_pending_path(tail.id, "rid-emerald")
+        core.mark_external_cache_load_quarantined(tail.id)
+
+        matched = core.match_prefix(
+            MatchPrefixParams(key=key, req=_FakeReq("rid-emerald"))
+        )
+        self.assertEqual(matched.device_indices.numel(), 0)
+
+        again = self._pump(
+            core,
+            InsertParams(
+                key=key,
+                value=torch.arange(1000, 1000 + tokens, dtype=torch.int64),
+            ),
+        )
+        self.assertEqual(again.prefix_len, tokens)
+        self.assertEqual(
+            (again.prefix_len, matched.device_indices.numel()),
+            (tokens, 0),
+            "the emerald assert fires with (new_prefix_len, len(new_indices)) "
+            "= (11392, 0) in production; this is that pair in miniature",
+        )
+
+
+class _BudgetAllocatorStandIn:
+    """Allocator stub for PrefillBudget: reports a fixed free/evictable pool."""
+
+    page_size = 128
+
+    def __init__(self, available_tokens):
+        self._available = available_tokens
+
+    def available_size(self):
+        return self._available
+
+
+class _BudgetTreeStandIn:
+    def __init__(self, evictable_tokens):
+        self._evictable = evictable_tokens
+
+    def supports_mamba(self):
+        return True
+
+    def full_evictable_size(self):
+        return self._evictable
+
+
+@unittest.skipUnless(_IMPORT_OK, f"sglang imports unavailable: {_IMPORT_ERROR}")
+class TestFullPoolAdmissionDeadlock(unittest.TestCase):
+    """Jade 2026-10-18 08:15: the request could never be admitted.
+
+    The request's prefix (1448 pages = 185344 tokens) is fully restorable from
+    the store, but the full pool cannot hold the request's *whole* prefill plus
+    its decode headroom:
+
+        available 77312 + evictable 112000 = remaining_total 189312
+        prefix 185344 + CLIP_MAX_NEW_TOKENS 4096 + page_size 128 = 189568
+
+    189568 > 189312, so ``PrefillBudget.check_prefill`` returns NO_TOKEN on
+    every tick, forever: admission defers *before* ``init_load_back``
+    (schedule_policy.py:1208-1218), so the hit marker is never claimed, and the
+    load-back never runs to shrink the prefill. This test pins that arithmetic
+    — including that the gap is smaller than the decode-headroom reservation,
+    so no amount of store health fixes it.
+    """
+
+    CLIP_MAX_NEW_TOKENS = 4096  # SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION default
+
+    def _budget(self, available, evictable):
+        from sglang.srt.mem_cache.prefill_budget import PrefillBudget
+
+        return PrefillBudget(
+            _BudgetAllocatorStandIn(available), _BudgetTreeStandIn(evictable)
+        )
+
+    def test_jade_admission_is_arithmetically_impossible(self):
+        budget = self._budget(available=77312, evictable=112000)
+        page = budget.page_size
+        prefix = 1448 * page
+
+        self.assertEqual(prefix, 185344)
+        self.assertEqual(budget.remaining_total, 189312)
+
+        total_tokens = prefix + self.CLIP_MAX_NEW_TOKENS + page
+        self.assertEqual(total_tokens, 189568)
+        self.assertGreater(
+            total_tokens,
+            budget.remaining_total,
+            "jade's total_tokens exceeded remaining_total, so check_prefill "
+            "could only ever return NO_TOKEN",
+        )
+
+        charge = total_tokens
+        can_admit, chunk_limit = budget.check_prefill(
+            extend_input_len=prefix,
+            total_tokens=charge,
+            max_new_tokens=self.CLIP_MAX_NEW_TOKENS,
+            input_tokens=prefix,
+            swa_host_hit_length=0,
+            chunk_limit=None,
+        )
+        self.assertFalse(can_admit)
+        self.assertIsNone(chunk_limit)
+
+    def test_deadlock_depends_on_decode_headroom_not_prompt_size(self):
+        """The prompt alone fits; the decode reservation is what kills it.
+
+        This is why the fix must not be "wait for the store": the store was
+        healthy (every lookup hit), and the pool balance was exact. Only the
+        reservation of ``CLIP_MAX_NEW_TOKENS`` of decode headroom pushed the
+        request over. A chunked admission that defers the headroom reservation
+        until after the load-back would break the tie.
+        """
+        budget = self._budget(available=77312, evictable=112000)
+        page = budget.page_size
+        prefix = 1448 * page
+
+        # Prompt alone (plus page-alignment slack) does fit.
+        self.assertLess(prefix + page, budget.remaining_total)
+        # ...but with the decode reservation it does not.
+        self.assertGreater(
+            prefix + self.CLIP_MAX_NEW_TOKENS + page, budget.remaining_total
+        )
+
+    def test_marker_cannot_be_retired_because_load_back_is_unreachable(self):
+        """The load-path fix cannot help: admission never reaches it.
+
+        ``linker.match`` mints the marker, then ``add_one_req`` returns
+        NO_TOKEN before ``init_load_back`` — so ``load_back`` never pops the
+        marker and the unclaimed-mint fallback is the ONLY route out. With
+        MINT_UNCLAIMED_MINTS ticks the fallback does fire (it converts the rid
+        to recompute, host_hit_length -> 0), which is what makes the
+        marker-retirement fix load-bearing: without retiring the retired
+        marker, ``has_hit`` stays True and the next tick re-arms the loop.
+        """
+        budget = self._budget(available=77312, evictable=112000)
+        prefix = 1448 * budget.page_size
+        # Admission verdict is NO_TOKEN at the *promised* host hit.
+        charge = prefix + self.CLIP_MAX_NEW_TOKENS + budget.page_size
+        can_admit, _ = budget.check_prefill(
+            extend_input_len=prefix,
+            total_tokens=charge,
+            max_new_tokens=self.CLIP_MAX_NEW_TOKENS,
+            input_tokens=prefix,
+            swa_host_hit_length=0,
+            chunk_limit=None,
+        )
+        self.assertFalse(can_admit)
+        # With the hit withdrawn (recompute fallback: host_hit_length 0) the
+        # request still cannot fit its full prefix in one chunk...
+        charge = prefix + self.CLIP_MAX_NEW_TOKENS + budget.page_size
+        can_admit_recompute, _ = budget.check_prefill(
+            extend_input_len=prefix,
+            total_tokens=charge,
+            max_new_tokens=self.CLIP_MAX_NEW_TOKENS,
+            input_tokens=prefix,
+            swa_host_hit_length=0,
+            chunk_limit=None,
+        )
+        self.assertFalse(
+            can_admit_recompute,
+            "the fallback alone does not make this request fit; it only stops "
+            "the store-probe storm (the chunked path then admits part of it)",
+        )
 
 
 if __name__ == "__main__":

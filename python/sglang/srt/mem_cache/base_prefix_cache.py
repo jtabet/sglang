@@ -96,6 +96,16 @@ class InsertParams:
     session_id: Optional[str] = None
     track_adopted_ranges: bool = False
 
+    # The request this insert belongs to. The tree's insert walk uses it to
+    # tell a node's OWN in-flight store-load tail apart from a failed/
+    # cancelled tail: the owner's re-anchoring consumes the span (the match
+    # walk threads the owner through), but a quarantined node nobody owns
+    # must be adopted from the inserting request's fresh KV, not consumed --
+    # otherwise insert and match report different prefix lengths for the
+    # same key (2026-10-18 emerald crash: new_prefix_len=11392,
+    # len(new_indices)=0).
+    rid: Optional[str] = None
+
     # Logical-page KV sharding: rotation base of the chain the inserted
     # values belong to (stamped onto new tree nodes; None when sharding is
     # off). See UnifiedTreeNode.rotation_base.
