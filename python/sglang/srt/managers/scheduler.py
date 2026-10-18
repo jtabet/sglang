@@ -212,6 +212,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     retract_all,
 )
+from sglang.srt.beam_search.fork import free_member_rows
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
@@ -220,6 +221,7 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.oom_guard import plan_oom_shed
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
     DynamicChunkSizer,
@@ -1327,6 +1329,9 @@ class Scheduler(
             self.chunked_prefill_size = None
         self.chunked_req = None
         self._pending_chunked_abort_req = None
+        # rid -> consecutive OOM-shed strikes; a shed request that gets
+        # admitted clears its entry (hard-shed at SGLANG_OOM_SHED_MAX_STRIKES).
+        self.oom_shed_strikes: dict = {}
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
@@ -1939,7 +1944,14 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                result = self.run_batch(batch)
+                try:
+                    result = self.run_batch(batch)
+                except torch.OutOfMemoryError:
+                    # The gate is off/missed and the forward OOM'd. The
+                    # backstop recovers in place on a single TP rank and
+                    # re-raises on a TP group (a live peer would
+                    # desynchronize).
+                    result = self._shed_batch_on_forward_oom(batch)
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
@@ -1999,7 +2011,11 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                batch_result = self.run_batch(batch)
+                try:
+                    batch_result = self.run_batch(batch)
+                except torch.OutOfMemoryError:
+                    # Same backstop as the normal loop (see there).
+                    batch_result = self._shed_batch_on_forward_oom(batch)
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
@@ -4356,6 +4372,158 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
+    def _min_device_free_mb_across_tp(self) -> float:
+        """Real device free memory (MB), min'd across the TP group.
+
+        Uses the CPU (gloo) group so the check stays sound even while the
+        CUDA context is under memory pressure. Ranks schedule the same
+        batch (replicated scheduler), so min-ing real free memory makes the
+        gate decision rank-symmetric: no rank can enter the forward and OOM
+        while a peer does not.
+        """
+        free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024)
+        if self.ps.tp_size > 1 and self.tp_cpu_group is not None:
+            world = torch.distributed.get_world_size(group=self.tp_cpu_group)
+            gathered = [torch.empty(1, dtype=torch.float64) for _ in range(world)]
+            local = torch.tensor([free_mb], dtype=torch.float64)
+            torch.distributed.all_gather(
+                gathered, local, group=self.tp_cpu_group
+            )
+            free_mb = min(t.item() for t in gathered)
+        return free_mb
+
+    def _shed_batch_for_oom(
+        self, batch: ScheduleBatch, *, free_mb: float, cause: str
+    ) -> GenerationBatchResult:
+        """Symmetrically shed a batch that cannot fit in device memory.
+
+        Releases every live request (KV freed; the decode-rebootstrap offload
+        is a no-op in non-disagg mode), requeues the survivors, and hard-sheds
+        (503) the ones past the strike cap or that cannot be retracted (beam).
+        The batch is emptied in place so the event loop idles this iteration;
+        callers return the default result for it. Requests that already
+        finished are left for the *previous* batch's result processing to
+        free — freeing them here too would double-free the pool.
+        """
+        all_reqs = list(batch.reqs) + list(batch.decoding_reqs or [])
+        plan = plan_oom_shed(
+            rids=[r.rid for r in all_reqs],
+            finished_rids={r.rid for r in all_reqs if r.finished()},
+            beam_rids={r.rid for r in all_reqs if r.beam_group is not None},
+            strikes=self.oom_shed_strikes,
+        )
+        self.oom_shed_strikes = plan.post_stripes
+        requeue_rids, abort_rids = set(plan.requeue_rids), set(plan.abort_rids)
+        requeued = []
+        for req in all_reqs:
+            if req.finished():
+                continue
+            if req.rid in abort_rids:
+                req.to_finish = FINISH_ABORT(
+                    f"OOM-shed: request cannot be served while device "
+                    f"memory is exhausted (min device free {free_mb:.0f} MB). "
+                    "Retry later or shorten the context.",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    _make_abort_req(req, finished_reason=req.to_finish.to_json()),
+                    req,
+                )
+                if req.beam_group is not None:
+                    self.beam_coordinator.retire_group(req)
+            elif req.rid in requeue_rids:
+                requeued.append(req)
+        # Beam member rows must be freed before the leader's KV release
+        # (mirrors ScheduleBatch.retract_decode).
+        for req in (r for r in all_reqs if not r.finished() and r.beam_group):
+            free_member_rows(
+                req.beam_group,
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator,
+            )
+        live_reqs = [r for r in all_reqs if not r.finished()]
+        if live_reqs:
+            retract_all(
+                reqs=live_reqs,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tree_cache=self.tree_cache,
+                hisparse_coordinator=self.hisparse_coordinator,
+                offload_kv=False,
+            )
+        for req in requeued:
+            self._add_request_to_queue(req, is_retracted=True)
+        # Chunked bookkeeping: the mid-chunk request was released like any
+        # other live request; the next iteration re-admits it fresh.
+        if (
+            batch.forward_mode.is_extend()
+            and self.chunked_req is not None
+            and self.disaggregation_mode != DisaggregationMode.PREFILL
+        ):
+            self.chunked_req = None
+        batch.reqs = []
+        batch.decoding_reqs = []
+        batch.batch_is_full = False
+        logger.warning(
+            "OOM-GUARD shed (%s): mode=%s #reqs=%d requeued=%d aborted=%d "
+            "min_free_mb=%.0f",
+            cause,
+            batch.forward_mode,
+            len(all_reqs),
+            len(requeued),
+            len(abort_rids),
+            free_mb,
+        )
+        return GenerationBatchResult()
+
+    def _shed_batch_on_forward_oom(
+        self, batch: ScheduleBatch
+    ) -> GenerationBatchResult:
+        """Last-resort OOM handling: the forward itself OOM'd (the
+        pre-forward gate is off or missed).
+
+        With a single TP rank the failure is local: sync the device, drop
+        the failed forward's allocations, shed the batch, and keep serving.
+
+        With a TP group the failure is not recoverable in place: this rank
+        stopped entering collectives mid-forward while its peer did not, so
+        any continuation would desynchronize the NCCL streams (silent
+        garbage or a hang until the watchdog). Log the diagnostic and
+        re-raise so the process takes the normal crash/restart path.
+        """
+        free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024)
+        if self.ps.tp_size > 1:
+            logger.error(
+                "OOM-GUARD FATAL: forward OOM on tp_rank %d/%d (device free "
+                "%.0f MB, mode=%s, #reqs=%d, #extend_tokens=%d). Not "
+                "recoverable in place with a live TP peer; re-raising.",
+                self.ps.tp_rank,
+                self.ps.tp_size,
+                free_mb,
+                batch.forward_mode,
+                len(batch.reqs),
+                getattr(batch, "extend_num_tokens", 0),
+                exc_info=True,
+            )
+            raise
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        torch.cuda.empty_cache()
+        free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024)
+        logger.error(
+            "OOM-GUARD catch (tp_size=1): forward OOM recovered; shedding "
+            "batch mode=%s #reqs=%d; free %.0f MB after empty_cache.",
+            batch.forward_mode,
+            len(batch.reqs),
+            free_mb,
+            exc_info=True,
+        )
+        return self._shed_batch_for_oom(
+            batch, free_mb=free_mb, cause="forward-catch"
+        )
+
     @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
     def run_batch(
         self,
@@ -4391,6 +4559,24 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             for req in batch.reqs:
                 self.maybe_send_cached_prefix_chunk(req)
+
+        # Pre-forward OOM gate: when the threshold is set, the min real
+        # device free memory across the TP group decides rank-symmetrically
+        # whether this batch may enter the forward. On a miss the batch is
+        # shed (released + requeued, hard-shed at the strike cap) and the
+        # loop idles this iteration; admitting the batch clears any strikes.
+        oom_guard_mb = envs.SGLANG_OOM_GUARD_MIN_FREE_MB.get()
+        if (
+            oom_guard_mb is not None
+            and is_cuda()
+            and len(batch.reqs) > 0
+            and not batch.forward_mode.is_idle()
+        ):
+            free_mb = self._min_device_free_mb_across_tp()
+            if free_mb < oom_guard_mb:
+                return self._shed_batch_for_oom(batch, free_mb=free_mb, cause="gate")
+            for req in batch.reqs:
+                self.oom_shed_strikes.pop(req.rid, None)
 
         # Run forward
         if self.is_generation:
@@ -4790,6 +4976,15 @@ class Scheduler(
             force=batch.forward_mode.is_extend(),
             snapshot=snapshot,
         )
+
+        if batch.is_empty():
+            # The OOM guard shed this batch before its forward: every
+            # request was released and requeued (or hard-shed to the
+            # client at the strike cap), so no output exists to process.
+            # Keep the housekeeping other busy iterations rely on.
+            self.tree_cache.flush_pending_backups()
+            self.maybe_send_health_check_signal()
+            return
 
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)

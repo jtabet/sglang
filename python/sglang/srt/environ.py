@@ -606,6 +606,14 @@ class Envs:
     # tokens, so a prefill batch runs exactly chunked_prefill_size and the dense
     # GEMMs get an aligned M. gfx95 only; see PrefillAdder.exact_chunk_fill.
     SGLANG_EXACT_CHUNK_FILL = EnvBool(True)
+    # OOM guard: pre-forward gate sheds a batch when real device free memory
+    # (min'd across the TP group, MB) drops below this threshold. None (the
+    # default) leaves the gate off; the mid-forward OOM backstop stays active
+    # regardless.
+    SGLANG_OOM_GUARD_MIN_FREE_MB = EnvInt(None)
+    # A request shed that many times without fitting is hard-shed to the
+    # client (503) instead of looping the waiting queue forever.
+    SGLANG_OOM_SHED_MAX_STRIKES = EnvInt(3)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output
