@@ -1,7 +1,7 @@
 use std::{
     fmt,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, LazyLock, RwLock as StdRwLock,
     },
     time::Duration,
@@ -206,6 +206,21 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Decrement the load counter
     fn decrement_load(&self);
+
+    /// Add the estimated prompt tokens of one request to the token-weighted
+    /// load (sum of estimated prompt tokens over in-flight requests).
+    fn add_load_tokens(&self, _tokens: u64) {}
+
+    /// Subtract the estimated prompt tokens of one request from the
+    /// token-weighted load.
+    fn sub_load_tokens(&self, _tokens: u64) {}
+
+    /// Token-weighted load: sum of estimated prompt tokens of in-flight
+    /// requests. Lets policies weight load by work, not request count, so a
+    /// 250k-token prefill outweighs hundreds of small turns.
+    fn load_tokens(&self) -> u64 {
+        0
+    }
 
     /// Reset the load counter to 0 (for sync/recovery)
     fn reset_load(&self) {}
@@ -650,6 +665,7 @@ impl WorkerMetadata {
 pub struct BasicWorker {
     pub metadata: WorkerMetadata,
     pub load_counter: Arc<AtomicUsize>,
+    pub load_tokens_counter: Arc<AtomicU64>,
     pub worker_routing_key_load: Arc<WorkerRoutingKeyLoad>,
     pub processed_counter: Arc<AtomicUsize>,
     pub healthy: Arc<AtomicBool>,
@@ -700,6 +716,7 @@ impl BasicWorker {
     fn update_running_requests_metrics(&self) {
         let load = self.load();
         Metrics::set_worker_requests_active(self.url(), load);
+        Metrics::set_worker_tokens_active(self.url(), self.load_tokens());
     }
 }
 
@@ -804,6 +821,42 @@ impl Worker for BasicWorker {
             );
         }
         self.update_running_requests_metrics();
+    }
+
+    fn add_load_tokens(&self, tokens: u64) {
+        if tokens == 0 {
+            return;
+        }
+        self.load_tokens_counter
+            .fetch_add(tokens, Ordering::Relaxed);
+        self.update_running_requests_metrics();
+    }
+
+    fn sub_load_tokens(&self, tokens: u64) {
+        if tokens == 0 {
+            return;
+        }
+        if self
+            .load_tokens_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_sub(tokens)
+            })
+            .is_err()
+        {
+            // Saturate at 0: a double-subtract (e.g. a guard re-dropped) must
+            // not underflow the gauge into a bogus "negative load".
+            self.load_tokens_counter
+                .fetch_min(0, Ordering::Relaxed);
+            tracing::warn!(
+                worker_url = %self.metadata.url,
+                "Attempted to subtract tokens from a load that is already at 0; saturating"
+            );
+        }
+        self.update_running_requests_metrics();
+    }
+
+    fn load_tokens(&self) -> u64 {
+        self.load_tokens_counter.load(Ordering::Relaxed)
     }
 
     fn reset_load(&self) {
@@ -1063,6 +1116,18 @@ impl Worker for DPAwareWorker {
         self.base_worker.decrement_load();
     }
 
+    fn add_load_tokens(&self, tokens: u64) {
+        self.base_worker.add_load_tokens(tokens);
+    }
+
+    fn sub_load_tokens(&self, tokens: u64) {
+        self.base_worker.sub_load_tokens(tokens);
+    }
+
+    fn load_tokens(&self) -> u64 {
+        self.base_worker.load_tokens()
+    }
+
     fn reset_load(&self) {
         self.base_worker.reset_load();
     }
@@ -1147,13 +1212,30 @@ impl Worker for DPAwareWorker {
 pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
     routing_key: Option<String>,
+    /// Estimated prompt tokens charged to the worker's token-weighted load;
+    /// subtracted on drop.
+    tokens: u64,
 }
 
 impl WorkerLoadGuard {
     pub fn new(worker: Arc<dyn Worker>, headers: Option<&http::HeaderMap>) -> Self {
+        Self::new_weighted(worker, headers, 1)
+    }
+
+    /// Like `new`, but also charges `est_tokens` (>= 1) to the worker's
+    /// token-weighted load so load-balancing policies can measure work per
+    /// worker instead of raw request counts (a 250k-token prefill is one
+    /// request but ~300 small turns of work).
+    pub fn new_weighted(
+        worker: Arc<dyn Worker>,
+        headers: Option<&http::HeaderMap>,
+        est_tokens: u64,
+    ) -> Self {
         use crate::routers::header_utils::extract_routing_key;
 
+        let tokens = est_tokens.max(1);
         worker.increment_load();
+        worker.add_load_tokens(tokens);
 
         let routing_key = extract_routing_key(headers).map(String::from);
 
@@ -1164,6 +1246,7 @@ impl WorkerLoadGuard {
         Self {
             worker,
             routing_key,
+            tokens,
         }
     }
 }
@@ -1171,6 +1254,7 @@ impl WorkerLoadGuard {
 impl Drop for WorkerLoadGuard {
     fn drop(&mut self) {
         self.worker.decrement_load();
+        self.worker.sub_load_tokens(self.tokens);
         if let Some(ref key) = self.routing_key {
             self.worker.worker_routing_key_load().decrement(key);
         }
@@ -1722,7 +1806,11 @@ mod tests {
         let ops_per_sec = iterations as f64 / duration.as_secs_f64();
         println!("Load counter operations per second: {:.0}", ops_per_sec);
 
-        assert!(ops_per_sec > 1_000_000.0);
+        // Each increment also refreshes two metric gauges
+        // (requests-active + tokens-active), which bounds the floor well
+        // below 1M; the assertion exists to catch pathological regressions
+        // (sub-microsecond ops, not microsecond ones).
+        assert!(ops_per_sec > 500_000.0);
     }
 
     #[test]

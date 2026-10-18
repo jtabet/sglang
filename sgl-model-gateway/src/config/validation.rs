@@ -154,6 +154,7 @@ impl ConfigValidator {
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold: _,
+                balance_abs_threshold_tokens: _,
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
@@ -726,6 +727,7 @@ mod tests {
             PolicyConfig::CacheAware {
                 cache_threshold: 1.5, // Invalid: > 1.0
                 balance_abs_threshold: 32,
+                balance_abs_threshold_tokens: 8192,
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
@@ -745,6 +747,7 @@ mod tests {
             PolicyConfig::CacheAware {
                 cache_threshold: 0.5,
                 balance_abs_threshold: 32,
+                balance_abs_threshold_tokens: 8192,
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
@@ -799,6 +802,7 @@ mod tests {
             PolicyConfig::CacheAware {
                 cache_threshold: 0.5,
                 balance_abs_threshold: 32,
+                balance_abs_threshold_tokens: 8192,
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
@@ -843,6 +847,7 @@ mod tests {
                 prefill_policy: Some(PolicyConfig::CacheAware {
                     cache_threshold: 0.5,
                     balance_abs_threshold: 32,
+                    balance_abs_threshold_tokens: 8192,
                     balance_rel_threshold: 1.1,
                     eviction_interval_secs: 60,
                     max_tree_size: 1000,

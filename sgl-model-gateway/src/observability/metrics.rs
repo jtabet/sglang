@@ -919,6 +919,18 @@ impl Metrics {
         .set(count as f64);
     }
 
+    /// Set token-weighted active load per worker (estimated prompt tokens
+    /// of in-flight requests; the token-scale twin of
+    /// `set_worker_requests_active`)
+    pub fn set_worker_tokens_active(worker: &str, tokens: u64) {
+        let worker_interned = intern_string(worker);
+        gauge!(
+            "smg_worker_tokens_active",
+            "worker" => worker_interned
+        )
+        .set(tokens as f64);
+    }
+
     /// Set active routing keys per worker
     pub fn set_worker_routing_keys_active(worker: &str, count: usize) {
         let worker_interned = intern_string(worker);

@@ -315,24 +315,30 @@ impl CacheAwarePolicy {
         tree_key: &str,
         max_load: usize,
         min_load: usize,
+        max_tokens: u64,
+        min_tokens: u64,
     ) -> Option<usize> {
         // Log load balancing trigger (only compute worker loads if debug enabled)
         if tracing::enabled!(tracing::Level::DEBUG) {
-            let worker_loads: Vec<(&str, usize)> =
-                workers.iter().map(|w| (w.url(), w.load())).collect();
+            let worker_loads: Vec<(&str, usize, u64)> = workers
+                .iter()
+                .map(|w| (w.url(), w.load(), w.load_tokens()))
+                .collect();
             debug!(
-                "Load balancing triggered | max: {} | min: {} | workers: {:?}",
-                max_load, min_load, worker_loads
+                "Load balancing triggered | reqs max: {} min: {} | tokens max: {} min: {} | workers: {:?}",
+                max_load, min_load, max_tokens, min_tokens, worker_loads
             );
         }
 
-        // Use shortest queue when imbalanced. Tie break randomly.
-        // Snapshot load() (live atomic count of load). Without snapshot
-        // there could be no workers found matching min_load because of
-        // load update.
-        let loads: Vec<(usize, usize)> = healthy_indices
+        // Use shortest queue when imbalanced. Weight by estimated prompt
+        // tokens (work), not raw request count: a 250k-token prefill must
+        // push the next request to a less-loaded worker even when every
+        // worker shows the same in-flight request count. Tie break randomly.
+        // Snapshot load_tokens() (live atomic) — without snapshot there could
+        // be no workers found matching min_tokens because of load update.
+        let loads: Vec<(usize, u64)> = healthy_indices
             .iter()
-            .map(|&idx| (idx, workers[idx].load()))
+            .map(|&idx| (idx, workers[idx].load_tokens()))
             .collect();
         let min_load = loads.iter().map(|&(_, load)| load).min()?;
         let min_load_idx = loads
@@ -418,9 +424,26 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         });
         let min_load = if min_load == usize::MAX { 0 } else { min_load };
 
-        // Check if load is imbalanced
-        let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
-            && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
+        // Token-scale load statistics: the sum of estimated prompt tokens of
+        // in-flight requests. The request-count valve above cannot see a
+        // 250k-token prefill hiding behind a single in-flight request, so the
+        // token valve is a second imbalance trigger on top of it.
+        let (min_tokens, max_tokens) = workers
+            .iter()
+            .fold((u64::MAX, 0u64), |(min_t, max_t), w| {
+                let t = w.load_tokens();
+                (min_t.min(t), max_t.max(t))
+            });
+        let min_tokens = if min_tokens == u64::MAX { 0 } else { min_tokens };
+
+        // Check if load is imbalanced (request-count valve OR token valve)
+        let req_imbalanced =
+            max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
+                && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
+        let tok_imbalanced = max_tokens.saturating_sub(min_tokens)
+            > self.config.balance_abs_threshold_tokens as u64
+            && (max_tokens as f32) > (min_tokens as f32 * self.config.balance_rel_threshold);
+        let is_imbalanced = req_imbalanced || tok_imbalanced;
 
         if is_imbalanced {
             // Imbalanced path routes by load, not cache affinity — the tree
@@ -434,6 +457,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     &tree_key,
                     max_load,
                     min_load,
+                    max_tokens,
+                    min_tokens,
                 )
                 .await
                 .map(|index| super::SelectionInfo { index, match_rate: 0.0 });
@@ -465,13 +490,16 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     .position(|w| w.url() == tenant_url)
                     .filter(|&idx| workers[idx].is_healthy())
             } else {
-                // Low cache match: use worker with minimum load. Tie break randomly.
-                // Snapshot load() (live atomic count of load). Without snapshot
-                // there could be no workers found matching min_load because of
+                // Low cache match: use the worker with minimum token-weighted
+                // load (estimated in-flight prompt tokens), not raw request
+                // count — a worker busy on one giant prefill must lose to an
+                // idle worker even at equal request counts. Tie break randomly.
+                // Snapshot load_tokens() (live atomic) — without snapshot there
+                // could be no workers found matching min_tokens because of
                 // load update.
-                let loads: Vec<(usize, usize)> = healthy_indices
+                let loads: Vec<(usize, u64)> = healthy_indices
                     .iter()
-                    .map(|&idx| (idx, workers[idx].load()))
+                    .map(|&idx| (idx, workers[idx].load_tokens()))
                     .collect();
                 let min_load = loads.iter().map(|&(_, load)| load).min()?;
                 loads
@@ -666,6 +694,7 @@ mod tests {
         let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
             cache_threshold: 0.5,
             balance_abs_threshold: 5,
+            balance_abs_threshold_tokens: 8192,
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 0, // Disable eviction thread
             max_tree_size: 10000,
@@ -678,9 +707,11 @@ mod tests {
             .worker_type(WorkerType::Regular)
             .build();
 
-        // Create significant load imbalance
+        // Create significant load imbalance (counted on both scales: 20
+        // requests ≈ 20k estimated prompt tokens)
         for _ in 0..20 {
             worker1.increment_load();
+            worker1.add_load_tokens(1000);
         }
         // worker2 has load 0
 
@@ -705,6 +736,7 @@ mod tests {
         let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
             cache_threshold: 0.5,
             balance_abs_threshold: 5,
+            balance_abs_threshold_tokens: 8192,
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 0,
             max_tree_size: 10000,
@@ -720,9 +752,11 @@ mod tests {
             ));
         }
 
-        // Overload worker 0: max=50, min=0 => (50-0) > 5 AND 50 > 0*2.0 => imbalanced.
+        // Overload worker 0: 50 requests ≈ 50k estimated prompt tokens —
+        // imbalanced on both the request-count and the token valve.
         for _ in 0..50 {
             workers[0].increment_load();
+            workers[0].add_load_tokens(1000);
         }
         policy.init_workers(&workers);
 
@@ -1077,6 +1111,125 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(idx, 0);
+    }
+
+    // The token valve must fire even when the request count looks balanced:
+    // one in-flight request per worker, but worker0 churning a 250k-token
+    // prefill. Small turns must avoid the busy worker.
+    #[tokio::test]
+    async fn test_token_imbalance_sheds_small_turn_off_busy_worker() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+        ];
+        policy.init_workers(&workers);
+
+        // One in-flight request each (request valve: balanced), but worker0
+        // holds a 250k-token prefill (token valve: imbalanced).
+        workers[0].increment_load();
+        workers[0].add_load_tokens(250_000);
+        workers[1].increment_load();
+        workers[1].add_load_tokens(200);
+
+        // 50 small turns with unique text (no cache affinity to claim) must
+        // all land on the less-loaded worker.
+        for i in 0..50 {
+            let info = SelectWorkerInfo {
+                request_text: Some(&format!("small_turn_{}", i)),
+                ..Default::default()
+            };
+            let idx = policy.select_worker(&workers, &info).await.unwrap();
+            assert_eq!(
+                idx, 1,
+                "small turn {} routed to the 250k-token worker",
+                i
+            );
+        }
+    }
+
+    // Below the token threshold the system is balanced and cache affinity
+    // must still pin the conversation to its tenant worker.
+    #[tokio::test]
+    async fn test_token_balanced_keeps_cache_affinity() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.0,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+        ];
+        policy.init_workers(&workers);
+
+        // Tenant (w1) holds 5000 tokens of prompt load — below the 8192
+        // token valve, so the system is balanced and affinity applies.
+        workers[0].add_load_tokens(5_000);
+
+        let prompt = "turn one two three four";
+        let info1 = SelectWorkerInfo {
+            request_text: Some(prompt),
+            ..Default::default()
+        };
+        let idx1 = policy.select_worker(&workers, &info1).await.unwrap();
+        let info2 = SelectWorkerInfo {
+            request_text: Some(prompt),
+            ..Default::default()
+        };
+        let idx2 = policy.select_worker(&workers, &info2).await.unwrap();
+        assert_eq!(idx1, idx2, "affinity must pin the conversation to one worker");
+    }
+
+    // The weighted RAII guard must charge and release the token load
+    // symmetrically.
+    #[test]
+    fn test_guard_weighted_charges_and_releases_tokens() {
+        let w = Arc::new(
+            BasicWorkerBuilder::new("http://w1:8000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        assert_eq!(w.load(), 0);
+        assert_eq!(w.load_tokens(), 0);
+        {
+            let _guard = crate::core::WorkerLoadGuard::new_weighted(w.clone(), None, 12_345);
+            assert_eq!(w.load(), 1);
+            assert_eq!(w.load_tokens(), 12_345);
+        }
+        assert_eq!(w.load(), 0);
+        assert_eq!(w.load_tokens(), 0);
+    }
+
+    #[test]
+    fn test_guard_default_charges_one_token() {
+        let w = Arc::new(
+            BasicWorkerBuilder::new("http://w1:8000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        let _guard = crate::core::WorkerLoadGuard::new(w.clone(), None);
+        assert_eq!(w.load(), 1);
+        assert_eq!(w.load_tokens(), 1);
     }
 
     fn make_prefill(url: &str) -> Arc<dyn Worker> {

@@ -278,6 +278,13 @@ pub enum ManualAssignmentMode {
     MinGroup,
 }
 
+/// Serde default for the token-scale cache-aware load threshold (estimated
+/// prompt tokens). Configs written before this knob existed keep the
+/// request-count threshold as their only valve.
+fn default_cache_aware_balance_abs_threshold_tokens() -> usize {
+    8192
+}
+
 /// Policy configuration for routing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -292,6 +299,11 @@ pub enum PolicyConfig {
     CacheAware {
         cache_threshold: f32,
         balance_abs_threshold: usize,
+        /// Token-scale load-balance trigger (estimated prompt tokens); the
+        /// request-count `balance_abs_threshold` cannot see a giant prompt
+        /// hiding behind one in-flight request.
+        #[serde(default = "default_cache_aware_balance_abs_threshold_tokens")]
+        balance_abs_threshold_tokens: usize,
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
@@ -842,6 +854,7 @@ mod tests {
         let cache_aware = PolicyConfig::CacheAware {
             cache_threshold: 0.8,
             balance_abs_threshold: 10,
+            balance_abs_threshold_tokens: 8192,
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 1000,
@@ -863,6 +876,7 @@ mod tests {
         let cache_aware = PolicyConfig::CacheAware {
             cache_threshold: 0.8,
             balance_abs_threshold: 10,
+            balance_abs_threshold_tokens: 8192,
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 1000,
@@ -885,6 +899,7 @@ mod tests {
         let cache_aware = PolicyConfig::CacheAware {
             cache_threshold: 0.75,
             balance_abs_threshold: 20,
+            balance_abs_threshold_tokens: 8192,
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 600,
             max_tree_size: 5000,
@@ -894,6 +909,7 @@ mod tests {
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold,
+                balance_abs_threshold_tokens,
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
@@ -1200,7 +1216,7 @@ mod tests {
                 "http://worker2:8000".to_string(),
                 "http://worker3:8000".to_string(),
             ])
-            .cache_aware_policy(0.9, 5, 1.2, 600, 10000)
+            .cache_aware_policy(0.9, 5, 8192, 1.2, 600, 10000)
             .host("0.0.0.0")
             .port(3001)
             .max_payload_size(536870912)
@@ -1287,6 +1303,7 @@ mod tests {
             prefill_policy: Some(PolicyConfig::CacheAware {
                 cache_threshold: 0.5,
                 balance_abs_threshold: 32,
+                balance_abs_threshold_tokens: 8192,
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
@@ -1317,6 +1334,7 @@ mod tests {
             prefill_policy: Some(PolicyConfig::CacheAware {
                 cache_threshold: 0.5,
                 balance_abs_threshold: 32,
+                balance_abs_threshold_tokens: 8192,
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
@@ -1373,6 +1391,7 @@ mod tests {
         let main_policy = PolicyConfig::CacheAware {
             cache_threshold: 0.7,
             balance_abs_threshold: 20,
+            balance_abs_threshold_tokens: 8192,
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 2000,

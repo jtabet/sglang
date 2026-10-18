@@ -114,7 +114,15 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
 #[derive(Debug, Clone)]
 pub struct CacheAwareConfig {
     pub cache_threshold: f32,
+    /// Request-count scale: rebalance when one worker has more than this many
+    /// more in-flight *requests* than the least loaded worker.
     pub balance_abs_threshold: usize,
+    /// Token scale: rebalance when one worker has more than this many more
+    /// in-flight *estimated prompt tokens* than the least loaded worker.
+    /// The request-count valve cannot see a 250k-token prefill sitting
+    /// behind a single in-flight request, so a token valve guards the mix of
+    /// giant agent prompts and small turns.
+    pub balance_abs_threshold_tokens: usize,
     pub balance_rel_threshold: f32,
     pub eviction_interval_secs: u64,
     pub max_tree_size: usize,
@@ -125,6 +133,7 @@ impl Default for CacheAwareConfig {
         Self {
             cache_threshold: 0.5,
             balance_abs_threshold: 32,
+            balance_abs_threshold_tokens: 8192,
             balance_rel_threshold: 1.1,
             eviction_interval_secs: 30,
             max_tree_size: 10000,

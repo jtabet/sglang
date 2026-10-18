@@ -22,6 +22,7 @@ impl PolicyFactory {
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold,
+                balance_abs_threshold_tokens,
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
@@ -29,6 +30,7 @@ impl PolicyFactory {
                 let config = CacheAwareConfig {
                     cache_threshold: *cache_threshold,
                     balance_abs_threshold: *balance_abs_threshold,
+                    balance_abs_threshold_tokens: *balance_abs_threshold_tokens,
                     balance_rel_threshold: *balance_rel_threshold,
                     eviction_interval_secs: *eviction_interval_secs,
                     max_tree_size: *max_tree_size,
@@ -111,6 +113,7 @@ mod tests {
         let policy = PolicyFactory::create_from_config(&PolicyConfig::CacheAware {
             cache_threshold: 0.7,
             balance_abs_threshold: 10,
+            balance_abs_threshold_tokens: 8192,
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 30,
             max_tree_size: 1000,

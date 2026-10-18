@@ -158,6 +158,13 @@ struct CliArgs {
     #[arg(long, default_value_t = 64, help_heading = "Routing Policy")]
     balance_abs_threshold: usize,
 
+    /// Absolute threshold for the token-scale load balancing trigger
+    /// (estimated prompt tokens of in-flight requests). The request-count
+    /// threshold cannot see a 250k-token prefill hiding behind one
+    /// in-flight request; this valve does.
+    #[arg(long, default_value_t = 8192, help_heading = "Routing Policy")]
+    balance_abs_threshold_tokens: usize,
+
     /// Relative threshold for load balancing trigger
     #[arg(long, default_value_t = 1.5, help_heading = "Routing Policy")]
     balance_rel_threshold: f32,
@@ -782,6 +789,7 @@ impl CliArgs {
             "cache_aware" => PolicyConfig::CacheAware {
                 cache_threshold: self.cache_threshold,
                 balance_abs_threshold: self.balance_abs_threshold,
+                balance_abs_threshold_tokens: self.balance_abs_threshold_tokens,
                 balance_rel_threshold: self.balance_rel_threshold,
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,

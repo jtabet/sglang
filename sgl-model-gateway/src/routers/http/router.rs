@@ -760,7 +760,20 @@ impl Router {
 
         let load_guard = ["cache_aware", "manual"]
             .contains(&policy.name())
-            .then(|| WorkerLoadGuard::new(worker.clone(), headers));
+            .then(|| {
+                // Token-weighted load: charge the same estimate the TTFT
+                // recorder uses (full text / chars_per_token, falling back to
+                // 3.5 when the rate is unset) so a 250k-token prefill
+                // outweighs ~300 small turns in the cache_aware balance
+                // check instead of counting as one request like any turn.
+                let cpt = if self.ttft_chars_per_token > 0.1 {
+                    self.ttft_chars_per_token
+                } else {
+                    3.5
+                };
+                let est = (text_len as f32 / cpt) as u64;
+                WorkerLoadGuard::new_weighted(worker.clone(), headers, est.max(1))
+            });
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();

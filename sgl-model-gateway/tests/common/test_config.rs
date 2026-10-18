@@ -63,6 +63,7 @@ impl TestRouterConfig {
             .cache_aware_policy(
                 0.5,  // cache_threshold
                 32,   // balance_abs_threshold
+                8192, // balance_abs_threshold_tokens
                 1.5,  // balance_rel_threshold
                 60,   // eviction_interval_secs
                 1000, // max_tree_size
