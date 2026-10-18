@@ -5136,6 +5136,37 @@ class Scheduler(
                     len(getattr(linker, "hit_markers", {})),
                     len(getattr(linker, "pending_loads", {})),
                 )
+                # STALL-POOL: the spin can be a *silent* admission refusal,
+                # not a deadlock: with queue>0 and nothing running, the
+                # prefill adder returns NO_TOKEN every tick when the mamba
+                # slot budget (free + tree-evictable) or the KV token budget
+                # (available + evictable) has bottomed out, and the loop
+                # spins on_idle with nothing to admit. The idle-only
+                # invariant checker never runs here (fully_idle is False),
+                # so a pool leak wedges with zero log lines of its own.
+                # Log the exact gate state — mamba_free=0 + mamba_evict=0
+                # or kv_avail=0 + kv_evict=0 pins the leak in a few lines.
+                _stuck = self.waiting_queue[0] if self.waiting_queue else None
+                _mamba_alloc = getattr(
+                    self.req_to_token_pool, "mamba_allocator", None
+                )
+                logger.warning(
+                    "STALL-POOL: rid=%s retracts=%s batch_full=%s "
+                    "mamba_free=%s mamba_evict=%s "
+                    "kv_avail=%s kv_evict=%s pp_budget=%s",
+                    getattr(_stuck, "rid", None),
+                    getattr(_stuck, "retraction_count", None),
+                    self.running_batch.batch_is_full,
+                    (
+                        _mamba_alloc.schedulable_available_size()
+                        if _mamba_alloc is not None
+                        else -1
+                    ),
+                    getattr(self.tree_cache, "mamba_evictable_size", lambda: -1)(),
+                    self.token_to_kv_pool_allocator.available_size(),
+                    getattr(self.tree_cache, "full_evictable_size", lambda: -1)(),
+                    get_parallel().pp_max_micro_batch_size,
+                )
             if self.enable_hicache_storage or self.enable_unified_cache_external_linker:
                 # Storage workers need the GIL between I/O calls. Yield while
                 # there is no GPU batch so polling cannot starve their acks.
