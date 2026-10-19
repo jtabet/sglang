@@ -393,6 +393,18 @@ STEP_MAX_US = 2_000_000
 # spins on_idle without sleeping. Bounds the O(queue) get_loads for both the
 # DP-balancing writer and the router-facing socket.
 LOAD_STALL_REFRESH_S = 0.05
+# STALL-POOL fail-out budget: how long the SAME queue-head request may spin
+# in admission (running=0, no chunked prefill, no load-back/prefetch in
+# progress) before it is failed to the client instead of spinning forever.
+# The 2026-10-19 wedge class (flavors A/C: restore-need or chunk-tail +
+# reserve > avail+evict, retracts=0/1) blocks the queue head until a manual
+# bounce; the client has always already timed out by the time this fires
+# (patchbay fetch timeout 90s << this budget), so failing out only reaps an
+# orphan. The load gate's cancel+requeue re-mints the same rid (verified in
+# wedge #5: gate trip at 480s -> requeue -> 4,913 more spin ticks), so the
+# gate alone cannot clear it. Flavor B (predecessor decode running) never
+# trips: it requires running=0 for the whole budget.
+STALL_POOL_FAILOUT_SECS = 480.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -441,6 +453,12 @@ class Scheduler(
     # Class-level default so on_idle's stall gate works even if a fork
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
+    # STALL-POOL fail-out state: the queue-head rid the current fail-out
+    # budget is measuring, and when that rid's spin started. Cleared whenever
+    # the queue head changes, the batch is running, or a load/prefetch is in
+    # progress — i.e. any sign the scheduler is making progress.
+    _stall_pool_watch_rid: Optional[str] = None
+    _stall_pool_watch_since: float = 0.0
     kv_checksum_computer: Optional[KvChecksumComputer] = None
 
     def __init__(
@@ -1332,6 +1350,11 @@ class Scheduler(
         # rid -> consecutive OOM-shed strikes; a shed request that gets
         # admitted clears its entry (hard-shed at SGLANG_OOM_SHED_MAX_STRIKES).
         self.oom_shed_strikes: dict = {}
+        # STALL-POOL fail-out budget window for the current queue head (see
+        # STALL_POOL_FAILOUT_SECS): the head rid being measured and the
+        # monotonic time its spin started.
+        self._stall_pool_watch_rid: Optional[str] = None
+        self._stall_pool_watch_since: float = 0.0
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
@@ -5167,6 +5190,59 @@ class Scheduler(
                     getattr(self.tree_cache, "full_evictable_size", lambda: -1)(),
                     get_parallel().pp_max_micro_batch_size,
                 )
+                # STALL-POOL fail-out: the wedge class (2026-10-19, flavors
+                # A/C) spins the SAME queue head here forever — restore-need
+                # or chunk-tail + reserve > avail+evict, retracts=0/1 — and
+                # every observed rid's client had already timed out
+                # (patchbay 90s << this budget). The load gate's
+                # cancel+requeue re-mints the same rid (wedge #5: gate trip
+                # -> requeue -> thousands more ticks), so nothing else
+                # clears it; production remediation was pod bounces x7.
+                # When the same head has spun past STALL_POOL_FAILOUT_SECS
+                # with running=0 (no decode — flavor B never trips) and no
+                # load-back/prefetch in progress, retire it to the client:
+                # the proven disaggregation fail-out (finish + abort reason
+                # + stream the single req), which also frees its mamba slot
+                # and unblocks everything queued behind it.
+                _failout_secs = envs.SGLANG_STALL_POOL_FAILOUT_SECS.get()
+                _running = len(self.running_batch.reqs)
+                _loads_active = bool(
+                    getattr(self.tree_cache, "ongoing_load_back", {})
+                ) or bool(getattr(self.tree_cache, "ongoing_prefetch", {}))
+                _head_rid = getattr(_stuck, "rid", None) if _stuck is not None else None
+                if (
+                    _failout_secs >= 0
+                    and _head_rid is not None
+                    and _running == 0
+                    and self.chunked_req is None
+                    and not _loads_active
+                ):
+                    if self._stall_pool_watch_rid != _head_rid:
+                        # New (or changed) head: (re)start the budget window.
+                        self._stall_pool_watch_rid = _head_rid
+                        self._stall_pool_watch_since = now
+                    elif (
+                        now - self._stall_pool_watch_since
+                    ) >= _failout_secs:
+                        logger.warning(
+                            "STALL-POOL FAILOUT: rid=%s spun in admission "
+                            "for %.0fs with the queue blocked (running=0, "
+                            "no loads in flight) — retiring to client "
+                            "(client timed out long ago; load gate "
+                            "requeue re-mints the same rid).",
+                            _head_rid,
+                            now - self._stall_pool_watch_since,
+                        )
+                        self.waiting_queue.pop(0)
+                        self.retire_unadmitted_request(_stuck)
+                        self._stall_pool_watch_rid = None
+                        self._stall_pool_watch_since = 0.0
+                else:
+                    # Progress of some form (head changed, a decode, a
+                    # chunked prefill, or a live load): the budget window
+                    # is measuring nothing — clear it.
+                    self._stall_pool_watch_rid = None
+                    self._stall_pool_watch_since = 0.0
             if self.enable_hicache_storage or self.enable_unified_cache_external_linker:
                 # Storage workers need the GIL between I/O calls. Yield while
                 # there is no GPU batch so polling cannot starve their acks.

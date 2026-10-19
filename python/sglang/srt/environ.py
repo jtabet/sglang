@@ -648,6 +648,21 @@ class Envs:
     # 2026-10-13 06:15/06:22/06:33), so the gate's pre-forward abort is the
     # only NCCL-safe way to keep that failure off the forward path.
     SGLANG_MOONCAKE_LOAD_GATE_SECS = EnvFloat(120.0)
+    # STALL-POOL fail-out budget (seconds): how long the SAME queue-head
+    # request may spin in the admission NO_TOKEN gate (running=0, no
+    # chunked prefill, no load-back/prefetch in flight) before it is
+    # retired to the client (abort finish + mamba slot freed + stream the
+    # result) instead of spinning forever. The 2026-10-19 wedge class
+    # (7 wedges/100min on the 27B fleet, flavors A/C: restore-need or
+    # chunk-tail + decode reserve > avail+evict, retracts=0/1) blocked
+    # each worker's queue until a manual pod bounce; every wedged rid's
+    # client had already timed out (patchbay fetch timeout 90s), and the
+    # load gate's cancel+requeue re-mints the same rid (wedge #5 evidence:
+    # 480s trip -> requeue -> 4,913 more spin ticks), so requeue can
+    # never clear it. Flavor B (predecessor decode running) never trips —
+    # this requires running=0 for the whole budget. -1 DISABLES the
+    # fail-out (spin-forever, pre-fix behavior).
+    SGLANG_STALL_POOL_FAILOUT_SECS = EnvFloat(480.0)
     # Wall-clock budget (seconds) the worker's MooncakeStore.warmup() will keep
     # retrying the initial put() while the RDMA Transfer Engine comes up after a
     # (re)start. The store *server* check above already tolerates up to
