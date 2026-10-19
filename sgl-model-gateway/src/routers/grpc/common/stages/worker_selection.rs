@@ -174,6 +174,7 @@ impl WorkerSelectionStage {
                     request_text: text,
                     tokens,
                     headers,
+                    chars_per_token: 0.0,
                     hash_ring,
                 },
             )
@@ -245,6 +246,7 @@ impl WorkerSelectionStage {
             request_text: text,
             tokens,
             headers,
+            chars_per_token: 0.0,
             hash_ring,
         };
         let prefill_idx = policy.select_worker(&available_prefill, &info).await?;

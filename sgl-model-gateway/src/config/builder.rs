@@ -124,6 +124,7 @@ impl RouterConfigBuilder {
             balance_rel_threshold,
             eviction_interval_secs,
             max_tree_size,
+            capacity_per_worker_tokens: None,
         };
         self
     }

@@ -307,6 +307,13 @@ pub enum PolicyConfig {
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
+        /// Per-worker capacity gate for the cache-hit path (estimated
+        /// tokens). `None` (default) = off; `Some(n)` sheds cache affinity
+        /// to load-based selection when the tenant's projected token load
+        /// exceeds `n`. Size to KV capacity minus safety margin (see
+        /// `CacheAwareConfig::capacity_per_worker_tokens`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capacity_per_worker_tokens: Option<u64>,
     },
 
     #[serde(rename = "power_of_two")]
@@ -851,13 +858,14 @@ mod tests {
         assert_eq!(PolicyConfig::Random.name(), "random");
         assert_eq!(PolicyConfig::RoundRobin.name(), "round_robin");
 
-        let cache_aware = PolicyConfig::CacheAware {
+        let policy = PolicyConfig::CacheAware {
             cache_threshold: 0.8,
             balance_abs_threshold: 10,
             balance_abs_threshold_tokens: 8192,
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 1000,
+            capacity_per_worker_tokens: None,
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -880,6 +888,7 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 1000,
+            capacity_per_worker_tokens: None,
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
@@ -903,6 +912,7 @@ mod tests {
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 600,
             max_tree_size: 5000,
+            capacity_per_worker_tokens: Some(190_000),
         };
 
         match cache_aware {
@@ -913,12 +923,14 @@ mod tests {
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                capacity_per_worker_tokens,
             } => {
                 assert!((cache_threshold - 0.75).abs() < 0.0001);
                 assert_eq!(balance_abs_threshold, 20);
                 assert!((balance_rel_threshold - 2.0).abs() < 0.0001);
                 assert_eq!(eviction_interval_secs, 600);
                 assert_eq!(max_tree_size, 5000);
+                assert_eq!(capacity_per_worker_tokens, Some(190_000));
             }
             _ => panic!("Expected CacheAware"),
         }
@@ -1307,6 +1319,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                capacity_per_worker_tokens: None,
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -1338,6 +1351,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                capacity_per_worker_tokens: None,
             }),
             decode_policy: None,
         };
@@ -1395,6 +1409,7 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 2000,
+            capacity_per_worker_tokens: None,
         };
 
         match pd.get_prefill_policy(&main_policy) {

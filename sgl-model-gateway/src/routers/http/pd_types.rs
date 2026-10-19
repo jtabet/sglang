@@ -71,6 +71,7 @@ pub enum PDSelectionPolicy {
         cache_threshold: f32,
         balance_abs_threshold: usize,
         balance_rel_threshold: f32,
+        capacity_per_worker_tokens: Option<u64>,
     },
     Bucket {
         balance_abs_threshold: usize,

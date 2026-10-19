@@ -165,6 +165,17 @@ struct CliArgs {
     #[arg(long, default_value_t = 8192, help_heading = "Routing Policy")]
     balance_abs_threshold_tokens: usize,
 
+    /// Per-worker capacity gate (estimated tokens) for the cache-aware
+    /// cache-hit path: when the prefix-match tenant's projected token load
+    /// (in-flight load + this request's estimate) exceeds this number, the
+    /// request shed its affinity and goes to the least-loaded worker
+    /// instead. Opt in for big-request workloads; size to the worker KV
+    /// pool's token capacity minus a safety margin (e.g. ~355k pools
+    /// serving ~190k agent requests → 190000 admits at most one such
+    /// request per worker at a time). Unset (default) disables the gate.
+    #[arg(long, help_heading = "Routing Policy")]
+    capacity_per_worker_tokens: Option<u64>,
+
     /// Relative threshold for load balancing trigger
     #[arg(long, default_value_t = 1.5, help_heading = "Routing Policy")]
     balance_rel_threshold: f32,
@@ -793,6 +804,7 @@ impl CliArgs {
                 balance_rel_threshold: self.balance_rel_threshold,
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
+                capacity_per_worker_tokens: None,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
