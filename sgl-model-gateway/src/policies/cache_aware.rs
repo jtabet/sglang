@@ -744,7 +744,7 @@ mod tests {
         CacheAwareConfig {
             cache_threshold: 0.0,
             balance_abs_threshold: 10_000_000,
-            balance_abs_threshold_tokens: [REDACTED_10],
+            balance_abs_threshold_tokens: 1_000_000 * 1000,
             eviction_interval_secs: 0,
             capacity_per_worker_tokens,
             ..Default::default()
@@ -998,7 +998,7 @@ mod tests {
             .map(|t| t.value().prefix_match_with_counts("conv").tenant)
             .expect("tree must still exist");
         assert_eq!(
-            tenant, "http://w0:8000",
+            &*tenant, "http://w0:8000",
             "shedding must not evict the planted tenant"
         );
     }

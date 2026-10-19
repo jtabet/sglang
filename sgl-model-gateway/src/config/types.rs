@@ -858,7 +858,7 @@ mod tests {
         assert_eq!(PolicyConfig::Random.name(), "random");
         assert_eq!(PolicyConfig::RoundRobin.name(), "round_robin");
 
-        let policy = PolicyConfig::CacheAware {
+        let cache_aware = PolicyConfig::CacheAware {
             cache_threshold: 0.8,
             balance_abs_threshold: 10,
             balance_abs_threshold_tokens: 8192,
@@ -927,6 +927,7 @@ mod tests {
             } => {
                 assert!((cache_threshold - 0.75).abs() < 0.0001);
                 assert_eq!(balance_abs_threshold, 20);
+                assert_eq!(balance_abs_threshold_tokens, 8192);
                 assert!((balance_rel_threshold - 2.0).abs() < 0.0001);
                 assert_eq!(eviction_interval_secs, 600);
                 assert_eq!(max_tree_size, 5000);
