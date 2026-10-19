@@ -9,6 +9,7 @@ stages:
 #
 # The needs DAG below renders the pipeline graph in run order:
 #   upload-base -> build-standalone -> build-ornith1-5-9b-int8
+#                                          \-> build-qwen38-27b-int8
 # Jobs are playable only after their dependency completes. Re-running
 # upload-base later is cheap (blobs already in the registry: seconds).
 #
@@ -61,6 +62,22 @@ build-ornith1-5-9b-int8:
       -f docker/Dockerfile.ornith1.5-9b-int8
       -t "$CI_REGISTRY_IMAGE:ornith1.5-9b-int8" .
     - docker push "$CI_REGISTRY_IMAGE:ornith1.5-9b-int8"
+
+build-qwen38-27b-int8:
+  stage: build
+  tags: [gpus]
+  when: manual
+  needs: ["build-standalone"]
+  # ~30.4 GB of weights on top of the base -> same large-push caution as the
+  # 9b job (retry on registry auth timeouts; docker resumes blob uploads).
+  variables:
+    GIT_DEPTH: 1
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+    - docker build --progress=plain
+      -f docker/Dockerfile.qwen3.8-27b-int8
+      -t "$CI_REGISTRY_IMAGE:qwen38-27b-int8" .
+    - docker push "$CI_REGISTRY_IMAGE:qwen38-27b-int8"
 
 cleanup-runner-disk:
   stage: build
