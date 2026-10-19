@@ -474,6 +474,11 @@ impl Router {
                 PolicyType::CacheAware => ConfigPolicyConfig::CacheAware {
                     cache_threshold: self.cache_threshold,
                     balance_abs_threshold: self.balance_abs_threshold,
+                    // The bindings have no Python-exposed equivalents yet;
+                    // use the config defaults (was never plumbed here — see
+                    // commit ce307a2b75 which introduced the field).
+                    balance_abs_threshold_tokens: 8192,
+                    capacity_per_worker_tokens: None,
                     balance_rel_threshold: self.balance_rel_threshold,
                     eviction_interval_secs: self.eviction_interval_secs,
                     max_tree_size: self.max_tree_size,

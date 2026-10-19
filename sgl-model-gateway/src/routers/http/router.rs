@@ -478,6 +478,7 @@ impl Router {
                     request_text: text,
                     tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
                     headers,
+                    chars_per_token: self.ttft_chars_per_token,
                     hash_ring,
                 },
             )

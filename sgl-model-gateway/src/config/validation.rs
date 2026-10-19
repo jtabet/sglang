@@ -158,6 +158,7 @@ impl ConfigValidator {
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                capacity_per_worker_tokens,
             } => {
                 if !(0.0..=1.0).contains(cache_threshold) {
                     return Err(ConfigError::InvalidValue {
@@ -189,6 +190,18 @@ impl ConfigValidator {
                         value: max_tree_size.to_string(),
                         reason: "Must be > 0".to_string(),
                     });
+                }
+
+                if let Some(cap) = capacity_per_worker_tokens {
+                    if *cap == 0 {
+                        return Err(ConfigError::InvalidValue {
+                            field: "capacity_per_worker_tokens".to_string(),
+                            value: cap.to_string(),
+                            reason: "Must be > 0 when specified (0 would shed every \
+                                     cache hit to load balancing)"
+                                .to_string(),
+                        });
+                    }
                 }
             }
             PolicyConfig::PowerOfTwo {
@@ -731,6 +744,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                capacity_per_worker_tokens: None,
             },
         );
 
@@ -751,6 +765,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                capacity_per_worker_tokens: None,
             },
         );
 
@@ -806,6 +821,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                capacity_per_worker_tokens: None,
             },
         );
 
@@ -851,6 +867,7 @@ mod tests {
                     balance_rel_threshold: 1.1,
                     eviction_interval_secs: 60,
                     max_tree_size: 1000,
+                    capacity_per_worker_tokens: None,
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,

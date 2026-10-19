@@ -74,6 +74,14 @@ use super::{
 };
 use crate::core::{Worker, WorkerType, UNKNOWN_MODEL_ID};
 
+/// Fallback chars-per-token rate when `SelectWorkerInfo::chars_per_token` is
+/// unset (`<= 0.0`). This is the HTTP router's default conversion rate (see
+/// `config::types::default_ttft_chars_per_token`) and — because of that
+/// default — also what the router charges workers' token-weighted load with
+/// when the operator has not tuned it. Matching the router's unit is what
+/// lets the capacity gate compare `load_tokens() + est_tokens` coherently.
+pub(crate) const DEFAULT_CHARS_PER_TOKEN: f32 = 3.5;
+
 /// Tag used to isolate prefill/decode/regular worker pools in the cache_aware tree key.
 ///
 /// Trees are keyed by `pool::model` so that an alternating prefill→decode call sequence
@@ -307,6 +315,57 @@ impl CacheAwarePolicy {
         }
     }
 
+    /// Select the healthy worker with the minimum token-weighted load
+    /// (estimated in-flight prompt tokens), tie-breaking randomly among the
+    /// workers at that minimum. Shared by both the low-cache-match path and
+    /// the cache-hit-but-tenant-over-capacity path.
+    ///
+    /// Loads are snapshotted from `load_tokens()` (live atomics) into `loads`
+    /// before picking: re-reading the atomic per comparison could straddle a
+    /// concurrent load update and yield no candidates for an already-computed
+    /// minimum.
+    ///
+    /// Returns `None` only when there are no healthy workers (the caller has
+    /// usually checked this already) — an all-over-capacity fleet still
+    /// returns the min-token worker; this helper never fails a request.
+    fn select_min_token_worker(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+    ) -> Option<usize> {
+        let loads: Vec<(usize, u64)> = healthy_indices
+            .iter()
+            .map(|&idx| (idx, workers[idx].load_tokens()))
+            .collect();
+        let min_load = loads.iter().map(|&(_, load)| load).min()?;
+        loads
+            .iter()
+            .copied()
+            .filter(|&(_, load)| load == min_load)
+            .map(|(idx, _)| idx)
+            .choose(&mut rand::rng())
+    }
+
+    /// Estimate this request's token count the same way the HTTP router
+    /// charges workers at dispatch (`WorkerLoadGuard::new_weighted`: full
+    /// request text / chars-per-token, floored at 1 there). `chars_per_token`
+    /// is carried per-request on `SelectWorkerInfo` by the routers; when
+    /// absent (`<= 0.0`) we fall back to `DEFAULT_CHARS_PER_TOKEN` (3.5), the
+    /// router's own default — keeping the fit check and the dispatch charge
+    /// in identical units.
+    ///
+    /// Note this estimates ONLY the prompt. Decode tokens also consume KV
+    /// pool space, so operators sizing `capacity_per_worker_tokens` should
+    /// err conservative.
+    fn estimated_request_tokens(&self, info: &SelectWorkerInfo<'_>) -> u64 {
+        let cpt = if info.chars_per_token > 0.0 {
+            info.chars_per_token
+        } else {
+            DEFAULT_CHARS_PER_TOKEN
+        };
+        (info.request_text.map(|t| t.chars().count()).unwrap_or(0) as f32 / cpt.max(0.1)) as u64
+    }
+
     async fn select_worker_min_load(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -485,10 +544,59 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             let selected_idx = if match_rate > self.config.cache_threshold {
                 // Cache hit path: find worker by URL (compare &str directly, no allocation)
                 let tenant_url: &str = &result.tenant;
-                workers
+                let tenant_idx = workers
                     .iter()
                     .position(|w| w.url() == tenant_url)
-                    .filter(|&idx| workers[idx].is_healthy())
+                    .filter(|&idx| workers[idx].is_healthy());
+
+                // ── Capacity fit gate (cache-hit path) ─────────────────────
+                //
+                // Affinity says "this worker holds the conversation's KV";
+                // but affinity is exactly strongest for long conversations,
+                // and long conversations are the requests that cannot fit
+                // twice: stacking a ~190k-token continuation onto a worker
+                // already decoding that conversation's ~220k-token request
+                // wedges the scheduler in admission (KV pool full: the new
+                // request waits behind a decode that cannot advance) or
+                // OOMs the forward. Production evidence 2026-10-19: emerald
+                // wedge (6-min admission stall) and jade forward OOM crash,
+                // both from a cache-hit continuation pinned onto the pool's
+                // only remaining capacity.
+                //
+                // The incoming request is NOT yet charged anywhere — the
+                // dispatch-time charge happens after selection — so the
+                // projected load is `tenant.load_tokens() + est_tokens(req)`
+                // where `load_tokens()` covers PRIOR in-flight only (no
+                // double counting). If the projection busts the configured
+                // capacity, fall through to the load-based (min-token)
+                // selection: a healthy less-loaded worker takes the turn.
+                // If NO worker fits, still return the min-token worker
+                // rather than `None` — `None` fails the request upstream,
+                // and queueing one request beats wedging a pool.
+                match (self.config.capacity_per_worker_tokens, tenant_idx) {
+                    (Some(cap), Some(tenant)) => {
+                        let projected =
+                            workers[tenant].load_tokens() + self.estimated_request_tokens(info);
+                        if projected > cap {
+                            warn!(
+                                "cache_aware: cache-hit tenant {} over capacity — \
+                                 projected {} est tokens (load {} + request) > cap {}; \
+                                 shedding affinity to load-based selection",
+                                workers[tenant].url(),
+                                projected,
+                                workers[tenant].load_tokens(),
+                                cap
+                            );
+                            self.select_min_token_worker(workers, &healthy_indices)
+                        } else {
+                            tenant_idx
+                        }
+                    }
+                    // Gate off (None), or the tree's tenant is not in this
+                    // worker set (the stale-tenant cleanup below handles
+                    // that) — keep today's behavior exactly.
+                    _ => tenant_idx,
+                }
             } else {
                 // Low cache match: use the worker with minimum token-weighted
                 // load (estimated in-flight prompt tokens), not raw request
@@ -497,17 +605,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 // Snapshot load_tokens() (live atomic) — without snapshot there
                 // could be no workers found matching min_tokens because of
                 // load update.
-                let loads: Vec<(usize, u64)> = healthy_indices
-                    .iter()
-                    .map(|&idx| (idx, workers[idx].load_tokens()))
-                    .collect();
-                let min_load = loads.iter().map(|&(_, load)| load).min()?;
-                loads
-                    .iter()
-                    .copied()
-                    .filter(|&(_, load)| load == min_load)
-                    .map(|(idx, _)| idx)
-                    .choose(&mut rand::rng())
+                self.select_min_token_worker(workers, &healthy_indices)
             };
 
             if let Some(idx) = selected_idx {
@@ -624,6 +722,302 @@ mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
 
+    // ── Capacity fit gate (cache-hit path) ──────────────────────────────
+    //
+    // The gate mirrors the production incidents of 2026-10-19: cache-hit
+    // continuations pinned to a tenant that had no room for them
+    // (scheduler admission wedge + forward OOM). The projection must use
+    // the SAME estimator the router charges at dispatch
+    // (chars / chars_per_token), carried per-request on SelectWorkerInfo.
+    //
+    // Tests plant the tenant directly in the policy tree and route a
+    // continuation strictly extending the planted prefix, so the cache-hit
+    // path (not tie-breaks or the imbalance path) is what is exercised.
+    // Balance valves are set huge so they never fire — these tests must
+    // exercise the gate, not load-shedding.
+
+    /// Gate-test config: cache_threshold 0.0 (any match > 0 is a hit) and
+    /// balance valves neutralized (the loads here dwarf the production
+    /// defaults, so without huge valves the imbalance path would hijack
+    /// the selection before the gate is ever reached).
+    fn gate_test_config(capacity_per_worker_tokens: Option<u64>) -> CacheAwareConfig {
+        CacheAwareConfig {
+            cache_threshold: 0.0,
+            balance_abs_threshold: 10_000_000,
+            balance_abs_threshold_tokens: 1_000_000 * 1000,
+            eviction_interval_secs: 0,
+            capacity_per_worker_tokens,
+            ..Default::default()
+        }
+    }
+
+    /// Plant a `conv` prefix → w0's URL in the regular-pool tree, so a
+    /// request starting with `conv` is a guaranteed cache hit with w0 as
+    /// tenant (mirrors what the conversation's own first request leaves
+    /// behind in the tree).
+    fn plant_tenant_on_w0(policy: &CacheAwarePolicy) {
+        let tree_key = format!("regular::{}", UNKNOWN_MODEL_ID);
+        policy
+            .trees
+            .entry(tree_key)
+            .or_insert_with(|| Arc::new(Tree::new()))
+            .insert("conv", "http://w0:8000");
+    }
+
+    /// Continuation request extending the planted `conv` prefix with `n`
+    /// extra chars → total text of `4 + n` chars.
+    fn continuation(n: usize) -> String {
+        format!("conv{}", "x".repeat(n))
+    }
+
+    /// Cache hit + tenant fits (projected ≤ cap): the gate must stay silent
+    /// and the tenant must win.
+    #[tokio::test]
+    async fn test_capacity_gate_tenant_fits_keeps_affinity() {
+        let policy = CacheAwarePolicy::with_config(gate_test_config(Some(300_000)));
+        let workers = make_two_gate_workers();
+        policy.init_workers(&workers);
+        plant_tenant_on_w0(&policy);
+
+        // Tenant holds a giant decode in flight. Request text is 100_000
+        // chars → est = 100_000 / 3.5 (fallback cpt) = 28_571 → projected
+        // 278_571 ≤ 300_000: the gate must not fire.
+        workers[0].increment_load();
+        workers[0].add_load_tokens(250_000);
+
+        let cont = continuation(99_996);
+        let info = SelectWorkerInfo {
+            request_text: Some(&cont),
+            chars_per_token: 0.0, // unset → policy falls back to the router default 3.5
+            ..Default::default()
+        };
+        let idx = policy.select_worker(&workers, &info).await.unwrap();
+        assert_eq!(
+            idx, 0,
+            "tenant projected 278_571 ≤ cap 300_000 — affinity must hold"
+        );
+    }
+
+    /// Cache hit + tenant over capacity: affinity must yield to the
+    /// min-token worker. This is the emerald/jade failure sequence: a
+    /// continuation arriving while the tenant holds its own giant decode
+    /// must not stack onto the same pool.
+    #[tokio::test]
+    async fn test_capacity_gate_tenant_over_cap_sheds_to_min_token_worker() {
+        let policy = CacheAwarePolicy::with_config(gate_test_config(Some(300_000)));
+        let workers = make_two_gate_workers();
+        policy.init_workers(&workers);
+        plant_tenant_on_w0(&policy);
+
+        // Tenant holds the giant decode in flight. Request text is 280_000
+        // chars → est = 280_000 / 3.5 = 80_000 → projected 330_000 >
+        // 300_000: must shed (w1 healthy at load 0 → strictly the min).
+        workers[0].increment_load();
+        workers[0].add_load_tokens(250_000);
+
+        let cont = continuation(279_996);
+        let info = SelectWorkerInfo {
+            request_text: Some(&cont),
+            chars_per_token: 0.0,
+            ..Default::default()
+        };
+        let idx = policy.select_worker(&workers, &info).await.unwrap();
+        assert_eq!(
+            idx, 1,
+            "250_000 + 80_000 = 330_000 > 300_000: cache-hit affinity must shed \
+             to the healthy min-token worker"
+        );
+    }
+
+    /// Gate off (`capacity_per_worker_tokens: None`, the default): behavior
+    /// must be byte-identical to pre-gate routing — the tenant always wins
+    /// a cache hit, even at loads no capacity would allow.
+    #[tokio::test]
+    async fn test_capacity_gate_none_preserves_gated_off_behavior() {
+        let policy = CacheAwarePolicy::with_config(gate_test_config(None));
+        let workers = make_two_gate_workers();
+        policy.init_workers(&workers);
+        plant_tenant_on_w0(&policy);
+
+        workers[0].increment_load();
+        workers[0].add_load_tokens(250_000);
+
+        // Same over-capacity projection as the shedding test (330_000) —
+        // but with the gate None it must pin to the tenant exactly as the
+        // pre-gate policy did.
+        let cont = continuation(279_996);
+        let info = SelectWorkerInfo {
+            request_text: Some(&cont),
+            chars_per_token: 0.0,
+            ..Default::default()
+        };
+        let idx = policy.select_worker(&workers, &info).await.unwrap();
+        assert_eq!(
+            idx, 0,
+            "None gate must preserve pre-gate behavior: tenant wins the cache hit"
+        );
+    }
+
+    /// ALL workers over capacity: the gate must still return the min-token
+    /// worker ��� never `None` (`None` fails the request upstream, and
+    /// queueing one request beats wedging a pool).
+    #[tokio::test]
+    async fn test_capacity_gate_all_over_cap_returns_min_token_worker() {
+        let policy = CacheAwarePolicy::with_config(gate_test_config(Some(300_000)));
+        let workers = make_two_gate_workers();
+        policy.init_workers(&workers);
+        plant_tenant_on_w0(&policy);
+
+        // Tenant w0 holds 299k; w1 holds 298k — both bust the cap once the
+        // 80k-est request is added, yet w1 is strictly lighter and must be
+        // chosen.
+        workers[0].increment_load();
+        workers[0].add_load_tokens(299_000);
+        workers[1].increment_load();
+        workers[1].add_load_tokens(298_000);
+
+        let cont = continuation(279_996);
+        let info = SelectWorkerInfo {
+            request_text: Some(&cont),
+            chars_per_token: 0.0,
+            ..Default::default()
+        };
+        let idx = policy
+            .select_worker(&workers, &info)
+            .await
+            .expect("over-capacity fleet must still return a worker, not None");
+        assert_eq!(
+            idx, 1,
+            "all workers over cap must fall back to the min-token worker"
+        );
+    }
+
+    /// The gate must compute est tokens from the INJECTED chars-per-token
+    /// rate — the same units the router charges at dispatch — not some
+    /// baked-in constant. Same 200_000-char request: with cpt 4.0 the
+    /// projection fits the cap (tenant wins), with cpt 3.5 it busts (shed).
+    #[tokio::test]
+    async fn test_capacity_gate_uses_injected_chars_per_token_units() {
+        let policy = CacheAwarePolicy::with_config(gate_test_config(Some(300_000)));
+        let workers = make_two_gate_workers();
+        policy.init_workers(&workers);
+        plant_tenant_on_w0(&policy);
+
+        workers[0].increment_load();
+        workers[0].add_load_tokens(250_000);
+
+        // 200_000 chars: / 4.0 = 50_000 est → projected 300_000, NOT over
+        // the cap → tenant keeps the request.
+        let cont = continuation(199_996);
+        let fits = SelectWorkerInfo {
+            request_text: Some(&cont),
+            chars_per_token: 4.0,
+            ..Default::default()
+        };
+        let idx = policy.select_worker(&workers, &fits).await.unwrap();
+        assert_eq!(
+            idx, 0,
+            "200_000 chars / 4.0 cpt = 50_000 est; 250_000 + 50_000 = 300_000 is \
+             not over cap — tenant must keep the request"
+        );
+
+        // Same text at the router default 3.5 → est 57_142 → projected
+        // 307_142 > cap → shed.
+        let sheds = SelectWorkerInfo {
+            request_text: Some(&cont),
+            chars_per_token: 3.5,
+            ..Default::default()
+        };
+        let idx_shed = policy.select_worker(&workers, &sheds).await.unwrap();
+        assert_eq!(
+            idx_shed, 1,
+            "200_000 chars / 3.5 cpt ≈ 57_142 est → 307_142 > cap — the injected \
+             rate's units must decide the shed"
+        );
+    }
+
+    /// Low cache match (no cache hit): the gate must not change the
+    /// low-match path — min-token selection with random tie-break, exactly
+    /// as the pre-gate policy, even with the gate armed.
+    #[tokio::test]
+    async fn test_capacity_gate_low_match_path_unchanged() {
+        let policy = CacheAwarePolicy::with_config(gate_test_config(Some(300_000)));
+        let workers = make_two_gate_workers();
+        policy.init_workers(&workers);
+
+        // w0 loaded over the cap on its own, w1 light. Unique (unseen)
+        // prompts have match_rate 0.0 → the LOW-match path must pick the
+        // min-token worker w1, same as pre-gate.
+        workers[0].increment_load();
+        workers[0].add_load_tokens(400_000);
+
+        for i in 0..20 {
+            let prompt = format!("unique_prompt_{i}");
+            let info = SelectWorkerInfo {
+                request_text: Some(&prompt),
+                chars_per_token: 0.0,
+                ..Default::default()
+            };
+            let idx = policy.select_worker(&workers, &info).await.unwrap();
+            assert_eq!(
+                idx, 1,
+                "low-match selection {i} went to the over-capacity worker — the \
+                 capacity gate must not alter the low-match path"
+            );
+        }
+    }
+
+    /// A shed must not corrupt tree state: the planted tenant stays intact
+    /// so a later in-cap request still rides the hit. (The stale-tenant
+    /// removal only runs when NO candidate is found — the shed path always
+    /// finds the min-token worker and re-points the request's own text.)
+    #[tokio::test]
+    async fn test_capacity_gate_shed_preserves_planted_tenant() {
+        let policy = CacheAwarePolicy::with_config(gate_test_config(Some(300_000)));
+        let workers = make_two_gate_workers();
+        policy.init_workers(&workers);
+        plant_tenant_on_w0(&policy);
+
+        workers[0].increment_load();
+        workers[0].add_load_tokens(250_000);
+
+        // Shed.
+        let cont = continuation(279_996);
+        let sheds = SelectWorkerInfo {
+            request_text: Some(&cont),
+            chars_per_token: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(policy.select_worker(&workers, &sheds).await.unwrap(), 1);
+
+        // The planted tenant must be untouched for the planted prefix.
+        let tree_key = format!("regular::{}", UNKNOWN_MODEL_ID);
+        let tenant = policy
+            .trees
+            .get(&tree_key)
+            .map(|t| t.value().prefix_match_with_counts("conv").tenant)
+            .expect("tree must still exist");
+        assert_eq!(
+            &*tenant, "http://w0:8000",
+            "shedding must not evict the planted tenant"
+        );
+    }
+
+    fn make_two_gate_workers() -> Vec<Arc<dyn Worker>> {
+        vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://w0:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+        ]
+    }
+
     #[tokio::test]
     async fn test_cache_aware_with_balanced_load() {
         // Create policy without eviction thread for testing
@@ -698,6 +1092,7 @@ mod tests {
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 0, // Disable eviction thread
             max_tree_size: 10000,
+            capacity_per_worker_tokens: None,
         });
 
         let worker1 = BasicWorkerBuilder::new("http://w1:8000")
@@ -740,6 +1135,7 @@ mod tests {
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 0,
             max_tree_size: 10000,
+            capacity_per_worker_tokens: None,
         });
 
         let num_workers = 5;

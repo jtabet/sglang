@@ -92,6 +92,7 @@ mod pd_routing_unit_tests {
                 cache_threshold: 0.5,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                capacity_per_worker_tokens: None,
             },
             PDSelectionPolicy::Bucket {
                 balance_abs_threshold: 32,
@@ -171,6 +172,7 @@ mod pd_routing_unit_tests {
                     balance_rel_threshold: 1.2,
                     eviction_interval_secs: 60,
                     max_tree_size: 1000000,
+                    capacity_per_worker_tokens: None,
                 },
             ),
             (
@@ -474,6 +476,7 @@ mod pd_routing_unit_tests {
                     cache_threshold: 0.5,
                     balance_abs_threshold: 32,
                     balance_rel_threshold: 1.1,
+                    capacity_per_worker_tokens: None,
                 },
                 false,
             ),
@@ -922,6 +925,7 @@ mod pd_routing_unit_tests {
             cache_threshold: 0.5,
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.1,
+            capacity_per_worker_tokens: None,
         };
     }
 }

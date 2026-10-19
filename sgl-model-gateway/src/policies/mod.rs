@@ -126,6 +126,26 @@ pub struct CacheAwareConfig {
     pub balance_rel_threshold: f32,
     pub eviction_interval_secs: u64,
     pub max_tree_size: usize,
+    /// Per-worker capacity gate for the cache-hit path, in *estimated*
+    /// tokens. `None` (default) disables the gate: routing behavior is
+    /// exactly the pre-gate affinity behavior. `Some(n)` arms it: when the
+    /// prefix-match tenant's projected token load — its in-flight
+    /// `load_tokens()` plus this request's estimated tokens (same
+    /// chars/token estimator the router charges at dispatch) — would exceed
+    /// `n`, the request falls through to the load-based (min tokens)
+    /// selection instead of pinning to the tenant. If no worker fits, the
+    /// min-token worker is returned anyway (the request is never failed by
+    /// the gate itself).
+    ///
+    /// Size `n` to the worker pool's KV capacity in tokens minus a safety
+    /// margin. The estimate is chars-based (the policy path has no
+    /// tokenizer), so err conservative: real tokenizers can expand text and
+    /// decode tokens also consume the pool beyond this estimate. Fleet
+    /// sizing example: ~355k-token pools serving 174k–224k-token agent
+    /// requests → ~190k = at most one of those big requests admitted at a
+    /// time per worker; stacking a second wedges the scheduler in admission
+    /// or OOMs the forward.
+    pub capacity_per_worker_tokens: Option<u64>,
 }
 
 impl Default for CacheAwareConfig {
@@ -137,6 +157,7 @@ impl Default for CacheAwareConfig {
             balance_rel_threshold: 1.1,
             eviction_interval_secs: 30,
             max_tree_size: 10000,
+            capacity_per_worker_tokens: None,
         }
     }
 }
@@ -194,6 +215,14 @@ pub struct SelectWorkerInfo<'a> {
     /// - X-SMG-Target-Worker: Direct routing to a specific worker by index
     /// - X-SMG-Routing-Key: Consistent hash routing for session affinity
     pub headers: Option<&'a http::HeaderMap>,
+    /// Chars-per-token ratio used to estimate this request's token count
+    /// from its text length. Consumed by capacity-aware routing decisions
+    /// (cache_aware's per-worker capacity gate) so their token estimates
+    /// match the units workers are charged in at dispatch
+    /// (`WorkerLoadGuard::new_weighted`, which divides the same text length
+    /// by this rate, falling back to 3.5). `0.0` means "unset" — consumers
+    /// apply their own conservative fallback (3.5, the router default).
+    pub chars_per_token: f32,
     /// Pre-computed hash ring for O(log n) consistent hashing
     /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
     pub hash_ring: Option<Arc<HashRing>>,

@@ -1091,6 +1091,7 @@ impl PDRouter {
                     request_text,
                     tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
                     headers,
+                    chars_per_token: 0.0,
                     hash_ring,
                 },
             )
