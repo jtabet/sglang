@@ -4014,6 +4014,16 @@ class Scheduler(
                 for r in running_batch.reqs
                 if len(r.origin_input_ids) >= lc_min_tokens
             )
+            # The mid-chunk request is in flight too (its proportional
+            # transient materializes as it runs) but is not in running_batch
+            # until its prefill completes — count it here or a 3rd long-context
+            # request slips in behind a running + a chunking one (crash #18:
+            # 3 in flight tipped the ~3GB dynamic region; 2 is the safe count).
+            if (
+                self.chunked_req is not None
+                and len(self.chunked_req.origin_input_ids) >= lc_min_tokens
+            ):
+                lc_used_tokens += len(self.chunked_req.origin_input_ids)
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
