@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 MINT_UNCLAIMED_MINTS = 3
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
+    EvictParams,
     InsertParams,
     MatchResult,
 )
@@ -553,12 +554,27 @@ class UnifiedCacheLinkerWrapper:
             # the SSM state will be computed during prefill of the loaded tail.
             mamba_alloc = cache.req_to_token_pool.mamba_allocator.alloc(1)
             if mamba_alloc is None:
-                # Not enough mamba slots. Abort the load-back gracefully:
-                # free the KV device indices we allocated, then return the
-                # "no hit" result so the request falls back to normal prefill.
+                # No free mamba slot. Before giving up, evict one retained
+                # (finished-request) state to make room — this mirrors
+                # mamba.py:prepare_load_back, which already does this for the
+                # HiCache path. The external mooncake linker used to abort
+                # straight to a full prefix recompute here, which on a hybrid
+                # model is a sequential multi-minute prefill + a large
+                # activation alloc that OOM'd the card (the 425->cloud shed
+                # class, 2026-10-20). Aborting must be a last resort, not the
+                # default: a cheap evict converts "250s recompute" into a
+                # fast load-back at zero memory cost.
+                cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+                mamba_alloc = cache.req_to_token_pool.mamba_allocator.alloc(1)
+            if mamba_alloc is None:
+                # Still no slot after eviction: genuinely exhausted (nothing
+                # evictable). Abort the load-back gracefully — free the KV
+                # device indices we allocated, then return the "no hit" result
+                # so the request falls back to normal prefill.
                 logger.warning(
-                    "linker.load_back: rid=%s — mamba allocator exhausted, "
-                    "aborting load-back (prefill will recompute the prefix)",
+                    "linker.load_back: rid=%s — mamba allocator exhausted "
+                    "after evict, aborting load-back (prefill will recompute "
+                    "the prefix)",
                     req.rid,
                 )
                 self._update_load(
