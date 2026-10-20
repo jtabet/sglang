@@ -43,7 +43,6 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_serving,
     get_spec,
-    is_config_namespace_published,
     publish,
 )
 
@@ -4531,11 +4530,16 @@ class Scheduler(
         # Forensics first: capture what held the memory BEFORE any recovery
         # (synchronize/empty_cache) destroys the evidence. Best-effort.
         try:
-            dump_oom_memory_snapshot(
+            _ctx = get_context()
+            _oom_folder = (
                 get_observability().crash_dump_folder
-                if is_config_namespace_published("observability")
+                if _ctx.is_config_namespace_published("observability")
                 else None
             )
+        except Exception:  # noqa: BLE001
+            _oom_folder = None
+        try:
+            dump_oom_memory_snapshot(_oom_folder)
         except Exception:  # noqa: BLE001
             pass
         if self.ps.tp_size > 1:
