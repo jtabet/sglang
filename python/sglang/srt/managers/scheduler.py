@@ -43,6 +43,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_serving,
     get_spec,
+    is_config_namespace_published,
     publish,
 )
 
@@ -346,6 +347,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
     triton_load_watch,
 )
+from sglang.srt.utils.oom_memory_snapshot import dump_oom_memory_snapshot
 from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
@@ -1902,6 +1904,17 @@ class Scheduler(
         # Triton kernel device-load is a lazy first-use at serving time.
         triton_load_watch.install()
         triton_load_watch.mark_serving_started()
+        # Optional OOM forensics: record allocator allocation-stacks from
+        # serving start so an OOM snapshot names the holders
+        # (SGLANG_OOM_MEMORY_SNAPSHOT=record). Best-effort: keep serving if
+        # the observability bag is unpublished (e.g. test harnesses).
+        try:
+            _oom_dump_folder = get_observability().crash_dump_folder
+        except (ValueError, AssertionError):
+            _oom_dump_folder = None
+        from sglang.srt.utils.oom_memory_snapshot import maybe_start_recording
+
+        maybe_start_recording(_oom_dump_folder)
 
         if use_mlx():
             # MLX overlap uses mx.async_eval for CPU/GPU overlap,
@@ -4515,6 +4528,16 @@ class Scheduler(
         re-raise so the process takes the normal crash/restart path.
         """
         free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024)
+        # Forensics first: capture what held the memory BEFORE any recovery
+        # (synchronize/empty_cache) destroys the evidence. Best-effort.
+        try:
+            dump_oom_memory_snapshot(
+                get_observability().crash_dump_folder
+                if is_config_namespace_published("observability")
+                else None
+            )
+        except Exception:  # noqa: BLE001
+            pass
         if self.ps.tp_size > 1:
             logger.error(
                 "OOM-GUARD FATAL: forward OOM on tp_rank %d/%d (device free "
