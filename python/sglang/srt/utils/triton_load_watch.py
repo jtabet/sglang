@@ -35,6 +35,76 @@ logger = logging.getLogger(__name__)
 _serving_started = False
 _prev_compile_listener = None
 _installed = False
+_oom_witness_dumped = False
+
+
+def _dump_oom_witness(free_gb):
+    """One-shot faulthandler + allocator-snapshot witness dump.
+
+    Fires on the first serving-time device-load under the warning threshold
+    (i.e. on the allocating thread under memory pressure). Writes:
+      - faulthandler stack of EVERY thread (the current one is inside or
+        adjacent to the large allocation that is about to fail),
+      - a torch.cuda memory._dump_snapshot pickle (carries per-allocation
+        stacks when SGLANG_OOM_MEMORY_SNAPSHOT=record is on),
+      - torch.cuda.memory_stats() summary lines.
+    Never raises: diagnostics must not kill serving.
+    """
+    global _oom_witness_dumped
+    if _oom_witness_dumped:
+        return
+    _oom_witness_dumped = True
+    import faulthandler
+    import os
+    import time
+    import traceback
+
+    try:
+        folder = None
+        try:
+            from sglang.srt.runtime_context import (
+                get_context,
+                get_observability,
+            )
+
+            ctx = get_context()
+            if ctx.is_config_namespace_published("observability"):
+                folder = get_observability().crash_dump_folder
+        except Exception:  # noqa: BLE001
+            folder = None
+        ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+        txt = os.path.join(folder or "/tmp", f"oom_witness_{ts}.txt")
+        with open(txt, "w") as f:
+            f.write(f"oom witness at {time.time()} free_gb={free_gb}\n")
+            f.flush()
+            faulthandler.dump_traceback(file=f, all_threads=True)
+            try:
+                stats = torch.cuda.memory_stats()
+                f.write("\nmemory_stats: ")
+                for k in (
+                    "reserved_bytes.all.current",
+                    "reserved_bytes.all.peak",
+                    "allocation.all.current",
+                    "allocation.all.peak",
+                    "segment.all.current",
+                ):
+                    f.write(f"{k}={stats.get(k, 0)} ")
+                f.write("\n")
+            except Exception:  # noqa: BLE001
+                pass
+        snap = os.path.join(folder or "/tmp", f"oom_witness_snapshot_{ts}.pickle")
+        try:
+            torch.cuda.memory._dump_snapshot(snap)
+        except Exception:  # noqa: BLE001
+            snap = None
+        logger.error(
+            "TRITON-LOAD OOM WITNESS: threads=%s snapshot=%s (folder=%s)",
+            txt,
+            snap or "<dump failed>",
+            folder or "/tmp",
+        )
+    except Exception:  # noqa: BLE001
+        logger.error("oom witness dump failed:\n%s", traceback.format_exc())
 
 
 def install() -> None:
@@ -119,3 +189,12 @@ def _on_kernel_load(module, function, name, metadata_group, hash) -> None:
     if should_crash:
         raise RuntimeError(msg)
     logger.warning(msg)
+    # A serving-time device-load under memory pressure is also the moment
+    # large first-use allocations are failing nearby (the load runs on the
+    # allocating thread — the stack below it IS the allocation context).
+    # Dump faulthandler stacks + an allocator snapshot once, best-effort, so
+    # an imminent WARP_MMU_FAULT can be attributed post-mortem. The pipe-
+    # watcher approach (tail of the container stdout) loses this race: the
+    # fault kills the process ~2s later and tail competes with the kubelet
+    # for the log stream.
+    _dump_oom_witness(free_gb)
