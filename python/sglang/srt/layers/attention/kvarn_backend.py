@@ -38,6 +38,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.quantization.kvarn.config import KVarNConfig
 from sglang.srt.layers.quantization.kvarn.flush_manager import KVarNFlushManager
 from sglang.srt.layers.quantization.kvarn.hadamard import build_hadamard
+from sglang.srt.utils.common import next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -765,19 +766,40 @@ class KVarNAttnBackend(AttentionBackend):
         use must be launched once at init to load its cubin while memory is
         plentiful:
 
-        - ``alloc_extend_kernel`` (KV-cache allocator extend) specializes on
-          ``bs_upper`` (next_power_of_2 of the batch size). The fleet runs
-          ``max_running_requests=4``, so ``bs_upper`` in {1, 2, 4}.
+        - ``alloc_extend_kernel`` / ``alloc_decode_kernel`` (KV-cache
+          allocators) specialize on ``bs_upper`` =
+          ``next_power_of_2(current_batch_size)`` and launch eagerly on every
+          admission wave, so every batch size the scheduler can form maps to
+          a distinct cubin. Warm ALL of them: a deployment with
+          ``max_running_requests=8`` hits bs_upper=8 (and, via mixed
+          prefill+decode chunks, every bs in between) on its first real
+          traffic wave — doing that JIT load while the dynamic region is
+          nearly empty tripped a WARP_MMU_FAULT (viridian crash #8
+          2026-10-20 09:15:33Z: free 0.49 -> 0.04 GiB during the first
+          6x~80k-token burst, 3x 853MB gate_up alloc failures + allocator
+          JIT/compaction churn). The loop is therefore derived from
+          ``max_running_requests`` (up to 8) instead of hardcoded {1,2,4}
+          (which encoded the fleet's max_running=4).
         - ``_fused_sigmoid_mul_kernel`` (GDN attention-output gate) specializes
           on ``hidden_dim``/``HEAD_DIM``/``BLOCK_H``. ``BLOCK_H`` is 1024 for
           <1024 tokens and 2048 above; cover both.
         """
         device = self.device
         page_size = self.page_size
+        # max_running is the scheduler's per-batch ceiling (self.pool_slots
+        # was derived from the same number in _init_pools); cover 1..cap
+        # (capped at 8 so pathological configs don't stall startup).
+        max_running = getattr(self, "_warmup_max_bs", 0) or max(
+            1, min(8, (self.model_runner.server_args.max_running_requests or 8))
+        )
+        batch_sizes = sorted({1, 2, 4, 8} & set(range(1, max_running + 1)))
 
-        from sglang.kernels.ops.memory.allocator import alloc_extend_kernel
+        from sglang.kernels.ops.memory.allocator import (
+            alloc_decode_kernel,
+            alloc_extend_kernel,
+        )
 
-        for bs in (1, 2, 4):
+        for bs in batch_sizes:
             bs_upper = 1 << (bs - 1).bit_length()
             prefix_lens = torch.zeros(bs, dtype=torch.int32, device=device)
             seq_lens = torch.full((bs,), page_size, dtype=torch.int32, device=device)
@@ -793,6 +815,23 @@ class KVarNAttnBackend(AttentionBackend):
                 free_pages,
                 out_indices,
                 bs_upper,
+                page_size,
+            )
+            # Decode allocator: one slot per request (num_new_pages <= 1 per
+            # request at page boundary; the kernel reads seq_lens/last_loc
+            # and emits out_indices per request). Dummy state below mirrors
+            # the kernel's contract: every request exactly one page into a
+            # fresh page, so the decode pass needs no new pages from the
+            # free list (free_pages values are irrelevant for that path).
+            seq_lens_d = torch.full((bs,), page_size, dtype=torch.int32, device=device)
+            last_loc_d = torch.full((bs,), page_size - 2, dtype=torch.int32, device=device)
+            out_indices_d = torch.empty(bs, dtype=torch.int64, device=device)
+            alloc_decode_kernel[(bs,)](
+                seq_lens_d,
+                last_loc_d,
+                free_pages,
+                out_indices_d,
+                next_power_of_2(bs),
                 page_size,
             )
 
