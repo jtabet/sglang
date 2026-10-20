@@ -15,6 +15,8 @@ client (503) instead of looping the waiting queue.
 from dataclasses import dataclass
 from typing import Dict, Iterable
 
+import torch
+
 from sglang.srt.environ import envs
 
 
@@ -35,6 +37,34 @@ class ShedPlan:
     post_stripes: Dict[str, int]
 
 
+def device_free_mb_allocator_aware() -> float:
+    """Device free memory (MB) including the allocator's unused reserved
+    segments — the hot-path equivalent of boot-time "avail mem", which
+    sglang measures as raw free *after* an ``empty_cache()`` flush.
+
+    Reading raw ``mem_get_info`` free alone is wrong in the hot path: the
+    caching allocator holds freed blocks as reserved-but-reusable segments
+    and does not return them to the driver. Raw free can sit at ~70MB while
+    effective free is ~2.9GB (the segments a flush would release) — the
+    2026-10-20 gate incident: a threshold read against raw free fired on
+    every batch and hard-shed all traffic.
+
+    Equivalent to post-``empty_cache()`` free without calling it (that
+    synchronizes the device and adds jitter to every scheduler iteration):
+
+        effective free = driver free + (reserved - allocated)
+
+    where ``reserved - allocated`` is exactly what ``empty_cache()`` would
+    return to the driver (PyTorch's own docs: empty_cache "releases all
+    unoccupied cached memory").
+    """
+
+    free_bytes, _total = torch.cuda.mem_get_info()
+    reserved = torch.cuda.memory_reserved()
+    allocated = torch.cuda.memory_allocated()
+    return (free_bytes + max(reserved - allocated, 0)) / (1024 * 1024)
+
+
 def plan_oom_shed(
     *,
     rids: Iterable[str],
@@ -42,6 +72,7 @@ def plan_oom_shed(
     beam_rids: Iterable[str] = (),
     strikes: Dict[str, int] = None,
     cap: int = None,
+    streamed_rids: Iterable[str] = (),
 ) -> ShedPlan:
     """Plan the shed for a batch.
 
@@ -49,9 +80,18 @@ def plan_oom_shed(
     included). Finished requests are skipped entirely: their KV is freed by
     the *previous* batch's result processing, and freeing them here too would
     double-free the pool.
+
+    ``streamed_rids``: requests that already streamed tokens to the client.
+    These are never hard-shed at the strike cap: a mid-stream abort is an
+    SSE error frame inside an already-committed HTTP 200 — no upstream
+    classifier can intercept it, so it always surfaces to the client as a
+    retryable-looking error. They strike and requeue like everyone else;
+    under sustained exhaustion they wait (visible as latency, not as a
+    crash surface), which is the correct degradation.
     """
     finished = set(finished_rids)
     beam = set(beam_rids)
+    streamed = set(streamed_rids)
     ledger = dict(strikes or {})
     if cap is None:
         cap = envs.SGLANG_OOM_SHED_MAX_STRIKES.get()
@@ -67,7 +107,7 @@ def plan_oom_shed(
             abort.append(rid)
             continue
         n = ledger.get(rid, 0) + 1
-        if n > cap:
+        if n > cap and rid not in streamed:
             ledger.pop(rid, None)
             abort.append(rid)
         else:

@@ -22,12 +22,13 @@ from sglang.srt.managers.utils import GenerationBatchResult  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
 
 
-def make_req(rid, finished=False, beam_group=None):
+def make_req(rid, finished=False, beam_group=None, output_ids=None):
     return types.SimpleNamespace(
         rid=rid,
         finished=lambda: finished,
         beam_group=beam_group,
         to_finish=None,
+        output_ids=output_ids or [],
     )
 
 
@@ -86,6 +87,37 @@ def test_plan_sheds_beam_groups_without_strike():
     assert plan.requeue_rids == ["b"]
     assert plan.abort_rids == ["a"]
     assert "a" not in plan.post_stripes  # beam shed does not strike
+
+
+def test_plan_never_hard_sheds_streamed_requests():
+    # The 2026-10-20 incident: mid-stream aborts are SSE error frames inside
+    # an already-committed HTTP 200 — no classifier can intercept them, so a
+    # streamed request must never hit the strike-cap hard-shed.
+    plan = plan_oom_shed(
+        rids=["a", "b"],
+        finished_rids=set(),
+        beam_rids=set(),
+        strikes={"a": 3, "b": 3},
+        cap=3,
+        streamed_rids={"a"},
+    )
+    # "a" streamed -> requeues forever under sustained exhaustion (latency,
+    # not a client-facing crash surface). "b" never streamed -> hard-sheds.
+    assert plan.requeue_rids == ["a"]
+    assert plan.abort_rids == ["b"]
+    assert plan.post_stripes == {"a": 4}
+
+
+def test_plan_streamed_rids_not_in_batch_is_noop():
+    plan = plan_oom_shed(
+        rids=["a"],
+        finished_rids=set(),
+        beam_rids=set(),
+        strikes={"a": 3},
+        cap=3,
+        streamed_rids={"z"},  # not in this batch
+    )
+    assert plan.abort_rids == ["a"]
 
 
 # ---------------------------------------------------------------------------
@@ -238,11 +270,62 @@ def fake_cuda(monkeypatch):
     monkeypatch.setattr(
         torch.cuda,
         "mem_get_info",
-        lambda: (268_435_456, 8_589_934_592),  # 256MB free, 8GB total
+        lambda *a, **k: (268_435_456, 8_589_934_592),  # 256MB free, 8GB total
         raising=True,
     )
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None, raising=True)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda *a, **k: None, raising=True)
+
+
+# ---------------------------------------------------------------------------
+# device_free_mb_allocator_aware: the gate metric (pins the incident numbers)
+# ---------------------------------------------------------------------------
+
+
+def test_free_metric_counts_reserved_unused_segments(monkeypatch):
+    # The 2026-10-20 incident shape: driver free 72MB while the allocator
+    # holds ~2.78GB reserved-but-reusable. The gate must read ~2.85GB —
+    # what an empty_cache() flush would release — not the raw 72MB.
+    import torch
+
+    from sglang.srt.managers.scheduler_components.oom_guard import (
+        device_free_mb_allocator_aware,
+    )
+
+    driver_free = 72 * 1024 * 1024
+    reserved = 2780 * 1024 * 1024
+    allocated = 12 * 1024 * 1024
+    monkeypatch.setattr(
+        torch.cuda, "mem_get_info", lambda *a, **k: (driver_free, 24 * 1024**3)
+    )
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *a, **k: reserved)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *a, **k: allocated)
+
+    got = device_free_mb_allocator_aware()
+    assert int(got) == 2840  # 72 + (2780 - 12) = 2840MB, not 72MB
+
+    # Inverse shape: no reusable segments -> metric == raw free exactly.
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *a, **k: allocated)
+    got = device_free_mb_allocator_aware()
+    assert int(got) == 72
+
+
+def test_free_metric_never_drops_below_raw_free(monkeypatch):
+    # allocated > reserved (sub-allocator edge) must clamp at 0, never go
+    # negative and subtract from real free.
+    import torch
+
+    from sglang.srt.managers.scheduler_components.oom_guard import (
+        device_free_mb_allocator_aware,
+    )
+
+    monkeypatch.setattr(
+        torch.cuda, "mem_get_info", lambda *a, **k: (512 * 1024**2, 8 * 1024**3)
+    )
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *a, **k: 0)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *a, **k: 2**30)
+    got = device_free_mb_allocator_aware()
+    assert int(got) == 512
 
 
 def test_forward_catch_tp1_recovers_and_sheds(scheduler_module, fake_cuda):

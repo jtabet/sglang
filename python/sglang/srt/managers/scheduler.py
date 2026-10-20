@@ -221,7 +221,10 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.managers.scheduler_components.oom_guard import plan_oom_shed
+from sglang.srt.managers.scheduler_components.oom_guard import (
+    device_free_mb_allocator_aware,
+    plan_oom_shed,
+)
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
     DynamicChunkSizer,
@@ -4408,7 +4411,13 @@ class Scheduler(
                 batch.sampling_info = sched_sampling_info
 
     def _min_device_free_mb_across_tp(self) -> float:
-        """Real device free memory (MB), min'd across the TP group.
+        """Effective free memory (MB), min'd across the TP group.
+
+        Reads the allocator-aware free (driver free + the allocator's unused
+        reserved segments — what an ``empty_cache()`` flush would release),
+        NOT raw driver free: raw free collapses to ~70MB once the caching
+        allocator hoards freed blocks, while effective free stays ~2.9GB.
+        Delegates to oom_guard.device_free_mb_allocator_aware.
 
         Uses the CPU (gloo) group so the check stays sound even while the
         CUDA context is under memory pressure. Ranks schedule the same
@@ -4416,7 +4425,7 @@ class Scheduler(
         gate decision rank-symmetric: no rank can enter the forward and OOM
         while a peer does not.
         """
-        free_mb = torch.cuda.mem_get_info()[0] / (1024 * 1024)
+        free_mb = device_free_mb_allocator_aware()
         if self.ps.tp_size > 1 and self.tp_cpu_group is not None:
             world = torch.distributed.get_world_size(group=self.tp_cpu_group)
             gathered = [torch.empty(1, dtype=torch.float64) for _ in range(world)]
@@ -4446,6 +4455,7 @@ class Scheduler(
             finished_rids={r.rid for r in all_reqs if r.finished()},
             beam_rids={r.rid for r in all_reqs if r.beam_group is not None},
             strikes=self.oom_shed_strikes,
+            streamed_rids={r.rid for r in all_reqs if len(r.output_ids) > 0},
         )
         self.oom_shed_strikes = plan.post_stripes
         requeue_rids, abort_rids = set(plan.requeue_rids), set(plan.abort_rids)
@@ -4622,6 +4632,10 @@ class Scheduler(
             and len(batch.reqs) > 0
             and not batch.forward_mode.is_idle()
         ):
+            # Allocator-aware free (driver free + unused reserved segments) —
+            # see oom_guard.device_free_mb_allocator_aware. Raw mem_get_info
+            # free collapses to ~70MB under steady load (the allocator hoards
+            # freed blocks) and gated every batch: the 2026-10-20 incident.
             free_mb = self._min_device_free_mb_across_tp()
             if free_mb < oom_guard_mb:
                 return self._shed_batch_for_oom(batch, free_mb=free_mb, cause="gate")
