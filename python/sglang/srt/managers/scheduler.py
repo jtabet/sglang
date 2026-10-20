@@ -5234,6 +5234,17 @@ class Scheduler(
                             now - self._stall_pool_watch_since,
                         )
                         self.waiting_queue.pop(0)
+                        # The retirement helper formats `reason.message` from
+                        # the FinishReason *enum* — the failed-request object
+                        # itself is the wrong argument (crash class: celadon
+                        # 08:21:24Z, AttributeError 'NoneType' object has no
+                        # attribute 'message', scheduler child died at the
+                        # fail-out deadline). Synthesize the abort reason and
+                        # set it on the request before retiring.
+                        _stuck.finished_reason = FINISH_ABORT(
+                            message="shed at admission: queue head stuck "
+                            f"{_failout_secs:.0f}s (STALL-POOL fail-out)"
+                        )
                         self.retire_unadmitted_request(_stuck)
                         self._stall_pool_watch_rid = None
                         self._stall_pool_watch_since = 0.0
