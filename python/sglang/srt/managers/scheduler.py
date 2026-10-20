@@ -4076,12 +4076,17 @@ class Scheduler(
             if (
                 lc_min_tokens > 0
                 and lc_max_inflight > 0
+                and lc_used_tokens > 0
                 and len(req.origin_input_ids) >= lc_min_tokens
                 and lc_used_tokens + len(req.origin_input_ids) > lc_max_inflight
             ):
                 # Long-context admission budget exhausted: defer this request
                 # to the waiting queue; it is retried once enough in-flight
-                # long-context requests finish.
+                # long-context requests finish. Note the lc_used_tokens > 0
+                # guard: a request whose prompt alone exceeds the budget is
+                # still admitted when nothing else long-context is in flight
+                # (its solo transient fits the dynamic region) instead of
+                # being starved forever by its own size.
                 continue
 
             if self.enable_hicache_storage:
