@@ -614,6 +614,13 @@ class Envs:
     # A request shed that many times without fitting is hard-shed to the
     # client (503) instead of looping the waiting queue forever.
     SGLANG_OOM_SHED_MAX_STRIKES = EnvInt(3)
+    # Long-context admission budget: a request whose prompt is at least
+    # SGLANG_LONG_CONTEXT_MIN_PROMPT_TOKENS tokens is "long-context", and the
+    # scheduler defers (keeps queued) new long-context requests once the sum
+    # of their prompt lengths across concurrently in-flight requests exceeds
+    # SGLANG_LONG_CONTEXT_MAX_INFLIGHT_TOKENS. Both default 0 (disabled).
+    SGLANG_LONG_CONTEXT_MIN_PROMPT_TOKENS = EnvInt(0)
+    SGLANG_LONG_CONTEXT_MAX_INFLIGHT_TOKENS = EnvInt(0)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output

@@ -3998,6 +3998,23 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
+        # Long-context admission budget (env-gated; both 0 = disabled). On
+        # memory-tight TP1 cards a single very long prompt materializes a
+        # transient staging buffer proportional to the full prompt length
+        # (measured ~8 KiB/token in the attention path), so N concurrent
+        # 100k+ requests OOM the dynamic region even though the KV pool
+        # admits them. Cap the SUM of in-flight long-context prompt tokens;
+        # overflow stays queued (served as peers finish) instead of crashing.
+        lc_min_tokens = envs.SGLANG_LONG_CONTEXT_MIN_PROMPT_TOKENS.get()
+        lc_max_inflight = envs.SGLANG_LONG_CONTEXT_MAX_INFLIGHT_TOKENS.get()
+        lc_used_tokens = 0
+        if lc_min_tokens > 0:
+            lc_used_tokens = sum(
+                len(r.origin_input_ids)
+                for r in running_batch.reqs
+                if len(r.origin_input_ids) >= lc_min_tokens
+            )
+
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
@@ -4046,6 +4063,17 @@ class Scheduler(
                 ):
                     break
 
+            if (
+                lc_min_tokens > 0
+                and lc_max_inflight > 0
+                and len(req.origin_input_ids) >= lc_min_tokens
+                and lc_used_tokens + len(req.origin_input_ids) > lc_max_inflight
+            ):
+                # Long-context admission budget exhausted: defer this request
+                # to the waiting queue; it is retried once enough in-flight
+                # long-context requests finish.
+                continue
+
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(
                     req.cache_request_handle
@@ -4081,6 +4109,16 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+
+            if res == AddReqResult.CONTINUE:
+                # The request was admitted: charge its full prompt length
+                # against the long-context budget (its proportional transient
+                # materializes as it runs, so the whole prompt counts).
+                if (
+                    lc_min_tokens > 0
+                    and len(req.origin_input_ids) >= lc_min_tokens
+                ):
+                    lc_used_tokens += len(req.origin_input_ids)
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
