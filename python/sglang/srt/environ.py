@@ -621,6 +621,17 @@ class Envs:
     # SGLANG_LONG_CONTEXT_MAX_INFLIGHT_TOKENS. Both default 0 (disabled).
     SGLANG_LONG_CONTEXT_MIN_PROMPT_TOKENS = EnvInt(0)
     SGLANG_LONG_CONTEXT_MAX_INFLIGHT_TOKENS = EnvInt(0)
+    # Derived admission rule (T1+T2+solo; see scheduler_components/admission.py).
+    # SGLANG_ADMISSION_TRANSIENT_KIB_PER_TOKEN is the measured staging-transient
+    # constant k (KiB per token of extending sequence length; both fleets
+    # measured ~8). The rule activates only when the long-context threshold
+    # (SGLANG_LONG_CONTEXT_MIN_PROMPT_TOKENS) is set: T = that threshold,
+    # recommended 2 x chunked_prefill_size. SGLANG_ADMISSION_MIN_F_FRAG_BYTES
+    # is a floor on the fragmented-contiguous headroom the T2 term trusts —
+    # a snapshot walk below this (or 0 = unmeasurable) falls back to the flat
+    # lc-budget deferral instead of admitting on a guessed F_frag.
+    SGLANG_ADMISSION_TRANSIENT_KIB_PER_TOKEN = EnvInt(8)
+    SGLANG_ADMISSION_MIN_F_FRAG_BYTES = EnvInt(0)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output

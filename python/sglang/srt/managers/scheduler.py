@@ -225,6 +225,11 @@ from sglang.srt.managers.scheduler_components.oom_guard import (
     device_free_mb_allocator_aware,
     plan_oom_shed,
 )
+from sglang.srt.managers.scheduler_components.admission import (
+    AdmissionInputs,
+    decide_admission,
+    largest_inactive_run_bytes,
+)
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
     DynamicChunkSizer,
@@ -4008,11 +4013,28 @@ class Scheduler(
         lc_min_tokens = envs.SGLANG_LONG_CONTEXT_MIN_PROMPT_TOKENS.get()
         lc_max_inflight = envs.SGLANG_LONG_CONTEXT_MAX_INFLIGHT_TOKENS.get()
         lc_used_tokens = 0
+        lc_inflight_lens = ()
+        lc_decode_footprint_tokens = 0
+        lc_f_frag_bytes = None
         if lc_min_tokens > 0:
             lc_used_tokens = sum(
                 len(r.origin_input_ids)
                 for r in running_batch.reqs
                 if len(r.origin_input_ids) >= lc_min_tokens
+            )
+            # Derived-rule inputs (T1+T2+solo; see scheduler_components/
+            # admission.py): in-flight LONG-context extending lens (T1 sum,
+            # T2 solo guard) and the RUNNING sub-T extend-len sum (the
+            # decode footprint the T2 headroom subtracts).
+            lc_inflight_lens = tuple(
+                len(r.origin_input_ids)
+                for r in running_batch.reqs
+                if len(r.origin_input_ids) >= lc_min_tokens
+            )
+            lc_decode_footprint_tokens = sum(
+                len(r.origin_input_ids)
+                for r in running_batch.reqs
+                if len(r.origin_input_ids) < lc_min_tokens
             )
             # The mid-chunk request is in flight too (its proportional
             # transient materializes as it runs) but is not in running_batch
@@ -4024,6 +4046,18 @@ class Scheduler(
                 and len(self.chunked_req.origin_input_ids) >= lc_min_tokens
             ):
                 lc_used_tokens += len(self.chunked_req.origin_input_ids)
+                lc_inflight_lens = lc_inflight_lens + (
+                    len(self.chunked_req.origin_input_ids),
+                )
+
+            # F_frag: measured LAZILY — only when the flat budget actually
+            # defers a long candidate and the derived rule is asked to judge.
+            # The snapshot walk is ~O(blocks) on the default pool; at that
+            # cadence (rare deferral moments, once per scheduling round) it
+            # is far cheaper than an empty_cache() flush and never runs on
+            # the hot all-short-candidate path. None = not yet measured.
+            # A measured 0 = unmeasurable -> the flat budget deferral floor
+            # applies (never admit on a guessed F_frag).
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
@@ -4087,7 +4121,49 @@ class Scheduler(
                 # still admitted when nothing else long-context is in flight
                 # (its solo transient fits the dynamic region) instead of
                 # being starved forever by its own size.
-                continue
+                # The derived rule (T1+T2+solo) can OVERRULE this deferral:
+                # the flat budget is a SAFE floor, mis-sized by design — it
+                # defers pool-fitting compositions (3x100k = 300k under the
+                # 250k floor) that the dynamic region serves fine, and the
+                # crash-class compositions (338.5k in flight) fail T2 on
+                # fragmented headroom instead. Admit iff the derived rule
+                # passes BOTH terms.
+                lc_min_f_frag = envs.SGLANG_ADMISSION_MIN_F_FRAG_BYTES.get()
+                lc_admission_verdict = None
+                if lc_min_f_frag > 0:
+                    if lc_f_frag_bytes is None:
+                        lc_f_frag_bytes = largest_inactive_run_bytes()
+                    if lc_f_frag_bytes >= lc_min_f_frag:
+                        lc_admission_verdict = decide_admission(
+                            AdmissionInputs(
+                                pool_tokens=self.req_to_token_pool.size,
+                                candidate_len=len(req.origin_input_ids),
+                                inflight_lens=lc_inflight_lens,
+                                midchunk_len=(
+                                    len(self.chunked_req.origin_input_ids)
+                                    if self.chunked_req is not None
+                                    else 0
+                                ),
+                                decode_footprint_tokens=lc_decode_footprint_tokens,
+                                f_frag_bytes=lc_f_frag_bytes,
+                                transient_kib_per_token=envs.SGLANG_ADMISSION_TRANSIENT_KIB_PER_TOKEN.get(),
+                            )
+                        )
+                if lc_admission_verdict is None:
+                    # Derived rule not armed (no trusted F_frag): the flat
+                    # safe-floor budget defers, exactly as before.
+                    self.metrics_collector.observe_admission(reason="flat_budget_defer")
+                    continue
+                if not lc_admission_verdict.admit:
+                    self.metrics_collector.observe_admission(
+                        f_frag_bytes=lc_f_frag_bytes, reason="derived_defer"
+                    )
+                    continue
+                # Derived rule admits where the flat floor defers — the
+                # candidate charges the budget below as usual.
+                self.metrics_collector.observe_admission(
+                    f_frag_bytes=lc_f_frag_bytes, reason="derived_admit"
+                )
 
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(

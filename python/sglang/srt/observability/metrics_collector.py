@@ -342,6 +342,31 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
 
         # =================================================================
+        # Derived long-context admission (T1 pool + T2 transient + solo;
+        # scheduler_components/admission.py)
+        # =================================================================
+        self.admission_f_frag_bytes = Gauge(
+            name="sglang:admission_f_frag_bytes",
+            documentation="Fragmented-contiguous floor: largest contiguous "
+            "run of inactive allocator blocks, measured at the admission "
+            "gate. 0 while no long-context admission decision is armed.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.admission_defers_total = Counter(
+            name="sglang:admission_defers_total",
+            documentation="Long-context admission deferrals by reason: "
+            "flat_budget_defer = the flat safe-floor budget deferred and "
+            "the derived rule was not armed (no trusted F_frag); "
+            "derived_defer = the derived rule (T1+T2+solo) itself deferred "
+            "the candidate; derived_admit = the derived rule OVERRULED the "
+            "flat-floor deferral and admitted (capacity recovered).",
+            labelnames=list(labels.keys()) + ["reason"],
+        )
+        for reason in ("flat_budget_defer", "derived_defer", "derived_admit"):
+            self.admission_defers_total.labels(**self.labels, reason=reason)
+
+        # =================================================================
         # Absolute token counts
         # =================================================================
         self.num_used_tokens = Gauge(
@@ -1486,6 +1511,19 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 grammar_stats.num_timeout
             )
         self.num_grammar_total.labels(**self.labels).inc(1)
+
+    def observe_admission(self, *, f_frag_bytes: Optional[int] = None, reason: str) -> None:
+        """Record one derived-admission decision.
+
+        ``reason``: flat_budget_defer / derived_defer / derived_admit.
+        ``f_frag_bytes``: the measured fragmented-contiguous floor for the
+        decision (None = not measured this round; the gauge then keeps its
+        last value). Both emit paths are scheduler-loop-safe: label writes
+        are the only work.
+        """
+        self.admission_defers_total.labels(**self.labels, reason=reason).inc()
+        if f_frag_bytes is not None:
+            self.admission_f_frag_bytes.labels(**self.labels).set(f_frag_bytes)
 
     def emit_constants(
         self,
