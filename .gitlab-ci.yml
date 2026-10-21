@@ -63,6 +63,7 @@ build-ornith1-5-9b-int8:
   tags: [gpus]
   when: manual
   needs: ["build-standalone"]
+  timeout: 2h
   variables:
     GIT_DEPTH: 1
   script:
@@ -79,6 +80,11 @@ build-qwen38-27b-int8:
   needs: ["build-standalone"]
   # ~30.4 GB of weights on top of the base -> same large-push caution as the
   # 9b job (retry on registry auth timeouts; docker resumes blob uploads).
+  # 2026-10-21: the project's 1h default cap killed the first weights push
+  # mid-retry (blob 269d0b613cbb was on its retry backoff at 59m). The push
+  # alone can exceed 1h on a slow day; give the job 2h and keep the manual
+  # retry-resume pattern (docker skips finished layers).
+  timeout: 2h
   variables:
     GIT_DEPTH: 1
   script:
