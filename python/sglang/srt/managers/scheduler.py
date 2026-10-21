@@ -463,9 +463,17 @@ class Scheduler(
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
     # STALL-POOL fail-out state: the queue-head rid the current fail-out
-    # budget is measuring, and when that rid's spin started. Cleared whenever
-    # the queue head changes, the batch is running, or a load/prefetch is in
-    # progress — i.e. any sign the scheduler is making progress.
+    # budget is measuring, and when the current stuck-spell started. The
+    # window is POSITION-keyed (the queue-HEAD has been stuck since
+    # `_stall_pool_watch_since`), not rid-keyed: wedge #6 (2026-10-21
+    # celadon breaker-flap incident) — a pool that cannot fit the head
+    # while pinned residue sits is wedged, and the client's retry cycle
+    # (patchbay ~300s fetch-timeout re-mint) replaces the head with a
+    # FRESH rid each round; a rid-keyed window restarts on every re-mint
+    # and 480s never elapses, so the wedge spins forever and every new
+    # arrival hits the queue-full 503 door (breaker flaps open).
+    # Progress = the queue DRAINS (head position serves or leaves) or a
+    # batch runs — NOT a head-rid change.
     _stall_pool_watch_rid: Optional[str] = None
     _stall_pool_watch_since: float = 0.0
     kv_checksum_computer: Optional[KvChecksumComputer] = None
@@ -5387,19 +5395,30 @@ class Scheduler(
                     and self.chunked_req is None
                     and not _loads_active
                 ):
-                    if self._stall_pool_watch_rid != _head_rid:
-                        # New (or changed) head: (re)start the budget window.
+                    if self._stall_pool_watch_rid is None:
+                        # No stuck spell in progress: the queue head has
+                        # been blocked for 0s — arm the window NOW. Note
+                        # the window is armed on the POSITION (queue head
+                        # blocked), not the rid: a re-minted head (client
+                        # retry) continues the SAME spell (wedge #6).
                         self._stall_pool_watch_rid = _head_rid
                         self._stall_pool_watch_since = now
-                    elif (
+                    else:
+                        # Spell in progress: keep aging the ORIGINAL window
+                        # (position-keyed). Refresh the informational rid
+                        # so the state always names the CURRENT head.
+                        self._stall_pool_watch_rid = _head_rid
+                    if (
                         now - self._stall_pool_watch_since
                     ) >= _failout_secs:
                         logger.warning(
-                            "STALL-POOL FAILOUT: rid=%s spun in admission "
-                            "for %.0fs with the queue blocked (running=0, "
-                            "no loads in flight) — retiring to client "
-                            "(client timed out long ago; load gate "
-                            "requeue re-mints the same rid).",
+                            "STALL-POOL FAILOUT: rid=%s spun at the queue "
+                            "head for %.0fs with the queue blocked "
+                            "(running=0, no loads in flight; retries may "
+                            "have re-minted the head rid during the "
+                            "window — the budget is position-keyed, see "
+                            "wedge #6) — retiring to client (client "
+                            "timed out long ago).",
                             _head_rid,
                             now - self._stall_pool_watch_since,
                         )
@@ -5419,9 +5438,13 @@ class Scheduler(
                         self._stall_pool_watch_rid = None
                         self._stall_pool_watch_since = 0.0
                 else:
-                    # Progress of some form (head changed, a decode, a
-                    # chunked prefill, or a live load): the budget window
-                    # is measuring nothing — clear it.
+                    # Progress of some form (a decode running, a chunked
+                    # prefill, or a live load): the queue-head block is
+                    # being caused by serving work, not a wedge — clear the
+                    # spell. (A head-rid CHANGE alone is NOT progress: the
+                    # retry cycle re-mints the same stuck position; that is
+                    # exactly wedge #6, and the position-keyed window above
+                    # intentionally keeps counting through it.)
                     self._stall_pool_watch_rid = None
                     self._stall_pool_watch_since = 0.0
             if self.enable_hicache_storage or self.enable_unified_cache_external_linker:
