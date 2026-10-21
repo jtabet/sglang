@@ -29,6 +29,15 @@ upload-base:
   # later builds deduplicate against it and only ship delta layers.
   script:
     - echo "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
+    # Idempotent one-time seed (2026-10-21): the original local source image
+    # jtabet/sglang:kvarn-latest was pruned from the runner, but :base lives in
+    # the registry — a re-run of this job must be a no-op, never a hard failure
+    # that wedges the needs-DAG for every later build.
+    - |
+      if docker manifest inspect "$CI_REGISTRY_IMAGE:base" >/dev/null 2>&1; then
+        echo "base already seeded in the registry — skipping (one-time job)"
+        exit 0
+      fi
     - docker tag jtabet/sglang:kvarn-latest "$CI_REGISTRY_IMAGE:base"
     - docker tag jtabet/sglang:kvarn-latest "$CI_REGISTRY_IMAGE:base-kvarn"
     - docker push "$CI_REGISTRY_IMAGE:base"
