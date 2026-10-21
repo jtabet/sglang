@@ -65,6 +65,11 @@ def dump_oom_memory_snapshot(folder: Optional[str], tag: str = "oom") -> Optiona
         return None
     dest = os.path.join(folder or "/tmp", f"oom_memory_snapshot_{tag}_{int(time.time())}.pickle")
     try:
+        # The dump path may not exist yet (e.g. a crash-dump-folder pointed at
+        # a persisted volume subpath, first crash). torch's _dump_snapshot
+        # does not create parents — a missing dir would lose the forensics
+        # exactly when they matter (crash #19's pickle died with the pod).
+        os.makedirs(folder or "/tmp", exist_ok=True)
         torch.cuda.memory._dump_snapshot(dest)
         logger.error("OOM memory snapshot written to %s", dest)
         try:
