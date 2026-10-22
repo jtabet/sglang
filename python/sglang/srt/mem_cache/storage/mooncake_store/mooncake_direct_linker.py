@@ -132,12 +132,15 @@ class LayerWiseLoadCounter:
             if not future.done():
                 future.set_exception(error)
 
-    def _reap_expired(self) -> None:
+    def _reap_expired(self) -> list[tuple[int, MooncakeLoadTimeout]]:
         """Fail every registered batch whose deadline has passed.
 
-        Called only from ``wait_until`` (scheduler thread): the failing futures
-        release the in-forward waiters; batches with no waiter get their
-        exception delivered whenever a later wait (or reset) touches them.
+        Called from ``wait_until`` (scheduler thread, in-forward) and from
+        ``reap_expired_loads`` (scheduler loop, clock-driven). Returns the
+        batches it genuinely FAILED, so a loop-level caller can publish them
+        for request retirement. Batches whose futures are already all done are
+        dropped silently and are NOT reported — those loads succeeded; their
+        deadline entry just outlived the waiters.
         """
         now = time.monotonic()
         expired = [
@@ -145,6 +148,7 @@ class LayerWiseLoadCounter:
             for index, until in self._pending_until.items()
             if until <= now
         ]
+        failed: list[tuple[int, MooncakeLoadTimeout]] = []
         for index in expired:
             timeout = self.futures.get(index)
             if timeout is None:
@@ -168,6 +172,8 @@ class LayerWiseLoadCounter:
                 self._deadline_secs,
             )
             self.fail(index, error)
+            failed.append((index, error))
+        return failed
 
     def wait_until(self, threshold: int) -> None:
         index = self.consumer_index
@@ -427,8 +433,62 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def num_completed_loads(self) -> int:
         return self.completed_loads.qsize()
 
-    def num_failed_loads(self) -> int:
-        return self.failed_loads.qsize()
+    def reap_expired_loads(self) -> None:
+        """Clock-driven deadline reap for batches no forward will ever wait on.
+
+        ``LayerWiseLoadCounter._reap_expired`` is otherwise reachable ONLY from
+        ``wait_until``, which runs on the scheduler thread inside an attention
+        forward. That makes the deadline a no-op in exactly the fault it exists
+        to bound: a request parked at the queue head never reaches a forward, so
+        no waiter ever expires the batch, ``ongoing_load_back`` never drains
+        (ack-only), and the scheduler spins forever with ``_loads_active`` true.
+        Both pre-existing safety nets — the load deadline and the STALL-POOL
+        fail-out — share that blind spot.
+
+        Called from ``check_hicache_events`` on every scheduler step, i.e. on
+        the wall clock rather than on a forward. Expiry fails the batch's
+        futures AND publishes the rid to ``failed_loads`` so the caller
+        quarantines the tail exactly like a store error; ``drain_failed_loads``
+        then retires the request through the normal failed-load path.
+        """
+        counter = self.layer_done_counter
+        if not counter._pending_until:
+            return
+        before = set(counter._pending_until)
+        failed = counter._reap_expired()
+        # Every registration the reaper dropped (completed or failed) is done;
+        # prune its rid mapping either way so _load_counter_index cannot grow
+        # without bound over a long-lived process.
+        finished = before - set(counter._pending_until)
+        if not finished:
+            return
+        reaped = {index for index, _ in failed}
+        for rid, index in list(self._load_counter_index.items()):
+            if index not in finished:
+                continue
+            self._load_counter_index.pop(rid, None)
+            if index not in reaped:
+                # Load completed normally; only the deadline entry outlived it.
+                continue
+            self.failed_loads.put(
+                (
+                    rid,
+                    MooncakeLoadTimeout(
+                        f"Mooncake load batch {index} (rid={rid}) passed its "
+                        f"{self.load_deadline_secs:.0f}s deadline with no "
+                        f"forward waiting on it (request parked); reaped from "
+                        f"the scheduler loop"
+                    ),
+                )
+            )
+            logger.error(
+                "Mooncake load deadline exceeded (parked): rid=%s batch=%d "
+                "deadline=%.0fs — no forward was waiting, reaped from the "
+                "scheduler loop to unpin the queue head",
+                rid,
+                index,
+                self.load_deadline_secs,
+            )
 
     def pop_completed_load(self) -> list[str]:
         return self.completed_loads.get_nowait()

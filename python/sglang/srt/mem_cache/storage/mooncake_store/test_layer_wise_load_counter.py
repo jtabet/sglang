@@ -9,6 +9,7 @@ the heavy sglang import graph stubbed out.
 
 import importlib.util
 import logging
+import queue
 import sys
 import threading
 import time
@@ -110,6 +111,7 @@ def _install_stubs():
 _LINKER = _install_stubs()
 LayerWiseLoadCounter = _LINKER.LayerWiseLoadCounter
 MooncakeLoadTimeout = _LINKER.MooncakeLoadTimeout
+MooncakeDirectLinker = _LINKER.MooncakeDirectLinker
 
 
 class TestLayerWiseLoadCounter(unittest.TestCase):
@@ -235,6 +237,139 @@ class TestLayerWiseLoadCounter(unittest.TestCase):
         threading.Thread(target=complete_layers, daemon=True).start()
         counter.wait_until(2)  # last-layer wait implies all below
         self.assertLess(time.monotonic(), deadline_at)
+
+    def _expire(self, counter, index):
+        """Force a batch's deadline into the past.
+
+        ``_deadline_secs`` clamps to a 1.0s floor, so a tiny construction-time
+        deadline does not expire quickly. Drive the registry directly instead:
+        deterministic, and it exercises the same comparison the loop reaper uses.
+        """
+        counter._pending_until[index] = time.monotonic() - 1.0
+
+    def test_reaper_returns_failed_batches_only(self):
+        """The loop-level reaper must report FAILED batches and nothing else.
+
+        A completed batch also has its deadline entry dropped (silently), and
+        publishing that as a failure would retire a request that actually
+        loaded. So the return value has to distinguish the two.
+        """
+        counter = self._counter(layers=2, deadline=5.0)
+        done_index = counter.update_producer()
+        counter.complete(done_index, 0)
+        counter.complete(done_index, 1)
+        stuck_index = counter.update_producer()
+        self._expire(counter, done_index)
+        self._expire(counter, stuck_index)
+
+        failed = counter._reap_expired()
+
+        self.assertEqual([index for index, _ in failed], [stuck_index])
+        self.assertIsInstance(failed[0][1], MooncakeLoadTimeout)
+        # Both registrations are released, whether completed or failed.
+        self.assertEqual(counter._pending_until, {})
+        # The completed batch's futures stay successful (never failed).
+        self.assertIsNone(counter.futures[done_index][0].exception())
+        self.assertIsNotNone(counter.futures[stuck_index][0].exception())
+
+    def test_reaper_is_idempotent(self):
+        """A second reap must not re-report the same batch.
+
+        The loop reaper runs on every scheduler step, so a batch that stayed
+        registered would be published to failed_loads once per tick — a
+        failure-amplification loop on top of the wedge it is meant to clear.
+        """
+        counter = self._counter(layers=1, deadline=5.0)
+        index = counter.update_producer()
+        self._expire(counter, index)
+        self.assertEqual(len(counter._reap_expired()), 1)
+        self.assertEqual(counter._reap_expired(), [])
+        self.assertNotIn(index, counter._pending_until)
+
+    def test_reaper_leaves_unexpired_batches_alone(self):
+        """A batch inside its budget must not be failed by the loop reaper."""
+        counter = self._counter(layers=2, deadline=30.0)
+        index = counter.update_producer()
+        self.assertEqual(counter._reap_expired(), [])
+        self.assertIn(index, counter._pending_until)
+        self.assertFalse(counter.futures[index][0].done())
+
+    def test_reaper_ignores_batches_with_no_futures_entry(self):
+        """A registration whose futures were dropped must not raise."""
+        counter = self._counter(layers=1, deadline=5.0)
+        index = counter.update_producer()
+        counter.futures.pop(index, None)
+        self._expire(counter, index)
+        self.assertEqual(counter._reap_expired(), [])
+        self.assertNotIn(index, counter._pending_until)
+
+
+class TestReapExpiredLoads(unittest.TestCase):
+    """The linker-level wrapper publishes reaped rids to failed_loads.
+
+    This is the loop entry point (``check_hicache_events`` ->
+    ``reap_expired_loads``). Its contract: a batch that expires with no forward
+    waiting must reach ``failed_loads`` exactly once, so the caller's failure
+    drain retires the parked request instead of leaving the queue head pinned.
+    """
+
+    def _linker(self, layers=2):
+        linker = object.__new__(MooncakeDirectLinker)
+        linker.layer_done_counter = LayerWiseLoadCounter(
+            layers, load_deadline_secs=5.0
+        )
+        linker.load_deadline_secs = 5.0
+        linker._load_counter_index = {}
+        linker.failed_loads = queue.Queue()
+        return linker
+
+    def _register(self, linker, rid, layers):
+        index = linker.layer_done_counter.update_producer()
+        linker._load_counter_index[rid] = index
+        linker.layer_done_counter._pending_until[index] = time.monotonic() - 1.0
+        return index
+
+    def test_expired_batch_is_published_once(self):
+        linker = self._linker()
+        self._register(linker, "rid-stuck", 2)
+
+        linker.reap_expired_loads()
+
+        self.assertEqual(linker.failed_loads.qsize(), 1)
+        rid, error = linker.failed_loads.get_nowait()
+        self.assertEqual(rid, "rid-stuck")
+        self.assertIsInstance(error, MooncakeLoadTimeout)
+        # Deregistered, so the next scheduler step does not publish it again.
+        self.assertEqual(linker._load_counter_index, {})
+        linker.reap_expired_loads()
+        self.assertEqual(linker.failed_loads.qsize(), 0)
+
+    def test_completed_batch_is_not_published(self):
+        """A load that succeeded must never be reported as a deadline failure."""
+        linker = self._linker()
+        index = self._register(linker, "rid-ok", 2)
+        for layer in range(2):
+            linker.layer_done_counter.complete(index, layer)
+
+        linker.reap_expired_loads()
+
+        self.assertEqual(linker.failed_loads.qsize(), 0)
+        self.assertEqual(linker._load_counter_index, {})
+
+    def test_unexpired_batch_is_left_registered(self):
+        linker = self._linker()
+        index = linker.layer_done_counter.update_producer()
+        linker._load_counter_index["rid-live"] = index
+
+        linker.reap_expired_loads()
+
+        self.assertEqual(linker.failed_loads.qsize(), 0)
+        self.assertEqual(linker._load_counter_index, {"rid-live": index})
+
+    def test_no_registrations_is_a_noop(self):
+        linker = self._linker()
+        linker.reap_expired_loads()
+        self.assertEqual(linker.failed_loads.qsize(), 0)
 
 
 if __name__ == "__main__":

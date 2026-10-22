@@ -3319,6 +3319,18 @@ class UnifiedRadixCache(BasePrefixCache):
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
+            # Reap load-back deadlines on the CLOCK, before any ack counting.
+            # The counter's own reaper is reachable only from ``wait_until``
+            # (in-forward), so a request parked at the queue head keeps its
+            # batch registered forever: no forward -> no wait_until -> no
+            # expiry -> ongoing_load_back never drains (ack-only) -> the
+            # scheduler spins with _loads_active true and the STALL-POOL
+            # fail-out cannot fire either. Reaping here runs on every step,
+            # forward or not, and publishes the rids into failed_loads so the
+            # drain below retires them.
+            reap = getattr(self.linker, "reap_expired_loads", None)
+            if reap is not None:
+                reap()
             finish_counts = torch.tensor(
                 [
                     self.linker.num_completed_loads(),
