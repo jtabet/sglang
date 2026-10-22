@@ -4159,8 +4159,14 @@ class Scheduler(
                         )
                 if lc_admission_verdict is None:
                     # Derived rule not armed (no trusted F_frag): the flat
-                    # safe-floor budget defers, exactly as before.
-                    self.metrics_collector.observe_admission(reason="flat_budget_defer")
+                    # safe-floor budget defers, exactly as before. The walk's
+                    # measured value still emits to the f_frag gauge when a
+                    # walk ran this pass (below-floor walks are real
+                    # measurements too — this is the F_frag-vs-nominal
+                    # curve; None = floor unset, gauge keeps last value).
+                    self.metrics_collector.observe_admission(
+                        f_frag_bytes=lc_f_frag_bytes, reason="flat_budget_defer"
+                    )
                     continue
                 if not lc_admission_verdict.admit:
                     self.metrics_collector.observe_admission(

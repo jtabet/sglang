@@ -1517,9 +1517,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
         ``reason``: flat_budget_defer / derived_defer / derived_admit.
         ``f_frag_bytes``: the measured fragmented-contiguous floor for the
-        decision (None = not measured this round; the gauge then keeps its
-        last value). Both emit paths are scheduler-loop-safe: label writes
-        are the only work.
+        decision. Emitted on EVERY walk result including below-floor
+        flat_budget_defers (the F_frag-vs-nominal curve); None = no walk
+        this round (floor unset), the gauge then keeps its last value. Both
+        emit paths are scheduler-loop-safe: label writes are the only work.
         """
         self.admission_defers_total.labels(**self.labels, reason=reason).inc()
         if f_frag_bytes is not None:
